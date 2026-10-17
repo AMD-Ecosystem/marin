@@ -118,7 +118,7 @@ def fake_transformer_engine(monkeypatch):
     """Factory installing a fake ``transformer_engine.jax`` (attention and sharding) in ``sys.modules``.
 
     ``fused_attn`` follows TE 2.17's signature (``softmax_type`` required) or, with ``takes_softmax_type=False``, the
-    pre-2.10 one, records each call, and computes ``_library_attention``. Like TE 2.9 and later, it asserts that a
+    pre-2.10 one, records each call, and computes ``_library_attention``. Like NVIDIA TE 2.7 to 2.11, it asserts that a
     ``MeshResource`` is set while its forward and its backward are traced. Returns the record of calls.
     """
 

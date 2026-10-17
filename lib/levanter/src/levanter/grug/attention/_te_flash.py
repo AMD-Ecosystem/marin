@@ -5,7 +5,7 @@
 Written against ROCm TransformerEngine 2.17 (``transformer_engine==2.17.0+rocm10.0.0``, the spurix refstack
 ``amd-jax-0.11.0-te``), whose fused attention runs AITER/CK kernels on AMD Instinct GPUs (``NVTE_CK_USES_FWD_V3`` and
 ``NVTE_CK_USES_BWD_V3`` let it use AITER's asm v3 kernels) and AOTriton where CK does not cover a shape. NVIDIA TE
-2.x (cuDNN) takes the same call.
+2.8 and later (cuDNN) take the same call; earlier releases name the kernel check's head size ``head_dim``.
 
 How a Grug call maps to ``fused_attn``:
 
@@ -24,8 +24,8 @@ How a Grug call maps to ``fused_attn``:
 
 Anything TE cannot run raises at trace time instead of falling back: segment ids (packed documents need TE's THD
 layout and a static ``max_segments_per_seq``), dense masks, non-causal windows, dtypes other than bf16 and fp16, and
-any shape for which ``is_fused_attn_kernel_available`` finds no fused kernel (on ROCm, neither CK, which stops below
-head_dim 512, nor AOTriton). ``NVTE_LOG_CK_CONFIG=1`` prints CK's reason.
+any shape for which ``is_fused_attn_kernel_available`` finds no fused kernel (on ROCm, neither CK, which needs
+head_dim below 512, nor AOTriton). ``NVTE_LOG_CK_CONFIG=1`` prints CK's reason.
 
 Under a mesh the kernel runs per device inside ``shard_map``, like ``gpu_pallas_triton_flash``: batch and heads may
 be sharded, sequence and head_dim may not. TE asserts that a global ``MeshResource`` is set whenever a mesh is
@@ -88,7 +88,7 @@ def _check_kernel_available(attention: ModuleType, q: jax.Array, k: jax.Array, c
         window_size=call.window,
         **softmax_type_kwargs(attention),
     )
-    # The checker's parameters differ across TE releases (softmax_type from 2.10, batch_size later).
+    # The checker's parameters differ across TE releases (softmax_type from 2.10, batch_size on NVIDIA's main).
     params = inspect.signature(attention.is_fused_attn_kernel_available).parameters
     if not attention.is_fused_attn_kernel_available(**{n: x for n, x in candidates.items() if n in params}):
         raise NotImplementedError(

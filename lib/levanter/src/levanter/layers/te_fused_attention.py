@@ -4,10 +4,11 @@
 
 - ``fused_attn`` takes a ``softmax_type`` on ROCm TE and on NVIDIA TE 2.10 and later, which require it; older NVIDIA
   releases have neither the parameter nor ``AttnSoftmaxType``.
-- TE 2.9 and later read a global ``MeshResource`` to find a context-parallel axis while tracing ``fused_attn``'s
-  forward and again its backward, and assert when none is set (newer releases only when a mesh is active, which the
-  Levanter trainer always makes). Levanter sets none, and needs none: it uses neither TE's context parallelism nor
-  its logical axes, and TE's partitioning rules for fused attention follow the input shardings.
+- TE reads a global ``MeshResource`` to find a context-parallel axis while tracing ``fused_attn``'s forward and
+  again its backward, and asserts when none is set: NVIDIA TE 2.7 to 2.11 always, NVIDIA TE 2.12 and later and ROCm
+  TE 2.17 only when a mesh is active, which the Levanter trainer always makes. Levanter sets none, and needs none: it
+  uses neither TE's context parallelism nor its logical axes, and TE's partitioning rules for fused attention follow
+  the input shardings.
 """
 
 import functools
