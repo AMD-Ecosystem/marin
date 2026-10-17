@@ -493,7 +493,7 @@ def test_te_flash_attention_calls_each_fused_attn_signature_and_matches_referenc
             "position", "key_position", D, q, k, v, mask, inference=True, scaling_factor=scaling_factor
         )
 
-    # The fake asserts, like TE >= 2.9, that a MeshResource is set while fused_attn's forward and backward are traced.
+    # Like NVIDIA TE 2.7-2.11, the fake asserts that a MeshResource is set while fused_attn's fwd and bwd trace.
     out = te(q, k, v)
     grads = jax.jit(jax.grad(lambda *a: loss(te, *a), argnums=(0, 1, 2)))(q, k, v)
     with jax.default_matmul_precision("highest"):

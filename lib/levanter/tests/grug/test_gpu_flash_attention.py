@@ -7,6 +7,7 @@ head layout changes the output. They record what Grug passes, the translation in
 kernel runs here.
 """
 
+import functools
 import math
 import sys
 
@@ -113,6 +114,37 @@ def test_gpu_flash_backend_gradients_match_reference(fake_backend):
     # The TE fake asserts, like TE, that a MeshResource is set while its backward is traced.
     actual = jax.jit(jax.grad(lambda *a: loss(flash, *a), argnums=(0, 1, 2)))(q, k, v)
     expected = jax.grad(lambda *a: loss(lambda *x: _reference(*x, mask), *a), argnums=(0, 1, 2))(q, k, v)
+    for name, want, got in zip("qkv", expected, actual, strict=True):
+        want = np.asarray(want, np.float32)
+        scale = max(1.0, float(np.max(np.abs(want))))
+        np.testing.assert_allclose(
+            np.asarray(got, np.float32) / scale, want / scale, atol=TOLERANCE, rtol=TOLERANCE, err_msg=f"d{name}"
+        )
+
+
+@pytest.mark.parametrize("fake_backend", ["gpu_te_flash", "gpu_aiter_flash"], indirect=True)
+def test_gpu_flash_backend_gradients_match_reference_under_scan_remat_and_cond(fake_backend):
+    """The June block's control flow: a scan over rematerialized layers, each picking its mask with ``lax.cond``."""
+    q, k, v = _qkv(8, 2)
+    cotangent = jax.random.normal(jax.random.key(1), q.shape, jnp.float32)
+    use_full_mask = jnp.array([False, True])
+
+    def loss(implementation, q, k, v):
+        def attend(mask):
+            return lambda x: attention(x, k, v, mask, implementation=implementation)
+
+        @jax.checkpoint
+        def layer(x, use_full):
+            full, windowed = attend(AttentionMask.causal()), attend(AttentionMask.causal(sliding_window=WINDOW))
+            return jax.lax.cond(use_full, full, windowed, x)
+
+        out, _ = jax.lax.scan(lambda x, use_full: (layer(x, use_full), None), q, use_full_mask)
+        return jnp.sum(out.astype(jnp.float32) * cotangent)
+
+    # The TE fake fails unless a MeshResource is set wherever these transforms trace fused_attn forward or backward.
+    actual = jax.jit(jax.grad(functools.partial(loss, fake_backend), argnums=(0, 1, 2)))(q, k, v)
+    with jax.default_matmul_precision("highest"):
+        expected = jax.jit(jax.grad(functools.partial(loss, "reference"), argnums=(0, 1, 2)))(q, k, v)
     for name, want, got in zip("qkv", expected, actual, strict=True):
         want = np.asarray(want, np.float32)
         scale = max(1.0, float(np.max(np.abs(want))))
