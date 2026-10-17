@@ -56,3 +56,23 @@ def test_noncausal_attention_flops_are_what_the_model_count_charges():
     full = lm_attention_flops_per_token(**ATTENTION_SHAPE, seq_len=seq_len)
     hybrid = lm_attention_flops_per_token(**ATTENTION_SHAPE, seq_len=seq_len, sliding_window=window, global_every=4)
     assert full_model - hybrid_model == pytest.approx(full.noncausal - hybrid.noncausal)
+
+
+def test_full_attention_maps_follow_the_megatron_estimate():
+    """Per layer and token: 2 * seq_len * hidden for the logits, 3 * seq_len * heads for the mask and softmax, and
+    2 * seq_len * hidden to mix the values."""
+    seq_len = 1024
+    hidden, heads, layers = (ATTENTION_SHAPE[k] for k in ("hidden_dim", "num_heads", "num_layers"))
+    full = lm_attention_flops_per_token(**ATTENTION_SHAPE, seq_len=seq_len)
+    assert full.noncausal == pytest.approx(layers * seq_len * (4 * hidden + 3 * heads))
+
+
+@pytest.mark.parametrize("schedule", [{}, {"sliding_window": 64, "global_every": 4}])
+def test_noncausal_attention_flops_are_all_of_the_model_count_that_grows_with_context(schedule):
+    """Without the attention maps, the model count per token is the same at every context length."""
+    rest = [
+        lm_flops_per_token(**SHAPE, seq_len=seq_len, **schedule)
+        - lm_attention_flops_per_token(**ATTENTION_SHAPE, seq_len=seq_len, **schedule).noncausal
+        for seq_len in (512, 1024, 4096)
+    ]
+    assert rest == pytest.approx([rest[0]] * len(rest))
