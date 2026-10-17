@@ -57,6 +57,7 @@ from .attention_mask import AttentionMask, materialize_mask
 from .kv_cache import KvPageCache
 from .normalization import LayerNormConfigBase
 from .rotary import RotaryEmbeddings, RotaryEmbeddingsConfig
+from .te_fused_attention import call_with_empty_mesh_resource, softmax_type_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -525,6 +526,7 @@ def _te_flash_attention(
     scaling_factor: float,
     logits_soft_cap: Optional[float] = None,
 ):
+    from transformer_engine.jax import attention as te_attention  # type: ignore[import]  # noqa: PLC0415  # optional dep: transformer_engine
     from transformer_engine.jax.attention import (  # type: ignore[import]  # noqa: PLC0415  # optional dep: transformer_engine
         AttnBiasType,
         QKVLayout,
@@ -581,43 +583,26 @@ def _te_flash_attention(
     if bias:
         raise NotImplementedError("Using bias with flash attention on GPU is not currently implemented.")
 
-    # TE 2.x uses SequenceDescriptor instead of explicit masks.
-    # For non-packed sequences, all sequences have full length.
-    q_seqlens = jnp.full((B,), Sq, dtype=jnp.int32)
-    kv_seqlens = jnp.full((B,), Sk, dtype=jnp.int32)
+    def call_fused_attn(q, k, v, seed):
+        # TE 2.x describes sequences with a SequenceDescriptor; every row here is one full-length sequence.
+        # SequenceDescriptor.from_seqlens takes no segment ids, and BSHD cannot hold several documents per row.
+        q_seqlens = jnp.full((B,), Sq, dtype=jnp.int32)
+        kv_seqlens = jnp.full((B,), Sk, dtype=jnp.int32)
+        return fused_attn(
+            (q, k, v),
+            fused_attn_bias,
+            SequenceDescriptor.from_seqlens((q_seqlens, kv_seqlens)),
+            seed,
+            attn_bias_type=attn_bias_type,
+            attn_mask_type=attn_mask_type,
+            qkv_layout=QKVLayout.BSHD_BSHD_BSHD,
+            scaling_factor=scaling_factor,
+            dropout_probability=dropout,
+            is_training=is_training,
+            **softmax_type_kwargs(te_attention),
+        )
 
-    # Extract segment_ids from mask if present
-    segment_ids_for_te = None
-    if isinstance(mask, AttentionMask) and mask.segment_ids is not None:
-        q_segment_ids, kv_segment_ids = map(lambda x: x.astype(jnp.int32), mask.segment_ids)
-
-        batch_axes = tuple(q_class["B"])
-        for ax in batch_axes:
-            if ax.name not in q_segment_ids.axes:
-                q_segment_ids = q_segment_ids.broadcast_axis(ax)
-            if ax.name not in kv_segment_ids.axes:
-                kv_segment_ids = kv_segment_ids.broadcast_axis(ax)
-
-        q_seg_reshaped = _maybe_flatten(q_segment_ids, batch_axes, "B")
-        q_seg_reshaped = q_seg_reshaped.rearrange(("B", QPos)).array
-        kv_seg_reshaped = _maybe_flatten(kv_segment_ids, batch_axes, "B")
-        kv_seg_reshaped = kv_seg_reshaped.rearrange(("B", KPos)).array
-        segment_ids_for_te = (q_seg_reshaped, kv_seg_reshaped)
-
-    sequence_descriptor = SequenceDescriptor.from_seqlens((q_seqlens, kv_seqlens), segment_ids=segment_ids_for_te)
-
-    attn_output = fused_attn(
-        (q_, k_, v_),
-        fused_attn_bias,
-        sequence_descriptor,
-        prng,
-        attn_bias_type=attn_bias_type,
-        attn_mask_type=attn_mask_type,
-        qkv_layout=QKVLayout.BSHD_BSHD_BSHD,
-        scaling_factor=scaling_factor,
-        dropout_probability=dropout,
-        is_training=is_training,
-    )
+    attn_output = call_with_empty_mesh_resource(call_fused_attn, q_, k_, v_, prng)
 
     # per the NVTE code, the output is BSHD. we can reshape it to match our axes
     # we have to ungroup the axes, then reshape them to match our expected output
@@ -660,6 +645,13 @@ def _te_get_mask_type(mask):
             "Custom NamedArray masks are not implemented for flash attention. Please pass an AttentionMask object"
         )
     elif isinstance(mask, AttentionMask):
+        # Nothing below passes these to TE, so running the kernel would silently attend to every causal key.
+        if mask.segment_ids is not None:
+            raise NotImplementedError("Segment ids (packed documents) are not supported for NVTE fused attention.")
+        if mask.sliding_window is not None or mask.bidirectional_window is not None:
+            raise NotImplementedError("Sliding windows are not supported for NVTE fused attention.")
+        if mask.explicit_mask is not None:
+            raise NotImplementedError("Explicit masks are not supported for NVTE fused attention.")
         if mask.is_causal:
             # NVTE fused attention does not support non-zero causal offsets.
             if mask.causal_offset is not None:
