@@ -45,10 +45,13 @@ from levanter.optim.config import AdamConfig
 from levanter.tracker.json_logger import JsonLoggerConfig
 from levanter.trainer import TrainerConfig
 from levanter.utils.jax_utils import multihost_broadcast_sync
+from rigging.log_setup import configure_logging
 
 from experiments.june_tpu_67b_a2b.moe.heuristic_muonh import MoeMuonHHeuristic
 from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig, RematMode
 from experiments.june_tpu_67b_a2b.moe.train import (
+    ATTENTION_FLOPS_PER_EXAMPLE_KEY,
+    CAUSAL_ATTENTION_FLOPS_PER_EXAMPLE_KEY,
     GrugRunConfig,
     GrugTrainerConfig,
     _compute_flops,
@@ -175,8 +178,22 @@ def report_memory() -> None:
         )
 
 
+def log_model_flops(flops_per_example: float, flops_summary: dict[str, float]) -> None:
+    """Log the FLOPs per example that MFU charges (3x forward) and their attention-map part, non-causal and causal."""
+    if jax.process_index() != 0:
+        return
+    logger.info(
+        "model flops per example: total=%r attention_noncausal=%r attention_causal=%r",
+        flops_per_example,
+        flops_summary[ATTENTION_FLOPS_PER_EXAMPLE_KEY],
+        flops_summary[CAUSAL_ATTENTION_FLOPS_PER_EXAMPLE_KEY],
+    )
+
+
 def main() -> None:
     args = parse_args()
+    # The training loop sets up logging only once it starts; without this, the lines logged before it are dropped.
+    configure_logging(logging.INFO)
     if args.gpus_per_node is not None:
         # Before any JAX call that starts the backend, including jax.device_count() below. Without explicit device
         # ids, JAX gives each Slurm process the single GPU numbered by its local rank.
@@ -258,7 +275,7 @@ def main() -> None:
         ),
         eval=None,
     )
-    flops_per_example, _ = _compute_flops(model_config=model)
+    flops_per_example, flops_summary = _compute_flops(model_config=model)
     logger.info(
         "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d seq_len=%d window=%d mp=%s "
         "expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d remat=%s "
@@ -285,6 +302,7 @@ def main() -> None:
         args.watch_interval,
         flops_per_example,
     )
+    log_model_flops(flops_per_example, flops_summary)
     _run_grug_local(config)
     report_memory()
 
