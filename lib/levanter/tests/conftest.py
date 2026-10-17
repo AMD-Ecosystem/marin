@@ -349,3 +349,46 @@ def fake_transformer_engine(monkeypatch):
 
     return install
 
+
+@pytest.fixture
+def fake_jax_aiter(monkeypatch):
+    """Install a fake ``jax_aiter.mha`` whose ``flash_attn_func`` records its arguments and computes
+    ``_library_attention``, returning a tuple as jax-aiter does. Returns the record of calls."""
+    record = types.SimpleNamespace(calls=[])
+
+    def flash_attn_func(
+        q,
+        k,
+        v,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+        bias=None,
+        alibi_slopes=None,
+        deterministic=True,
+        return_lse=False,
+        return_attn_probs=False,
+    ):
+        record.calls.append(
+            dict(
+                q_shape=q.shape,
+                kv_shape=k.shape,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                deterministic=deterministic,
+            )
+        )
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** -0.5
+        return (_library_attention(q, k, v, scale=softmax_scale, causal=causal, window=window_size),)
+
+    mha = types.ModuleType("jax_aiter.mha")
+    mha.flash_attn_func = flash_attn_func
+    package = types.ModuleType("jax_aiter")
+    package.mha = mha
+    monkeypatch.setitem(sys.modules, "jax_aiter", package)
+    monkeypatch.setitem(sys.modules, "jax_aiter.mha", mha)
+    return record
