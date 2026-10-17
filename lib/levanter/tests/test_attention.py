@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import sys
 from contextlib import ExitStack
 
 import equinox
@@ -36,6 +37,7 @@ from levanter.layers.attention import (
     _te_flash_attention,
     _tpu_splash_attention,
     dot_product_attention,
+    simple_attention_with_dropout,
 )
 from levanter.utils.mesh import create_mesh_from_axis_specs
 
@@ -454,6 +456,61 @@ def test_te_flash_attention_non_causal_mask_raises():
             attention_dtype=jnp.bfloat16,
             scaling_factor=1 / math.sqrt(D.size),
         )
+
+
+@pytest.mark.parametrize("takes_softmax_type", [True, False])
+def test_te_flash_attention_calls_each_fused_attn_signature_and_matches_reference(
+    fake_transformer_engine, takes_softmax_type
+):
+    """Drive ``_te_flash_attention`` through a fake TE with TE 2.17's ``fused_attn`` signature or the pre-2.10 one."""
+    record = fake_transformer_engine(takes_softmax_type=takes_softmax_type)
+    QPos = hax.Axis("position", 32)
+    KPos = hax.Axis("key_position", 32)
+    B = hax.Axis("batch", 2)
+    Head = hax.Axis("kv_heads", 2)
+    Q_Head = hax.Axis("q_heads_per_group", 2)
+    D = hax.Axis("head_size", 16)
+    kq, kk, kv, kc = jrandom.split(jrandom.PRNGKey(0), 4)
+    q = hax.random.normal(kq, (B, Head, Q_Head, QPos, D)).astype(jnp.bfloat16)
+    k = hax.random.normal(kk, (B, Head, KPos, D)).astype(jnp.bfloat16)
+    v = hax.random.normal(kv, (B, Head, KPos, D)).astype(jnp.bfloat16)
+    cotangent = hax.random.normal(kc, (B, Head, Q_Head, QPos, D))
+    mask = AttentionMask.causal()
+    scaling_factor = 1 / math.sqrt(D.size)
+
+    def loss(attend, q, k, v):
+        return hax.sum(attend(q, k, v).astype(jnp.float32) * cotangent).array
+
+    def te(q, k, v):
+        return _te_flash_attention(
+            "position", "key_position", "head_size", q, k, v, mask, scaling_factor=scaling_factor
+        )
+
+    def reference(q, k, v):
+        q, k, v = (x.astype(jnp.float32) for x in (q, k, v))
+        return simple_attention_with_dropout(
+            "position", "key_position", D, q, k, v, mask, inference=True, scaling_factor=scaling_factor
+        )
+
+    # The fake asserts, like TE >= 2.9, that a MeshResource is set while fused_attn's forward and backward are traced.
+    out = te(q, k, v)
+    grads = jax.jit(jax.grad(lambda *a: loss(te, *a), argnums=(0, 1, 2)))(q, k, v)
+    with jax.default_matmul_precision("highest"):
+        expected_out = reference(q, k, v)
+        expected_grads = jax.grad(lambda *a: loss(reference, *a), argnums=(0, 1, 2))(q, k, v)
+
+    np.testing.assert_allclose(
+        np.asarray(out.rearrange(expected_out.axes).array, np.float32), expected_out.array, atol=1e-2, rtol=1e-2
+    )
+    for name, want, got in zip("qkv", expected_grads, grads, strict=True):
+        got = np.asarray(got.rearrange(want.axes).array, np.float32)
+        want = np.asarray(want.array, np.float32)
+        # K/V gradients sum over a GQA group and many queries, so compare relative to their scale.
+        scale = max(1.0, float(np.max(np.abs(want))))
+        np.testing.assert_allclose(got / scale, want / scale, atol=1e-2, rtol=1e-2, err_msg=f"d{name}")
+    te_attention = sys.modules["transformer_engine.jax.attention"]
+    expected_softmax = te_attention.AttnSoftmaxType.VANILLA_SOFTMAX if takes_softmax_type else None
+    assert {call["softmax_type"] for call in record.calls} == {expected_softmax}
 
 
 def test_tpu_splash_attention():
