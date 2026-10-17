@@ -12,6 +12,17 @@ Single-node harness that trains a dense transformer on uniform-random tokens thr
 
 `--layers` gives shallower proxies of the same width, for example `--size 32b --layers 16` to time per-layer kernels and FSDP traffic; extrapolate those to the full depth instead of quoting their MFU. `--remat-mode` is `recompute_all` (rerun each block in backward; the default), `save_dots` (keep the matmul outputs) or `none`. `--model-axis` must divide the KV-head count. Mixed precision defaults to `p=f32,c=bfloat16`.
 
+`--attention` takes any Grug attention implementation. On AMD GPUs the fused choices are:
+
+| `--attention` | Kernel | Needs | `8b` (32 / 8) | `32b` (40 / 8) |
+|---|---|---|---|---|
+| `gpu_pallas_triton_flash` | Grug's Pallas-Triton flash | nothing extra | yes | no: needs a power-of-two GQA ratio |
+| `gpu_aiter_flash` | jax-aiter `flash_attn_func` (AITER asm v3 / CK) | `jax_aiter` with its MHA libraries | yes | yes |
+| `gpu_te_flash` | TransformerEngine `fused_attn` (AITER / CK) | ROCm TE's JAX extension, refstack `amd-jax-0.11.0-te` | yes | yes |
+| `xla_flash` | Levanter's pure-JAX flash attention | nothing extra | yes | yes |
+
+For `32b`, use `gpu_aiter_flash` or `gpu_te_flash`; `xla_flash` is the fallback when neither package is installed. Both take the 40 query and 8 KV heads as they are, run per device under the mesh, and use a nondeterministic backward (`gpu_aiter_flash` passes `deterministic=False`; `gpu_te_flash` follows `NVTE_ALLOW_NONDETERMINISTIC_ALGO`, which the refstack sets to 1). Neither supports segment ids, which this harness does not use. The module docstrings of `levanter/grug/attention/_aiter_flash.py` and `_te_flash.py` describe the argument mapping.
+
 FLOPs per example are Levanter's count for its Llama and Qwen3 models, so MFU matches theirs. The harness also logs a `model flops per example: total=... attention_noncausal=... attention_causal=...` line: the attention-map part of that total as Levanter counts it (non-causal) and with causal masking counted exactly, for a causal MFU.
 
 The default batch is one sequence per device; a global batch of 1 fails in the next-token loss under explicit mesh axes, so single-device runs need `--batch-size 2`. Every step sees fresh random tokens, so the loss cannot fall below ln(vocab_size) and a lower value means something leaks targets. No checkpoint is written.
