@@ -1,6 +1,6 @@
 # grug-dense-synthetic
 
-Single-node harness that trains a dense transformer on uniform-random tokens through Levanter's `Trainer` and reports step time, tokens/s, MFU, and peak device memory. It is the dense counterpart of [`snowball_synthetic`](../snowball_synthetic/README.md): the same trainer setup, flags and summary lines, so dense GEMM and attention throughput can be measured, and compared with MaxText, on the same footing as the MoE.
+Single-node harness that trains a dense transformer on uniform-random tokens through Levanter's `Trainer` and reports step time, tokens/s, MFU, and peak device memory. It is the dense counterpart of [`snowball_synthetic`](../snowball_synthetic/README.md): the same trainer setup and summary lines, so dense GEMM and attention throughput can be measured, and compared with MaxText, on the same footing as the MoE.
 
 [`model.py`](./model.py) reuses the June 67B Grug block machinery (`experiments/june_tpu_67b_a2b/moe/model.py`): the layers stacked into one `jax.lax.scan`, a per-block remat policy, the Grug attention dispatch (`--attention`), FSDP over `data` and tensor parallelism over `model`, and June's `DenseMLP` (SwiGLU) as the MLP. Attention is grouped-query with full RoPE and, where the model has it, a per-head RMSNorm on q and k (QK-norm). Embeddings are untied.
 
