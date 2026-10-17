@@ -13,7 +13,7 @@ import pytest
 from jax.sharding import AxisType, Mesh
 
 from experiments.grug.dense_synthetic.model import GrugModelConfig, Transformer
-from experiments.grug.dense_synthetic.train import PRESETS
+from experiments.grug.dense_synthetic.train import PRESETS, dense_flops_per_token
 from experiments.llama import llama_8b, llama_32b
 
 TINY = dataclasses.replace(PRESETS["tiny"], attention_implementation="reference")
@@ -46,6 +46,14 @@ def test_presets_are_marins_llama_shapes(size, reference):
     cfg = PRESETS[size]
     qk_norm = 2 * cfg.head_dim * cfg.num_layers if cfg.qk_norm else 0
     assert _parameter_count(cfg) == reference.total_trainable_params(cfg.vocab_size) + qk_norm
+
+
+@pytest.mark.parametrize(("size", "reference"), [("8b", llama_8b), ("32b", llama_32b)])
+def test_presets_charge_levanters_llama_flops(size, reference):
+    """MFU is comparable with Levanter's own Llama and Qwen3 runs: the same FLOPs per token at every context."""
+    cfg = PRESETS[size]
+    for seq_len in (cfg.max_seq_len, 8192):
+        assert dense_flops_per_token(cfg, seq_len) == reference.flops_per_token(cfg.vocab_size, seq_len)
 
 
 def test_remat_modes_keep_the_loss_and_gradients():
