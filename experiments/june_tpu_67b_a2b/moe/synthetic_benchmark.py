@@ -36,7 +36,7 @@ import numpy as np
 from fray.cluster import ResourceConfig
 from levanter.callbacks import StepInfo
 from levanter.callbacks._metrics import aggregate_device_flops, compute_instant_throughput
-from levanter.callbacks.profiler import ProfilerConfig, XprofUploadConfig
+from levanter.callbacks.profiler import ProfileOptionsConfig, ProfilerConfig, XprofUploadConfig
 from levanter.callbacks.watch import WatchConfig
 from levanter.checkpoint import CheckpointerConfig
 from levanter.data.dataset import ListAsyncDataset
@@ -270,6 +270,8 @@ def main() -> None:
             start_step=args.profile_start,
             num_steps=args.profile_steps,
             upload=XprofUploadConfig(enabled=False),
+            # The HLO modules let trace tools attribute kernels to HLO ops (spurix's xplane buckets).
+            profile_options=ProfileOptionsConfig(enable_hlo_proto=True),
         ),
         jax_compilation_cache_dir=args.compilation_cache_dir,
         log_jaxprs=False,

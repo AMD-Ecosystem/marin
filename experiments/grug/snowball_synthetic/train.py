@@ -39,7 +39,7 @@ import numpy as np
 from haliax import Axis
 from levanter import callbacks
 from levanter.callbacks._metrics import aggregate_device_flops, compute_instant_throughput
-from levanter.callbacks.profiler import ProfilerConfig, XprofUploadConfig
+from levanter.callbacks.profiler import ProfileOptionsConfig, ProfilerConfig, XprofUploadConfig
 from levanter.checkpoint import CheckpointerConfig
 from levanter.data.dataset import ListAsyncDataset
 from levanter.data.text.datasets import NamedLmDataset
@@ -197,6 +197,8 @@ def build_trainer_config(args: argparse.Namespace, preset: Preset, run_id: str, 
             start_step=args.profile_start,
             num_steps=args.profile_steps,
             upload=XprofUploadConfig(enabled=False),
+            # The HLO modules let trace tools attribute kernels to HLO ops (spurix's xplane buckets).
+            profile_options=ProfileOptionsConfig(enable_hlo_proto=True),
         ),
         jax_compilation_cache_dir=args.compilation_cache_dir,
         log_jaxprs=False,
