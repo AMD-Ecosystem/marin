@@ -8,7 +8,8 @@ model (``experiments/june_tpu_67b_a2b/moe/model.py``) and training loop, on the 
 kernels (reference or ``xla_flash`` attention, XLA ``ragged_dot``), so the two code paths can be compared on
 hardware that has no CUDA or TPU kernels. Every step sees fresh uniform-random tokens with no repeats, so the
 loss cannot fall below ln(vocab_size) and a lower value means something leaks the targets. No checkpoint is
-written.
+written. Like the Snowball harness, it logs the model FLOPs per example up front and ends with the median step
+time from step 2 on, tokens/s, model TFLOP/s and MFU, then each device's peak memory.
 
 Example, 8 GPUs, full 67B shape, expert parallelism over all 8, profile of steps 10-12::
 
@@ -24,6 +25,7 @@ parameters over a cross-node ``data`` axis (FSDP), and ``--expert-axis 16`` spre
 import argparse
 import dataclasses
 import logging
+import statistics
 import time
 from pathlib import Path
 from typing import get_args
@@ -32,6 +34,8 @@ import jax
 import jmp
 import numpy as np
 from fray.cluster import ResourceConfig
+from levanter.callbacks import StepInfo
+from levanter.callbacks._metrics import aggregate_device_flops, compute_instant_throughput
 from levanter.callbacks.profiler import ProfilerConfig, XprofUploadConfig
 from levanter.callbacks.watch import WatchConfig
 from levanter.checkpoint import CheckpointerConfig
@@ -64,6 +68,9 @@ SNOWBALL_HIDDEN_DIM = 2560
 # The width heuristic would otherwise derive seq_len // 2 and give the medium preset a shorter window than Snowball's.
 SNOWBALL_SLIDING_WINDOW = 2048
 POOLED_WAVE_MOE_IMPL = "fixed_pooled_wave_all_to_all"
+TRANSPORT_CAPACITY_MOE_IMPLS = ("ring_dedup", POOLED_WAVE_MOE_IMPL)
+# Steps 0 and 1 are excluded from the summary, as in the Snowball harness: step 0 compiles.
+FIRST_TIMED_STEP = 2
 
 
 def snowball_model(seq_len: int) -> GrugModelConfig:
@@ -130,7 +137,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pooled-transport-capacity-factor",
         type=float,
-        help="Sender pool capacity factor; required by --moe-impl fixed_pooled_wave_all_to_all.",
+        help="Sender capacity factor per destination; required by --moe-impl ring_dedup and "
+        "fixed_pooled_wave_all_to_all.",
     )
     parser.add_argument(
         "--num-expert-waves",
@@ -189,6 +197,22 @@ def log_model_flops(flops_per_example: float, flops_summary: dict[str, float]) -
     )
 
 
+def log_throughput_summary(
+    step_durations: list[float], batch_size: int, seq_len: int, flops_per_example: float, num_steps: int
+) -> None:
+    median = statistics.median(step_durations)
+    throughput = compute_instant_throughput(batch_size, median, seq_len, flops_per_example, aggregate_device_flops())
+    logger.info(
+        "median step over steps %d-%d: %.3f s  %s tokens/s  %s model TFLOP/s  MFU %s%%",
+        FIRST_TIMED_STEP,
+        num_steps - 1,
+        median,
+        f"{throughput.tokens_per_second:,.0f}" if throughput.tokens_per_second is not None else "n/a",
+        f"{throughput.model_flops_per_second / 1e12:.1f}" if throughput.model_flops_per_second is not None else "n/a",
+        f"{throughput.mfu:.2f}" if throughput.mfu is not None else "n/a",
+    )
+
+
 def main() -> None:
     args = parse_args()
     # The training loop sets up logging only once it starts; without this, the lines logged before it are dropped.
@@ -210,10 +234,10 @@ def main() -> None:
         model = dataclasses.replace(model, capacity_factor=args.capacity_factor)
     if args.layers is not None:
         model = dataclasses.replace(model, num_layers=args.layers)
+    # The backend checks these only on the first step, after the full model state is built.
+    if args.moe_impl in TRANSPORT_CAPACITY_MOE_IMPLS and args.pooled_transport_capacity_factor is None:
+        raise ValueError(f"--moe-impl {args.moe_impl} requires --pooled-transport-capacity-factor")
     if args.moe_impl == POOLED_WAVE_MOE_IMPL:
-        # The backend checks these only on the first step, after the full model state is built.
-        if args.pooled_transport_capacity_factor is None:
-            raise ValueError(f"--moe-impl {POOLED_WAVE_MOE_IMPL} requires --pooled-transport-capacity-factor")
         local_experts = model.num_experts // args.expert_axis
         if local_experts % args.num_expert_waves != 0:
             raise ValueError(
@@ -302,7 +326,16 @@ def main() -> None:
         flops_per_example,
     )
     log_model_flops(flops_per_example, flops_summary)
-    _run_grug_local(config)
+    step_durations: list[float] = []
+
+    def record_step(info: StepInfo, force: bool = False) -> None:
+        # The loop re-runs every hook with force=True after the last step; that call would duplicate the sample.
+        if not force and info.step >= FIRST_TIMED_STEP:
+            step_durations.append(info.step_duration)
+
+    _run_grug_local(config, step_hooks=[record_step])
+    if step_durations:
+        log_throughput_summary(step_durations, batch_size, model.max_seq_len, flops_per_example, args.steps)
     report_memory()
 
 
