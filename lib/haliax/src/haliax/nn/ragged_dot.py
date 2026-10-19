@@ -138,7 +138,8 @@ def _triton_ragged_dot_kernel(
                 a = plgpu.load(a_ref.at[span_m, span_k])
                 b = plgpu.load(b_ref.at[span_k, pl.ds(0, b_ref.shape[1])])
             dtype = jnp.result_type(a, b)
-            return acc + pl.dot(a.astype(dtype), b.astype(dtype))
+            # pl.dot was removed in JAX 0.12; it was a 2D dot_general with an fp32 result for float operands.
+            return acc + jnp.dot(a.astype(dtype), b.astype(dtype), preferred_element_type=jnp.float32)
 
         num_k_blocks = pl.cdiv(k, block_k)
         acc = jax.lax.fori_loop(0, num_k_blocks, body, acc)
@@ -230,7 +231,7 @@ def _triton_ragged_contracting_dim_dot_kernel(
         a = plgpu.load(a_ref.at[span_k], mask=mask, other=other)
         b = plgpu.load(b_ref.at[span_k], mask=mask, other=other)
         dtype = jnp.result_type(a, b)
-        return acc + pl.dot(a.astype(dtype).T, b.astype(dtype))
+        return acc + jnp.dot(a.astype(dtype).T, b.astype(dtype), preferred_element_type=jnp.float32)
 
     num_k_blocks = jnp.maximum(pl.cdiv(jnp.int32(hi - lo), jnp.int32(block_k)), jnp.int32(1))
     acc = jnp.zeros((block_m, out_ref.shape[1]), dtype=jnp.float32)
