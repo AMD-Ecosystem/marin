@@ -51,7 +51,7 @@ from levanter.utils.jax_utils import multihost_broadcast_sync
 from rigging.log_setup import configure_logging
 
 from experiments.june_tpu_67b_a2b.moe.heuristic_muonh import MoeMuonHHeuristic
-from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig, RematMode
+from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig, QbBalance, RematMode, ScanReduction
 from experiments.june_tpu_67b_a2b.moe.train import (
     ATTENTION_FLOPS_PER_EXAMPLE_KEY,
     CAUSAL_ATTENTION_FLOPS_PER_EXAMPLE_KEY,
@@ -156,6 +156,25 @@ def parse_args() -> argparse.Namespace:
         "--scan-unroll", type=int, default=1, help="Layers per iteration of the layer scan (lax.scan unroll)."
     )
     parser.add_argument(
+        "--replicated-grads",
+        choices=get_args(ScanReduction),
+        default="per_layer",
+        help="Reduce the small replicated block weights' gradients in every layer or once after the layer scan.",
+    )
+    parser.add_argument(
+        "--router-stats",
+        choices=get_args(ScanReduction),
+        default="per_layer",
+        help="Reduce routing statistics and QB thresholds in every layer or once after the layer scan.",
+    )
+    parser.add_argument("--qb-balance", choices=get_args(QbBalance), default="global", help="QB load balancing groups.")
+    parser.add_argument(
+        "--qb-sync-interval",
+        type=int,
+        default=0,
+        help="With --qb-balance per_node, average the nodes' QB thresholds every this many steps (0 never).",
+    )
+    parser.add_argument(
         "--watch-interval", type=int, default=10, help="Steps between gradient watch steps (0 disables)."
     )
     parser.add_argument(
@@ -233,6 +252,9 @@ def main() -> None:
         pooled_transport_capacity_factor=args.pooled_transport_capacity_factor,
         num_expert_waves=args.num_expert_waves,
         scan_unroll=args.scan_unroll,
+        replicated_grad_reduction=args.replicated_grads,
+        router_stats_reduction=args.router_stats,
+        qb_balance=args.qb_balance,
     )
     if args.capacity_factor is not None:
         model = dataclasses.replace(model, capacity_factor=args.capacity_factor)
@@ -301,6 +323,7 @@ def main() -> None:
             replica_axis_size=args.replica_axis,
             save_checkpoints=False,
             step_timeout=args.step_timeout or None,
+            qb_sync_interval=args.qb_sync_interval,
         ),
         eval=None,
     )
@@ -308,6 +331,7 @@ def main() -> None:
     logger.info(
         "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d seq_len=%d window=%d mp=%s "
         "expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d remat=%s "
+        "replicated_grads=%s router_stats=%s qb_balance=%s qb_sync_interval=%d "
         "watch_interval=%d flops_per_example=%.4e",
         args.size,
         model.num_layers,
@@ -328,6 +352,10 @@ def main() -> None:
         model.pooled_transport_capacity_factor,
         model.num_expert_waves,
         args.remat_mode,
+        args.replicated_grads,
+        args.router_stats,
+        args.qb_balance,
+        args.qb_sync_interval,
         args.watch_interval,
         flops_per_example,
     )
