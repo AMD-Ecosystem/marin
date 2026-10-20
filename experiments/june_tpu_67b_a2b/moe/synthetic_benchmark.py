@@ -153,6 +153,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compilation-cache-dir", help="Persistent JAX compilation cache directory.")
     parser.add_argument("--remat-mode", choices=get_args(RematMode), default="recompute_all")
     parser.add_argument(
+        "--scan-unroll", type=int, default=1, help="Layers per iteration of the layer scan (lax.scan unroll)."
+    )
+    parser.add_argument(
         "--watch-interval", type=int, default=10, help="Steps between gradient watch steps (0 disables)."
     )
     parser.add_argument(
@@ -229,6 +232,7 @@ def main() -> None:
         remat_mode=args.remat_mode,
         pooled_transport_capacity_factor=args.pooled_transport_capacity_factor,
         num_expert_waves=args.num_expert_waves,
+        scan_unroll=args.scan_unroll,
     )
     if args.capacity_factor is not None:
         model = dataclasses.replace(model, capacity_factor=args.capacity_factor)
