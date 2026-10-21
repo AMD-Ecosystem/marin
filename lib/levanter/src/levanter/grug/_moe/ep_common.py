@@ -29,15 +29,14 @@ def _combine_gather_sum_impl(
         weights = jnp.where(keep, combine_weights, 0)
         return sonic_gather_sum_masked(send_output, gather_indices, weights, output_dtype=output_dtype)
 
+    # top-k is static: unrolled, XLA fuses the gathers, the f32 multiply-adds and the cast into one pass that writes
+    # the output once, instead of carrying an f32 [tokens, hidden] sum through a loop (one write and read per route).
     out = jnp.zeros((tokens_per_shard, hidden_dim), dtype=jnp.float32)
-
-    def add_route(route_index, out):
+    for route_index in range(topk):
         rows = send_output[jnp.minimum(gather_indices[:, route_index], send_output.shape[0] - 1)]
         rows = jnp.where(keep[:, route_index, None], rows, 0)
-        weight = combine_weights[:, route_index, None].astype(jnp.float32)
-        return out + rows.astype(jnp.float32) * weight
-
-    return jax.lax.fori_loop(0, topk, add_route, out).astype(output_dtype)
+        out = out + rows.astype(jnp.float32) * combine_weights[:, route_index, None].astype(jnp.float32)
+    return out.astype(output_dtype)
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(4,))
@@ -69,16 +68,12 @@ def _combine_gather_sum_bwd(_output_dtype, residual, cotangent):
 
     gather_indices = gather_indices.reshape(tokens_per_shard, topk)
     keep = (gather_indices >= 0) & (gather_indices < send_output.shape[0])
-    d_combine_weights = jnp.zeros_like(combine_weights)
-
-    def set_route(route_index, d_combine_weights):
+    d_weights = []
+    for route_index in range(topk):  # unrolled, as in the forward
         rows = send_output[jnp.minimum(gather_indices[:, route_index], send_output.shape[0] - 1)]
         d_weight = jnp.sum(cotangent.astype(jnp.float32) * rows.astype(jnp.float32), axis=1)
-        d_weight = jnp.where(keep[:, route_index], d_weight, 0).astype(combine_weights.dtype)
-        return jax.lax.dynamic_update_slice_in_dim(d_combine_weights, d_weight[:, None], route_index, axis=1)
-
-    d_combine_weights = jax.lax.fori_loop(0, topk, set_route, d_combine_weights)
-    return d_send_output, None, None, d_combine_weights
+        d_weights.append(jnp.where(keep[:, route_index], d_weight, 0).astype(combine_weights.dtype))
+    return d_send_output, None, None, jnp.stack(d_weights, axis=1)
 
 
 _combine_gather_sum.defvjp(_combine_gather_sum_fwd, _combine_gather_sum_bwd)
