@@ -68,16 +68,12 @@ def _combine_gather_sum_bwd(_output_dtype, residual, cotangent):
 
     gather_indices = gather_indices.reshape(tokens_per_shard, topk)
     keep = (gather_indices >= 0) & (gather_indices < send_output.shape[0])
-    d_combine_weights = jnp.zeros_like(combine_weights)
-
-    def set_route(route_index, d_combine_weights):
+    d_weights = []
+    for route_index in range(topk):  # unrolled, as in the forward
         rows = send_output[jnp.minimum(gather_indices[:, route_index], send_output.shape[0] - 1)]
         d_weight = jnp.sum(cotangent.astype(jnp.float32) * rows.astype(jnp.float32), axis=1)
-        d_weight = jnp.where(keep[:, route_index], d_weight, 0).astype(combine_weights.dtype)
-        return jax.lax.dynamic_update_slice_in_dim(d_combine_weights, d_weight[:, None], route_index, axis=1)
-
-    d_combine_weights = jax.lax.fori_loop(0, topk, set_route, d_combine_weights)
-    return d_send_output, None, None, d_combine_weights
+        d_weights.append(jnp.where(keep[:, route_index], d_weight, 0).astype(combine_weights.dtype))
+    return d_send_output, None, None, jnp.stack(d_weights, axis=1)
 
 
 _combine_gather_sum.defvjp(_combine_gather_sum_fwd, _combine_gather_sum_bwd)
