@@ -153,10 +153,11 @@ class GrugModelConfig:
     """Layers per iteration of the stacked-blocks ``lax.scan`` (its ``unroll``). More exposes more layers to XLA's
     scheduler, e.g. to start the next layers' weight all-gathers early, at the cost of compile time and peak memory."""
     replicated_grad_reduction: ScanReduction = "per_layer"
-    """Where the gradients of the small replicated block weights (RMSNorm, GatedNorm, router) are reduced across
-    the batch shards: in every layer ("per_layer"), or once after the layer scan ("after_scan", stacked blocks
-    only): the weights are marked ``reduced`` over the batch axes before the scan, so their cotangents stay
-    ``unreduced`` (per-device partial sums) through it."""
+    """Where the gradients of the block weights replicated over the batch axes (RMSNorm, GatedNorm, router, and the
+    attention and shared-expert weights when not sharded) are reduced across the batch shards: in every layer
+    ("per_layer"), or once after the layer scan ("after_scan", stacked blocks only): the weights are marked
+    ``reduced`` over the batch axes before the scan, so their cotangents stay ``unreduced`` (per-device partial
+    sums) through it."""
     router_stats_reduction: ScanReduction = "per_layer"
     """Where routing statistics and QB thresholds are reduced across the batch shards: in every layer
     ("per_layer"), or once after the layer scan from per-shard partials ("after_scan", stacked blocks only). Both
@@ -625,35 +626,38 @@ def _reduce_qb_betas_per_group(stats: dict[str, jax.Array], groups: int) -> jax.
     return reshard(out, P(None, _QB_GROUP_AXES, None))
 
 
-_DEFERRED_GRAD_WEIGHTS = (
-    lambda b: b.rms_attn.weight,
-    lambda b: b.attn_gated_norm.w_down,
-    lambda b: b.attn_gated_norm.w_up,
-    lambda b: b.rms_mlp.weight,
-    lambda b: b.mlp_gated_norm.w_down,
-    lambda b: b.mlp_gated_norm.w_up,
-    lambda b: b.mlp.router,
-)
+def _without_unit_axes(spec: P, mesh: jax.sharding.AbstractMesh) -> P | None:
+    """``spec`` with size-1 mesh axes dropped, or None when it shards over a batch axis of size > 1."""
+    out = []
+    for p in spec:
+        axes = tuple(a for a in (p if isinstance(p, tuple) else (p,)) if p is not None and _mesh_axis_size(mesh, a) > 1)
+        if set(axes) & set(_BATCH_AXES):
+            return None
+        out.append(axes[0] if len(axes) == 1 else (axes or None))
+    return P(*out)
 
 
 def _mark_reduced(blocks: "Block") -> "Block":
-    """Mark the stacked small replicated weights ``reduced`` over the batch axes.
+    """Mark the stacked block weights that are replicated over the batch axes ``reduced`` over them.
 
     Their cotangents then stay unreduced through the layer scan; the transpose of this reshard reduces each once,
-    after the scan, instead of one all-reduce per weight in every iteration.
+    after the scan, instead of one all-reduce per weight in every iteration. This covers the norms, GatedNorm and
+    the router, and the attention and shared-expert weights when they are not sharded (e.g. ``replica_axis`` > 1
+    with ``data`` 1). Expert weights are sharded over ``expert`` and keep their per-layer reduction, which overlaps
+    with the backward. ``router_bias`` is excluded: it is added elementwise and has no gradient.
     """
+    mesh = get_abstract_mesh()
 
-    def mark(x: jax.Array) -> jax.Array:
-        spec = jax.typeof(x).sharding.spec
-        if any(p is not None for p in spec):
-            raise ValueError(f'replicated_grad_reduction="after_scan" expects replicated weights, got {spec}')
-        return reshard(x, P(*([None] * x.ndim), reduced=frozenset(_BATCH_AXES)))
+    def mark(path, x):
+        if not isinstance(x, jax.Array) or any(getattr(k, "name", None) == "router_bias" for k in path):
+            return x
+        spec = _without_unit_axes(jax.typeof(x).sharding.spec, mesh)
+        if spec is None:
+            return x
+        # Every batch axis, size-1 ones included: a dot's unreduced output must name its contracting dim's axes.
+        return reshard(x, P(*spec, reduced=frozenset(_BATCH_AXES)))
 
-    return eqx.tree_at(
-        lambda b: [get(b) for get in _DEFERRED_GRAD_WEIGHTS],
-        blocks,
-        [mark(get(blocks)) for get in _DEFERRED_GRAD_WEIGHTS],
-    )
+    return jax.tree_util.tree_map_with_path(mark, blocks)
 
 
 class Block(eqx.Module):

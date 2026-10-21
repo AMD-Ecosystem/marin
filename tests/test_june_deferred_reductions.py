@@ -40,12 +40,14 @@ BASE = GrugModelConfig(
     use_array_stacked_blocks=True, disable_pko=True,
 )
 MESH = compact_grug_mesh(expert_axis_size=2, replica_axis_size=1)
+# Weights replicated per node: replica_dcn=2, data=1, so the attention and shared-expert weights are replicated too.
+REPLICA_MESH = compact_grug_mesh(expert_axis_size=2, replica_axis_size=2)
 TOKENS = jax.random.randint(jax.random.key(1), (8, 8), 0, BASE.vocab_size)
 WEIGHT = jnp.ones((8, 8), dtype=jnp.float32)
 
 
-def run(cfg):
-    with jax.set_mesh(MESH):
+def run(cfg, mesh=MESH):
+    with jax.set_mesh(mesh):
         model = Transformer.init(cfg, key=jax.random.key(0))
 
         def loss_fn(m):
@@ -90,6 +92,23 @@ def test_deferred_replicated_gradients_match_and_leave_the_layer_scan():
             np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-6)
         base, deferred = all_reduces_in_loops(hlo), all_reduces_in_loops(d_hlo)
         assert deferred < base, (deferred, base)
+        """
+    )
+
+
+@pytest.mark.timeout(600)
+def test_deferred_gradients_cover_dense_weights_replicated_per_node():
+    _run(
+        """
+        loss, metrics, grads, hlo = run(BASE, REPLICA_MESH)
+        d_loss, _, d_grads, d_hlo = run(dataclasses.replace(BASE, replicated_grad_reduction="after_scan"), REPLICA_MESH)
+        np.testing.assert_allclose(d_loss, loss, rtol=1e-6)
+        for got, want in zip(leaves(d_grads), leaves(grads), strict=True):
+            np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-6)
+        # Per layer only the expert weights' all-reduce over replica_dcn stays in the loop.
+        base, deferred = all_reduces_in_loops(hlo), all_reduces_in_loops(d_hlo)
+        assert deferred < base, (deferred, base)
+        print("in-loop all-reduces", base, deferred)
         """
     )
 
