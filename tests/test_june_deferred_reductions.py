@@ -91,6 +91,9 @@ def test_deferred_replicated_gradients_match_and_leave_the_layer_scan():
             np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-6)
         base, deferred = all_reduces_in_loops(hlo), all_reduces_in_loops(d_hlo)
         assert deferred < base, (deferred, base)
+        # A zero size limit defers nothing.
+        *_, z_hlo = run(dataclasses.replace(BASE, replicated_grad_reduction="after_scan", replicated_grad_max_bytes=0))
+        assert all_reduces_in_loops(z_hlo) == base
         """
     )
 
