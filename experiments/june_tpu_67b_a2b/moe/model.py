@@ -157,7 +157,11 @@ class GrugModelConfig:
     attention and shared-expert weights when not sharded) are reduced across the batch shards: in every layer
     ("per_layer"), or once after the layer scan ("after_scan", stacked blocks only): the weights are marked
     ``reduced`` over the batch axes before the scan, so their cotangents stay ``unreduced`` (per-device partial
-    sums) through it."""
+    sums) through it. Only weights up to ``replicated_grad_max_bytes`` per layer: those reductions are
+    latency-bound, while larger ones overlap with the backward in the scan and only lose that overlap after it."""
+    replicated_grad_max_bytes: int = 4 << 20
+    """Per-layer size limit for ``replicated_grad_reduction="after_scan"``. The default 4 MiB covers the norms,
+    GatedNorm, router and attention gate at d=2560 and leaves the attention and shared-expert weights in the scan."""
     router_stats_reduction: ScanReduction = "per_layer"
     """Where routing statistics and QB thresholds are reduced across the batch shards: in every layer
     ("per_layer"), or once after the layer scan from per-shard partials ("after_scan", stacked blocks only). Both
@@ -637,19 +641,22 @@ def _without_unit_axes(spec: P, mesh: jax.sharding.AbstractMesh) -> P | None:
     return P(*out)
 
 
-def _mark_reduced(blocks: "Block") -> "Block":
+def _mark_reduced(blocks: "Block", max_bytes: int) -> "Block":
     """Mark the stacked block weights that are replicated over the batch axes ``reduced`` over them.
 
     Their cotangents then stay unreduced through the layer scan; the transpose of this reshard reduces each once,
     after the scan, instead of one all-reduce per weight in every iteration. This covers the norms, GatedNorm and
-    the router, and the attention and shared-expert weights when they are not sharded (e.g. ``replica_axis`` > 1
-    with ``data`` 1). Expert weights are sharded over ``expert`` and keep their per-layer reduction, which overlaps
-    with the backward. ``router_bias`` is excluded: it is added elementwise and has no gradient.
+    the router, and any other replicated block weight up to ``max_bytes`` per layer. Larger ones (attention and
+    shared expert when not sharded, e.g. ``replica_axis`` > 1 with ``data`` 1) keep their per-layer reduction,
+    which overlaps with the backward; so do the expert weights, sharded over ``expert``. ``router_bias`` is excluded:
+    it is added elementwise and has no gradient.
     """
     mesh = get_abstract_mesh()
 
     def mark(path, x):
         if not isinstance(x, jax.Array) or any(getattr(k, "name", None) == "router_bias" for k in path):
+            return x
+        if x.size * x.dtype.itemsize // x.shape[0] > max_bytes:  # stacked: leading axis is the layer
             return x
         spec = _without_unit_axes(jax.typeof(x).sharding.spec, mesh)
         if spec is None:
@@ -853,7 +860,7 @@ class Transformer(eqx.Module):
 
             stacked = self.stacked_blocks.stacked
             if cfg.replicated_grad_reduction == "after_scan":
-                stacked = _mark_reduced(stacked)
+                stacked = _mark_reduced(stacked, cfg.replicated_grad_max_bytes)
             hidden, stacked_router_stats = jax.lax.scan(
                 _scan_layers,
                 hidden,

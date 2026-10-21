@@ -162,6 +162,12 @@ def parse_args() -> argparse.Namespace:
         help="Reduce the small replicated block weights' gradients in every layer or once after the layer scan.",
     )
     parser.add_argument(
+        "--replicated-grads-max-mib",
+        type=float,
+        default=4.0,
+        help="With --replicated-grads after_scan, defer only weights up to this many MiB per layer.",
+    )
+    parser.add_argument(
         "--router-stats",
         choices=get_args(ScanReduction),
         default="per_layer",
@@ -253,6 +259,7 @@ def main() -> None:
         num_expert_waves=args.num_expert_waves,
         scan_unroll=args.scan_unroll,
         replicated_grad_reduction=args.replicated_grads,
+        replicated_grad_max_bytes=int(args.replicated_grads_max_mib * (1 << 20)),
         router_stats_reduction=args.router_stats,
         qb_balance=args.qb_balance,
     )
