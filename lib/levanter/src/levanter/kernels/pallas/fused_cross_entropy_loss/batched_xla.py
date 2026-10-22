@@ -24,6 +24,9 @@ _GB10_XLA_STREAMING_V_BLOCK_BATCH_8K = 3072
 _LARGE_VOCAB_THRESHOLD = 65536
 _GB10_CUSTOM_BWD_V_BLOCK_BATCH_1K = 6144
 _GB10_CUSTOM_BWD_V_BLOCK_BATCH_2K_PLUS = 7168
+# MI355X, x [32768, 2560] x w [2560, 128256] bf16: 87.8 ms at 1024 (the forward autotune's pick), 53.6 ms at 8192,
+# 53.4 ms at 16384 with 1.8 GiB more peak memory. Each vocab block re-reads and re-writes the f32 grad_x.
+_MI355X_CUSTOM_BWD_V_BLOCK = 8192
 _GPU_MIN_B_BLOCK_SIZE = 128
 _H100_FULL_VOCAB_B_TILED_BLOCK_SIZE = 8192
 _H100_FULL_VOCAB_B_TILED_MIN_BATCH = 8192
@@ -524,6 +527,16 @@ def _gb10_custom_backward_v_block_size(
     return None
 
 
+def _mi355x_custom_backward_v_block_size(
+    x: Float[Array, "B H"],
+    w: Float[Array, "H V"],
+) -> int | None:
+    is_mi355x_bf16 = "mi355" in _device_kind() and x.dtype == jnp.bfloat16 and w.dtype == jnp.bfloat16
+    if not is_mi355x_bf16 or w.shape[1] < _LARGE_VOCAB_THRESHOLD:
+        return None
+    return _MI355X_CUSTOM_BWD_V_BLOCK
+
+
 def _custom_backward_v_block_size(
     x: Float[Array, "B H"],
     w: Float[Array, "H V"],
@@ -532,6 +545,9 @@ def _custom_backward_v_block_size(
     gb10_tuned = _gb10_custom_backward_v_block_size(x, w)
     if gb10_tuned is not None:
         return gb10_tuned
+    mi355x_tuned = _mi355x_custom_backward_v_block_size(x, w)
+    if mi355x_tuned is not None:
+        return mi355x_tuned
     if block_sizes is not None:
         return block_sizes.v_block_size
     return BlockSizes.get_default().v_block_size
