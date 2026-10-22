@@ -106,14 +106,23 @@ def _moe_mlp_ep_ring_dedup_local(
         sent_assignments = jnp.sum(jnp.take_along_axis(keep, destination, axis=1) & assignment_valid, dtype=jnp.int32)
         sender_dropped = valid_assignments - sent_assignments
 
-        # Per send row: the token's combine weights and local expert ids on that destination.
         slot_valid = source < tokens
         safe_source = jnp.minimum(source, tokens - 1)
-        slot_destination = jnp.arange(send_rows, dtype=jnp.int32) // pair_capacity
-        slot_selected = selected[safe_source]
-        on_destination = slot_valid[:, None] & (slot_selected // local_experts == slot_destination[:, None])
-        slot_local_ids = jnp.where(on_destination, slot_selected - slot_destination[:, None] * local_experts, -1)
-        slot_weights = jnp.where(on_destination, combine_weights_local[safe_source].astype(jnp.float32), 0.0)
+        # Per send row: the token's combine weights and local expert ids on that destination. Scattering each
+        # assignment to its send row, rather than gathering per send row, makes the weights' gradient a gather
+        # instead of a scatter-add.
+        assignment_slot = jnp.take_along_axis(slot, destination, axis=1)
+        route = jnp.arange(topk)
+        slot_weights = (
+            jnp.zeros((send_rows, topk), jnp.float32)
+            .at[assignment_slot, route]
+            .set(combine_weights_local.astype(jnp.float32), mode="drop", unique_indices=True)
+        )
+        slot_local_ids = (
+            jnp.full((send_rows, topk), -1, jnp.int32)
+            .at[assignment_slot, route]
+            .set(selected % local_experts, mode="drop", unique_indices=True)
+        )
         metadata = jnp.concatenate([slot_weights, slot_local_ids.astype(jnp.float32)], axis=1)
         metadata = metadata.reshape(ep_size, pair_capacity, 2 * topk)
         # One trailer row per destination carries this shard's valid demand, which the receiver

@@ -61,19 +61,19 @@ def _combine_gather_sum_bwd(_output_dtype, residual, cotangent):
     assignments_per_shard = tokens_per_shard * topk
     valid = assignment_sources < assignments_per_shard
     sources = jnp.minimum(assignment_sources, assignments_per_shard - 1)
-    source_tokens = sources // topk
     source_weights = combine_weights.reshape(-1)[sources].astype(jnp.float32)
-    d_send_output = cotangent[source_tokens].astype(jnp.float32) * source_weights[:, None]
+    source_cotangent = cotangent[sources // topk].astype(jnp.float32)
+    d_send_output = source_cotangent * source_weights[:, None]
     d_send_output = jnp.where(valid[:, None], d_send_output, 0).astype(send_output.dtype)
+    # `gather_indices` and `assignment_sources` are inverse maps, so each weight's gradient is its send row's dot
+    # product with the cotangent row gathered above. XLA can then fuse this reduction into the pass that writes
+    # d_send_output, instead of re-reading the cotangent and gathering send_output once per route.
+    d_send_weights = jnp.sum(source_cotangent * send_output.astype(jnp.float32), axis=1)
 
     gather_indices = gather_indices.reshape(tokens_per_shard, topk)
     keep = (gather_indices >= 0) & (gather_indices < send_output.shape[0])
-    d_weights = []
-    for route_index in range(topk):  # unrolled, as in the forward
-        rows = send_output[jnp.minimum(gather_indices[:, route_index], send_output.shape[0] - 1)]
-        d_weight = jnp.sum(cotangent.astype(jnp.float32) * rows.astype(jnp.float32), axis=1)
-        d_weights.append(jnp.where(keep[:, route_index], d_weight, 0).astype(combine_weights.dtype))
-    return d_send_output, None, None, jnp.stack(d_weights, axis=1)
+    d_weights = d_send_weights[jnp.minimum(gather_indices, send_output.shape[0] - 1)]
+    return d_send_output, None, None, jnp.where(keep, d_weights, 0).astype(combine_weights.dtype)
 
 
 _combine_gather_sum.defvjp(_combine_gather_sum_fwd, _combine_gather_sum_bwd)
