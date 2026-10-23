@@ -29,7 +29,7 @@ from levanter.grug._moe.common import (
     _scaled_capacity,
     _swiglu_gate_up_backward,
 )
-from levanter.grug._moe.ep_common import _combine_gather_sum
+from levanter.grug._moe.ep_common import _combine_gather_sum, _prefix_cap_counts
 from levanter.grug._moe.ep_deepep import _pack_deepep_local_assignments
 from levanter.grug._moe.ep_fixed_all_to_all import _moe_mlp_ep_fixed_a2a_local
 from levanter.grug._moe.ep_fixed_pooled_wave_all_to_all import (
@@ -46,7 +46,7 @@ from levanter.grug._moe.ep_ragged_all_to_all import (
     _transport_buffer,
     _unpermute_from_global_expert,
 )
-from levanter.grug._moe.ep_ring import _gather_dispatch_combine
+from levanter.grug._moe.ep_ring import _gather_dispatch_combine, _select_local_assignments
 from levanter.grug._moe.ep_ring_filtered import _down_project_combine, _slot_weights
 from levanter.grug._moe.sonic import sonic_gather_sum, sonic_scatter_rows
 from levanter.grug._moe.topk import top_k_indices
@@ -2439,3 +2439,42 @@ def test_transport_buffer_sites_prevent_cse():
     assert (
         _optimized_hlo_opcode_count(repeated_site, MINIMUM_OPCODE) == 1
     ), "the CSE probe no longer merges repeated sites, so this test can no longer detect a site collision"
+
+
+def _top_k_local_assignments(local_expert, local_mask, *, local_experts, logical_capacity, physical_capacity):
+    """The previous selection: a top_k over (local expert id, flat position) keys."""
+    assignments = local_expert.shape[0]
+    counts = jnp.sum(
+        (local_expert[:, None] == jnp.arange(local_experts)[None, :]) & local_mask[:, None], axis=0, dtype=jnp.int32
+    )
+    accepted_counts = _prefix_cap_counts(counts, capacity=logical_capacity)
+    accepted_total = jnp.sum(accepted_counts)
+    order_key = local_expert * assignments + jnp.arange(assignments, dtype=jnp.int32)
+    _, picked = jax.lax.top_k(jnp.where(local_mask, local_experts * assignments - order_key, -1), physical_capacity)
+    return accepted_counts, jnp.sum(counts) - accepted_total, picked, jnp.arange(physical_capacity) < accepted_total
+
+
+@pytest.mark.parametrize(
+    ("logical_capacity", "physical_capacity"),
+    [(40, 48), (200, 200), (200, 230), (0, 16)],
+    ids=["drops", "fits", "physical_past_logical", "none_accepted"],
+)
+def test_select_local_assignments_matches_top_k_selection(logical_capacity, physical_capacity):
+    rng = np.random.default_rng(0)
+    assignments, local_experts = 240, 6
+    local_mask = jnp.asarray(rng.random(assignments) < 0.7)
+    local_expert = jnp.where(local_mask, jnp.asarray(rng.integers(0, local_experts, assignments), jnp.int32), 0)
+    kwargs = dict(
+        local_experts=local_experts, logical_capacity=jnp.int32(logical_capacity), physical_capacity=physical_capacity
+    )
+
+    sizes, dropped, picked, valid = _select_local_assignments(local_expert, local_mask, **kwargs)
+    want_sizes, want_dropped, want_picked, want_valid = _top_k_local_assignments(local_expert, local_mask, **kwargs)
+
+    np.testing.assert_array_equal(sizes, want_sizes)
+    assert int(dropped) == int(want_dropped)
+    np.testing.assert_array_equal(valid, want_valid)
+    np.testing.assert_array_equal(
+        np.asarray(picked)[np.asarray(valid)], np.asarray(want_picked)[np.asarray(want_valid)]
+    )
+    assert bool(jnp.all((picked >= 0) & (picked < assignments)))
