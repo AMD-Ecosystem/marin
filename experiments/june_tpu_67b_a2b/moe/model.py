@@ -57,7 +57,10 @@ _BATCH_AXES: tuple[str, ...] = ("replica_dcn", "data", "expert")
 _QB_GROUP_AXES: tuple[str, ...] = ("replica_dcn", "data")
 
 
-RematMode = Literal["recompute_all", "save_moe"]
+RematMode = Literal["recompute_all", "save_moe", "save_moe_attn"]
+# jax-aiter names its attention residuals (output, LSE, q/k/v) "context", as Transformer Engine does; a policy that
+# saves the name keeps the backward from re-running the attention forward.
+ATTENTION_REMAT_SAVE_NAME = "context"
 ScanReduction = Literal["per_layer", "after_scan"]
 QbBalance = Literal["global", "per_node"]
 
@@ -130,7 +133,9 @@ class GrugModelConfig:
     remat_mode: RematMode = "recompute_all"
     """Per-block gradient checkpointing. "recompute_all" reruns the whole block in
     backward (lowest memory); "save_moe" keeps the tagged MoE dispatch tensors so
-    backward skips re-running expert dispatch and its EP collectives."""
+    backward skips re-running expert dispatch and its EP collectives; "save_moe_attn" also keeps the
+    attention residuals the attention backend names (jax-aiter's ``gpu_aiter_flash``), so backward
+    does not re-run the attention forward either."""
     replicate_attn_weights: bool = False
     """If True, store w_q/w_k/w_v/w_o fully replicated (P(None, None)) instead
     of FSDP-sharded across the data axis. Attention weights are small (~128 KB
@@ -822,6 +827,10 @@ class Transformer(eqx.Module):
 
         if cfg.remat_mode == "save_moe":
             remat_policy = jax.checkpoint_policies.save_only_these_names(*MOE_REMAT_SAVE_NAMES)
+        elif cfg.remat_mode == "save_moe_attn":
+            remat_policy = jax.checkpoint_policies.save_only_these_names(
+                *MOE_REMAT_SAVE_NAMES, ATTENTION_REMAT_SAVE_NAME
+            )
         else:
             remat_policy = None
 
