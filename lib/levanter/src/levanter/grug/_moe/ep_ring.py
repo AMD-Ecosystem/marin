@@ -34,9 +34,9 @@ def _select_local_assignments(
 ) -> tuple[Int[Array, "Elocal"], jax.Array, Int[Array, "C"], Bool[Array, "C"]]:
     """Pick this shard's assignments in (local expert id, flat position) order under ring's capacity rule.
 
-    ``local_expert`` must be zero where ``local_mask`` is false. Returns the ``ragged_dot`` group sizes, with
-    padding rows attributed to the last expert, the dropped assignment count, the picked flat positions and
-    which of the ``physical_capacity`` picks are valid.
+    ``local_expert`` must be zero where ``local_mask`` is false. Returns the ``ragged_dot`` group sizes (the padding
+    rows past their sum belong to no expert), the dropped assignment count, the picked flat positions and which of
+    the ``physical_capacity`` picks are valid.
     """
     assignments = local_expert.shape[0]
     # TPU lowers this small-expert count reduction better as a dense compare+sum than as `bincount`.
@@ -56,9 +56,9 @@ def _select_local_assignments(
     order_key = local_expert * assignments + jnp.arange(assignments, dtype=jnp.int32)
     selection_key = jnp.where(local_mask, local_experts * assignments - order_key, -1)
     _, picked = jax.lax.top_k(selection_key, physical_capacity)
-    # `picked` pads with invalid rows at the end; attribute them to the final expert segment.
-    group_sizes = accepted_counts.at[-1].add(physical_capacity - accepted_total)
-    return group_sizes, dropped, picked, valid
+    # `picked` pads with invalid rows at the end. They stay outside every group: ragged_dot returns zeros for
+    # them and skips them, instead of computing them as the last expert's rows.
+    return accepted_counts, dropped, picked, valid
 
 
 def _gather_sum_slots(rows: Float[Array, "P H"], slots: Int[Array, "T K"]) -> Float[Array, "T H"]:

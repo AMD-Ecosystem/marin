@@ -292,3 +292,19 @@ def test_triton_ragged_dot_value_and_gradients_match_reference_with_device_block
     _assert_close_to_reference(out, expected_out, 1e-2)
     _assert_close_to_reference(dlhs, expected_dlhs, 1e-2)
     _assert_close_to_reference(drhs, expected_drhs, 1e-2)
+
+
+@pytest.mark.parametrize("implementation", ["xla", "megablox"])
+def test_ragged_dot_zeroes_rows_past_the_last_group(implementation):
+    """Rows outside every group come back as zeros, so callers may leave padding rows ungrouped."""
+    if implementation == "megablox" and ragged_dot_module._gmm_megablox is None:
+        pytest.skip("megablox is not available")
+    lhs, rhs, sizes = _layout_operands("fwd", jnp.float32, _GROUP_SIZE_CASES["rows_past_last_group"])
+    active = sum(_GROUP_SIZE_CASES["rows_past_last_group"])
+
+    out = jax.jit(lambda a, b, g: ragged_dot(a, b, g, implementation=implementation))(lhs, rhs, sizes)
+    expected = _cpu_f32_reference(lhs, rhs, sizes, ragged_dot_module._DEFAULT_DIM_NUMS)
+
+    (out,) = _to_cpu_f32(out)
+    assert bool(jnp.all(out[active:] == 0))
+    _assert_close_to_reference(out[:active], expected[:active], 1e-4)

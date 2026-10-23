@@ -100,10 +100,16 @@ def _megablox_tiling(m: int, k: int, n: int) -> tuple[int, int, int]:
     return min(m, tile_size[0]), min(k, tile_size[1]), min(n, tile_size[2])
 
 
+def _zero_rows_past_groups(out: jax.Array, group_sizes: jax.Array) -> jax.Array:
+    """Zero the rows past ``sum(group_sizes)``, which a grouped kernel may leave unwritten."""
+    active_rows = jnp.sum(group_sizes, dtype=jnp.int32)
+    return jnp.where(jnp.arange(out.shape[0])[:, None] < active_rows, out, jnp.zeros((), out.dtype))
+
+
 def _ragged_dot_megablox_impl(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array) -> jax.Array:
     if _gmm_megablox is None:
         raise NotImplementedError("megablox GMM is not available (TPU-only)")
-    return _gmm_megablox(
+    out = _gmm_megablox(
         lhs,
         rhs,
         group_sizes,
@@ -111,6 +117,7 @@ def _ragged_dot_megablox_impl(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.A
         tiling=_megablox_tiling,
         interpret=jax.default_backend() == "cpu",
     )
+    return _zero_rows_past_groups(out, group_sizes)
 
 
 def _triton_ragged_dot_kernel(
@@ -794,8 +801,13 @@ def _triton_pallas_call(
 ) -> jax.Array:
     """Raw Pallas-Triton grouped matmul for supported ragged-dot layouts, with one kernel family."""
     for layout, dim_nums in _LAYOUT_DIM_NUMS.items():
-        if ragged_dot_dimension_numbers == dim_nums:
-            return _TRITON_KERNELS[family](lhs, rhs, group_sizes, layout)
+        if ragged_dot_dimension_numbers != dim_nums:
+            continue
+        out = _TRITON_KERNELS[family](lhs, rhs, group_sizes, layout)
+        # The tile-map kernels zero the rows past the last group; the group-grid kernels leave them unwritten.
+        if family == TritonKernelFamily.GROUP_GRID and layout != RaggedLayout.DRHS:
+            out = _zero_rows_past_groups(out, group_sizes)
+        return out
     raise NotImplementedError(f"Unsupported ragged dot dimension numbers for Triton: {ragged_dot_dimension_numbers}")
 
 
@@ -835,7 +847,7 @@ _ragged_dot_triton_impl.defvjp(_ragged_dot_triton_fwd, _ragged_dot_triton_bwd)
 
 
 def _ragged_dot_xla_impl(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array) -> jax.Array:
-    return jax.lax.ragged_dot_general(
+    out = jax.lax.ragged_dot_general(
         lhs=lhs,
         rhs=rhs,
         group_sizes=group_sizes,
@@ -845,6 +857,7 @@ def _ragged_dot_xla_impl(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array)
             rhs_group_dimensions=(0,),
         ),
     )
+    return _zero_rows_past_groups(out, group_sizes)
 
 
 def _preferred_implementations(implementation: Implementation) -> tuple[Implementation, ...]:
@@ -902,7 +915,8 @@ def ragged_dot(
             TPU megablox. ``"xla"`` forces ``jax.lax.ragged_dot_general``.
 
     Returns:
-        A [tokens, out] array.
+        A [tokens, out] array. Rows past ``sum(group_sizes_)`` are zero on every implementation, so
+        callers may leave trailing rows outside all groups instead of assigning them to an expert.
     """
     hs_shape = lhs_.shape
     if hs_shape[0] % 512:
