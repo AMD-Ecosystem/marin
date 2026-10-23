@@ -41,23 +41,23 @@ def _select_local_assignments(
     assignments = local_expert.shape[0]
     # TPU lowers this small-expert count reduction better as a dense compare+sum than as `bincount`.
     expert_ids = jnp.arange(local_experts, dtype=jnp.int32)
-    counts = jnp.sum(
-        (local_expert[:, None] == expert_ids[None, :]).astype(jnp.int32) * local_mask.astype(jnp.int32)[:, None],
-        axis=0,
-        dtype=jnp.int32,
-    )
+    one_hot = ((local_expert[:, None] == expert_ids[None, :]) & local_mask[:, None]).astype(jnp.int32)
+    counts = jnp.sum(one_hot, axis=0, dtype=jnp.int32)
     accepted_counts = _prefix_cap_counts(counts, capacity=logical_capacity)
     accepted_total = jnp.sum(accepted_counts, dtype=jnp.int32)
     dropped = jnp.sum(counts, dtype=jnp.int32) - accepted_total
     valid = jnp.arange(physical_capacity, dtype=jnp.int32) < accepted_total
 
-    # A top_k over (local expert id, flat position) keys avoids a global argsort while preserving the
-    # grouped layout expected by ragged_dot.
-    order_key = local_expert * assignments + jnp.arange(assignments, dtype=jnp.int32)
-    selection_key = jnp.where(local_mask, local_experts * assignments - order_key, -1)
-    _, picked = jax.lax.top_k(selection_key, physical_capacity)
-    # `picked` pads with invalid rows at the end. They stay outside every group: ragged_dot returns zeros for
-    # them and skips them, instead of computing them as the last expert's rows.
+    # Each assignment's slot is its rank in (local expert id, flat position) order: its expert's start plus its rank
+    # within the expert. Scattering the flat positions to their slots keeps the grouped layout ragged_dot expects
+    # without a sort (a top_k over every assignment lowers to a multi-pass radix sort on GPU). Unselected
+    # assignments get distinct out-of-range slots, so the scatter's indices stay unique.
+    position = jnp.arange(assignments, dtype=jnp.int32)
+    rank_in_expert = jnp.take_along_axis(jnp.cumsum(one_hot, axis=0, dtype=jnp.int32), local_expert[:, None], axis=1)
+    slot = (jnp.cumsum(counts) - counts)[local_expert] + rank_in_expert[:, 0] - 1
+    slot = jnp.where(local_mask, slot, physical_capacity + position)
+    picked = jnp.zeros((physical_capacity,), jnp.int32).at[slot].set(position, mode="drop", unique_indices=True)
+    # Slots past accepted_total are padding: invalid, and outside every group (ragged_dot returns zeros for them).
     return accepted_counts, dropped, picked, valid
 
 
