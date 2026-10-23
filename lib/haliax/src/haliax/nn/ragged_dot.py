@@ -403,13 +403,13 @@ _TILE_MAP_CONFIGS: dict[_GpuFamily, dict[RaggedLayout, TritonBlockConfig]] = {
     # expert shapes; see lib/levanter/scripts/bench/bench_ragged_dot_triton.py.
     _GpuFamily.AMD_INSTINCT: {
         RaggedLayout.FWD: TritonBlockConfig(
-            block_m=256, block_n=256, block_k=64, num_warps=8, num_stages=2, num_xcds=1, group_m=2
+            block_m=128, block_n=256, block_k=64, num_warps=4, num_stages=1, num_xcds=1, group_m=8
         ),
         RaggedLayout.DLHS: TritonBlockConfig(
             block_m=256, block_n=256, block_k=64, num_warps=8, num_stages=2, num_xcds=1, group_m=4
         ),
         RaggedLayout.DRHS: TritonBlockConfig(
-            block_m=256, block_n=128, block_k=64, num_warps=4, num_stages=1, num_xcds=8, group_m=8
+            block_m=256, block_n=128, block_k=64, num_warps=4, num_stages=1, num_xcds=1, group_m=8
         ),
     },
     # Swept on H100 and GB200 at the same shapes.
@@ -640,6 +640,7 @@ def _tile_map_contracting_kernel(
     a_ref,
     b_ref,
     bounds_ref,
+    order_ref,
     out_ref,
     *,
     config: TritonBlockConfig,
@@ -653,7 +654,7 @@ def _tile_map_contracting_kernel(
     num_n_tiles = pl.cdiv(n, block_n)
     pid, has_work = _program_index(num_groups * num_m_tiles * num_n_tiles, config.num_xcds)
     pid = jnp.minimum(pid, num_groups * num_m_tiles * num_n_tiles - 1)
-    group = pid // (num_m_tiles * num_n_tiles)
+    group = order_ref[pid // (num_m_tiles * num_n_tiles)]
     m_tile, n_tile = _tile_coordinates(pid % (num_m_tiles * num_n_tiles), num_m_tiles, num_n_tiles, config.group_m)
     start_m = m_tile * block_m
     start_n = n_tile * block_n
@@ -692,7 +693,7 @@ def _tile_map_contracting_matmul(
     return pl.pallas_call(
         functools.partial(_tile_map_contracting_kernel, config=config, m=m, n=n, num_groups=num_groups),
         out_shape=jax.ShapeDtypeStruct((num_groups, m, n), dtype),
-        in_specs=[pl.no_block_spec, pl.no_block_spec, pl.no_block_spec],
+        in_specs=[pl.no_block_spec, pl.no_block_spec, pl.no_block_spec, pl.no_block_spec],
         out_specs=pl.no_block_spec,
         grid=_launch_grid(num_groups * pl.cdiv(m, config.block_m) * pl.cdiv(n, config.block_n), config.num_xcds),
         compiler_params=plgpu.CompilerParams(num_warps=config.num_warps, num_stages=config.num_stages),
@@ -722,7 +723,9 @@ def _tile_map_pallas_call(
         num_groups = group_sizes.shape[0]
         config = (config or _tile_map_block_config(layout, m, rows, n, num_groups)).fit(m, rows, n)
         bounds = jnp.cumulative_sum(group_sizes.astype(jnp.int32), include_initial=True)
-        return _tile_map_contracting_matmul(rows, m, n, num_groups, lhs.dtype, config)(lhs, rhs, bounds)
+        # Largest groups first, so the longest programs start early instead of forming the tail.
+        order = jnp.argsort(-group_sizes.astype(jnp.int32), stable=True).astype(jnp.int32)
+        return _tile_map_contracting_matmul(rows, m, n, num_groups, lhs.dtype, config)(lhs, rhs, bounds, order)
 
     m, k = lhs.shape
     num_groups = rhs.shape[0]
