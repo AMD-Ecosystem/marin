@@ -155,8 +155,9 @@ class GrugModelConfig:
     scan body so XLA only plans HBM for one iteration's intermediates — needed
     at scale where the unrolled program OOMs at compile time."""
     scan_unroll: int = 1
-    """Layers per iteration of the stacked-blocks ``lax.scan`` (its ``unroll``). More exposes more layers to XLA's
-    scheduler, e.g. to start the next layers' weight all-gathers early, at the cost of compile time and peak memory."""
+    """Layer groups per iteration of the stacked-blocks ``lax.scan`` (its ``unroll``); a group is
+    ``LONG_ATTENTION_INTERVAL`` layers, always unrolled. More exposes more layers to XLA's scheduler, e.g. to start the
+    next layers' weight all-gathers early, at the cost of compile time and peak memory."""
     replicated_grad_reduction: ScanReduction = "per_layer"
     """Where the gradients of the block weights replicated over the batch axes (RMSNorm, GatedNorm, router, and the
     attention and shared-expert weights when not sharded) are reduced across the batch shards: in every layer
@@ -711,24 +712,29 @@ class Block(eqx.Module):
         position_ids: jax.Array | None = None,
     ) -> tuple[Float[Array, "B S D"], dict[str, jax.Array]]:
         attn_in = self.attn_gated_norm(self.rms_attn(x))
-        # lax.cond so the body has a uniform shape across scan iterations:
-        # long layers use the full causal mask (and may PKO / drop RoPE); short
-        # layers use the sliding-window mask, never PKO, and always RoPE.
-        attn_out = jax.lax.cond(
-            jnp.asarray(use_long_mask, dtype=jnp.bool_),
-            lambda _: self.attn(
+
+        # Long layers use the full causal mask (and may PKO / drop RoPE); short layers use the sliding-window mask,
+        # never PKO, and always RoPE.
+        def long_attention(_):
+            return self.attn(
                 attn_in,
                 long_mask,
                 use_pko=use_pko,
                 disable_rope=disable_long_rope,
                 qk_mult_scale=self.attn.cfg.qk_mult_long_scale,
                 position_ids=position_ids,
-            ),
-            lambda _: self.attn(
+            )
+
+        def short_attention(_):
+            return self.attn(
                 attn_in, short_mask, use_pko=False, disable_rope=False, qk_mult_scale=1.0, position_ids=position_ids
-            ),
-            operand=None,
-        )
+            )
+
+        if isinstance(use_long_mask, bool):
+            attn_out = long_attention(None) if use_long_mask else short_attention(None)
+        else:
+            # A traced choice: XLA:GPU resolves a conditional's branch on the host, one sync per call.
+            attn_out = jax.lax.cond(jnp.asarray(use_long_mask, dtype=jnp.bool_), long_attention, short_attention, None)
         x = x + attn_out
         mlp_in = self.mlp_gated_norm(self.rms_mlp(x))
         token_valid = token_validity_from_attention_mask(
@@ -747,6 +753,56 @@ def _long_layer_schedule(num_layers: int) -> jax.Array:
     """Bool[num_layers] = True for every 4th layer and the last layer."""
     idx = jnp.arange(num_layers)
     return ((idx % LONG_ATTENTION_INTERVAL) == LONG_ATTENTION_INTERVAL - 1) | (idx == num_layers - 1)
+
+
+def _reshape_leading(a: jax.Array, leading: tuple[int, ...], kept: int) -> jax.Array:
+    """Reshape the leading (layer) axes to ``leading``, keeping the sharding of the last ``a.ndim - kept`` axes.
+
+    The layer axes are never sharded; with explicit sharding a reshape needs its output sharding spelled out.
+    """
+    shape = (*leading, *a.shape[kept:])
+    sharding = jax.typeof(a).sharding
+    if sharding.mesh.empty:
+        return a.reshape(shape)
+    spec = sharding.spec
+    assert all(s is None for s in spec.partitions[:kept]), spec
+    out = P(*(None,) * len(leading), *spec.partitions[kept:], reduced=spec.reduced, unreduced=spec.unreduced)
+    return jax.lax.reshape(a, shape, out_sharding=out)
+
+
+def _layer(stacked: "Block", index: int) -> "Block":
+    return jax.tree.map(lambda a: a[index] if isinstance(a, jax.Array) else a, stacked)
+
+
+def _scan_with_static_schedule(apply_layer, stacked: "Block", hidden: jax.Array, num_layers: int, unroll: int):
+    """Run the stacked layers with every layer's attention kind fixed at trace time.
+
+    Long attention is every ``LONG_ATTENTION_INTERVAL``-th layer and the last (``_long_layer_schedule``). Groups of
+    that many layers (short, ..., short, long) are scanned with the group unrolled; the remaining layers, the last of
+    them long, run after the scan. A per-layer ``lax.cond`` on a scanned schedule would make XLA:GPU read the branch
+    on the host in every layer, forward and backward. Returns the hidden state and the layers' outputs stacked in
+    layer order.
+    """
+    period = LONG_ATTENTION_INTERVAL
+    scanned = (num_layers // period) * period
+
+    def group_body(carry, group):
+        outputs = []
+        for j in range(period):
+            carry, out = apply_layer(carry, _layer(group, j), j == period - 1)
+            outputs.append(out)
+        return carry, jax.tree.map(lambda *xs: jnp.stack(xs), *outputs)
+
+    groups = jax.tree.map(
+        lambda a: _reshape_leading(a[:scanned], (scanned // period, period), 1) if isinstance(a, jax.Array) else a,
+        stacked,
+    )
+    hidden, group_outputs = jax.lax.scan(group_body, hidden, xs=groups, unroll=unroll)
+    outputs = [jax.tree.map(lambda a: _reshape_leading(a, (scanned,), 2), group_outputs)]
+    for i in range(scanned, num_layers):
+        hidden, out = apply_layer(hidden, _layer(stacked, i), i == num_layers - 1)
+        outputs.append(jax.tree.map(lambda a: a[None], out))
+    return hidden, jax.tree.map(lambda *xs: jnp.concatenate(xs), *outputs)
 
 
 class Transformer(eqx.Module):
@@ -856,25 +912,19 @@ class Transformer(eqx.Module):
             }
         else:
             assert self.stacked_blocks is not None
-            mask_schedule = _long_layer_schedule(cfg.num_layers)
 
-            def _scan_layers(
-                carry_hidden: Float[Array, "B S D"],
-                scan_inputs: tuple[Block, Bool[Array, ""]],
+            def _apply_layer(
+                carry_hidden: Float[Array, "B S D"], layer: Block, use_long_mask: bool
             ) -> tuple[Float[Array, "B S D"], dict[str, jax.Array]]:
-                layer, layer_use_long_mask = scan_inputs
                 return eqx.filter_checkpoint(layer, policy=remat_policy)(
-                    carry_hidden, short_mask, long_mask, layer_use_long_mask, False, cfg.disable_long_rope, position_ids
+                    carry_hidden, short_mask, long_mask, use_long_mask, False, cfg.disable_long_rope, position_ids
                 )
 
             stacked = self.stacked_blocks.stacked
             if cfg.replicated_grad_reduction == "after_scan":
                 stacked = _mark_reduced(stacked, cfg.replicated_grad_max_bytes)
-            hidden, stacked_router_stats = jax.lax.scan(
-                _scan_layers,
-                hidden,
-                xs=(stacked, mask_schedule),
-                unroll=cfg.scan_unroll,
+            hidden, stacked_router_stats = _scan_with_static_schedule(
+                _apply_layer, stacked, hidden, cfg.num_layers, cfg.scan_unroll
             )
             if cfg.router_stats_reduction == "after_scan":
                 # One cross-device reduction for the whole layer stack (moe_routing_stats_local).

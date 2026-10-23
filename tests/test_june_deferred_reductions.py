@@ -32,9 +32,10 @@ from levanter.grug.sharding import compact_grug_mesh
 from experiments.june_tpu_67b_a2b.moe import train as june_train
 from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig, Transformer
 
+# Nine layers: two scanned groups of four (a layer loop the HLO checks can count in) and one layer after the scan.
 BASE = GrugModelConfig(
     vocab_size=32, hidden_dim=16, intermediate_dim=8, shared_expert_intermediate_dim=8, num_experts=4,
-    num_experts_per_token=2, num_layers=3, num_heads=2, num_kv_heads=1, head_dim=8, max_seq_len=8,
+    num_experts_per_token=2, num_layers=9, num_heads=2, num_kv_heads=1, head_dim=8, max_seq_len=8,
     sliding_window=4, capacity_factor=4.0, attention_implementation="reference", moe_implementation="ring",
     use_array_stacked_blocks=True, disable_pko=True,
 )
