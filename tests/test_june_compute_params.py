@@ -1,0 +1,96 @@
+# Copyright The Marin Authors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Train-step changes that must not change the numbers, on four CPU devices (data=2 x expert=2).
+
+- ``carry_compute_params``: the compute-dtype copy carried in the train state gives the same losses and parameters as
+  casting the parameters inside each step.
+- The ring_dedup routing state saved for backward (``grug_moe_routing``) gives the same gradients as recomputing it.
+
+Each case runs in a subprocess so XLA can configure the CPU device count before JAX initializes.
+"""
+
+import textwrap
+
+import pytest
+from levanter.testing.cpu_devices import run_on_cpu_devices
+
+_PRELUDE = """
+import collections
+import dataclasses
+
+import jax
+import jmp
+import numpy as np
+import optax
+from levanter.grug.sharding import compact_grug_mesh
+
+from experiments.june_tpu_67b_a2b.moe import train as june_train
+from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig
+
+BASE = GrugModelConfig(
+    vocab_size=32, hidden_dim=16, intermediate_dim=8, shared_expert_intermediate_dim=8, num_experts=4,
+    num_experts_per_token=2, num_layers=3, num_heads=2, num_kv_heads=1, head_dim=8, max_seq_len=8,
+    sliding_window=4, capacity_factor=4.0, attention_implementation="reference", moe_implementation="ring_dedup",
+    pooled_transport_capacity_factor=1.1,
+    use_array_stacked_blocks=True, disable_pko=True,
+)
+MESH = compact_grug_mesh(expert_axis_size=2, replica_axis_size=1)
+TOKENS = jax.random.randint(jax.random.key(1), (8, 8), 0, BASE.vocab_size)
+BATCH = collections.namedtuple("Batch", "tokens loss_weight attn_mask")(TOKENS, np.ones((8, 8), np.float32), None)
+POLICY = jmp.get_policy("p=f32,c=bfloat16")
+
+
+def train(cfg, *, carry_compute_params, steps=3):
+    optimizer = optax.adam(1e-2)
+    with jax.set_mesh(MESH):
+        state = june_train.initial_state(
+            cfg, optimizer=optimizer, mp=POLICY, key=jax.random.key(0), ema_beta=None,
+            carry_compute_params=carry_compute_params,
+        )
+        step = june_train._make_train_step(optimizer, POLICY, z_loss_weight=0.0, ema_beta=None)
+        losses = []
+        for _ in range(steps):
+            state, metrics, _ = step(state, BATCH)
+            losses.append(float(metrics["train/loss"]))
+    return losses, state
+
+
+def leaves(tree):
+    return [np.asarray(x, dtype=np.float32) for x in jax.tree_util.tree_leaves(tree)]
+"""
+
+
+def _run(body: str) -> None:
+    run_on_cpu_devices(_PRELUDE + textwrap.dedent(body), device_count=4)
+
+
+@pytest.mark.timeout(600)
+def test_carried_compute_params_match_casting_in_the_step():
+    _run(
+        """
+        cfg = dataclasses.replace(BASE, remat_mode="save_moe")
+        losses, state = train(cfg, carry_compute_params=False)
+        carried_losses, carried = train(cfg, carry_compute_params=True)
+        assert state.compute_params is None
+        np.testing.assert_allclose(carried_losses, losses, rtol=1e-6)
+        for a, b in zip(leaves(carried.params), leaves(state.params), strict=True):
+            np.testing.assert_allclose(a, b, rtol=1e-6, atol=1e-7)
+        # The carried copy is the cast of the updated parameters, router biases included.
+        for a, b in zip(leaves(carried.compute_params), leaves(POLICY.cast_to_compute(carried.params)), strict=True):
+            np.testing.assert_array_equal(a, b)
+        """
+    )
+
+
+@pytest.mark.timeout(600)
+def test_saving_routing_state_matches_recomputing_it():
+    _run(
+        """
+        losses, state = train(dataclasses.replace(BASE, remat_mode="recompute_all"), carry_compute_params=False)
+        saved_losses, saved = train(dataclasses.replace(BASE, remat_mode="save_moe"), carry_compute_params=False)
+        np.testing.assert_allclose(saved_losses, losses, rtol=1e-6)
+        for a, b in zip(leaves(saved.params), leaves(state.params), strict=True):
+            np.testing.assert_allclose(a, b, rtol=1e-6, atol=1e-7)
+        """
+    )
