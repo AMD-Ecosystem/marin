@@ -239,25 +239,29 @@ def _apply_half_rope(
     rope: RotaryConfig,
     position_ids: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """RoPE applied to the first ``head_dim`` channels of q/k.
+    """RoPE on the first half of q/k's ``head_dim`` channels; the second half passes through.
 
-    Matches ``levanter.grug.attention.apply_rotary_embedding``. Convention:
-    ``x1, x2 = split(x, 2, axis=-1)``; rotation is
-    ``[x1*cos - x2*sin, x2*cos + x1*sin]``.
+    Matches ``levanter.grug.attention.apply_rotary_embedding`` on the first half. Convention:
+    ``x1, x2 = split(x[..., :head_dim // 2], 2, axis=-1)``; rotation is ``[x1*cos - x2*sin, x2*cos + x1*sin]``.
+    Computed over the whole head as ``x*c + flip(x)*s`` on a ``(half, part, quarter)`` view, with ``c = 1`` and
+    ``s = 0`` on the rope-free half (exactly ``x`` there), so neither direction splits or concatenates the
+    32-wide channel blocks, whose fusions run at a third of HBM bandwidth on GPU.
     """
-    half_dim = head_dim // 2
-    inv_freq = _rope_inv_freq(half_dim, rope.theta)
+    quarter = head_dim // 4
+    inv_freq = _rope_inv_freq(quarter, rope.theta)
     positions = (
         jnp.arange(seq_len, dtype=jnp.float32)[None, :] if position_ids is None else position_ids.astype(jnp.float32)
     )
     angles = positions[..., None] * inv_freq
-    cos = jnp.cos(angles)[:, :, None, :]
-    sin = jnp.sin(angles)[:, :, None, :]
+    cos, sin = jnp.cos(angles), jnp.sin(angles)
+    one, zero = jnp.ones_like(cos), jnp.zeros_like(sin)
+    # [batch, seq, 1 (heads), half, part, quarter]
+    c = jnp.stack([jnp.stack([cos, cos], axis=-2), jnp.stack([one, one], axis=-2)], axis=-3)[:, :, None]
+    s = jnp.stack([jnp.stack([-sin, sin], axis=-2), jnp.stack([zero, zero], axis=-2)], axis=-3)[:, :, None]
 
     def _apply(x: jax.Array) -> jax.Array:
-        dtype = x.dtype
-        x1, x2 = jnp.split(x, 2, axis=-1)
-        return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1).astype(dtype)
+        blocks = x.reshape(*x.shape[:-1], 2, 2, quarter)
+        return (blocks * c + jnp.flip(blocks, axis=-2) * s).reshape(x.shape).astype(x.dtype)
 
     return _apply(q), _apply(k)
 
@@ -346,19 +350,11 @@ class CausalSelfAttention(eqx.Module):
         k = rms_norm(k)
         cfg = self.cfg
         if not disable_rope:
-            # Half-RoPE: apply rotary embedding only to first half of Q/K head_dim.
-            # Second half is rope-free on every layer.
-            half = head_dim // 2
-            q_rot, k_rot = _apply_half_rope(
-                q[..., :half],
-                k[..., :half],
-                seq_len=seq_len,
-                head_dim=half,
-                rope=cfg.rope,
-                position_ids=position_ids,
+            # Half-RoPE: rotary embedding only on the first half of Q/K head_dim; the second half is rope-free
+            # on every layer.
+            q, k = _apply_half_rope(
+                q, k, seq_len=seq_len, head_dim=head_dim, rope=cfg.rope, position_ids=position_ids
             )
-            q = jnp.concatenate([q_rot, q[..., half:]], axis=-1)
-            k = jnp.concatenate([k_rot, k[..., half:]], axis=-1)
         q = q * cfg.qk_mult * qk_mult_scale
         attn_out = attention(q, k, v, mask, implementation=self.cfg.attention_implementation)
         # Half-RoPE's slice+concat on the head_dim axis can leave the explicit-mesh
