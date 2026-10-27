@@ -1,10 +1,13 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Train-step changes that must not change the numbers, on four CPU devices (data=2 x expert=2).
+"""Train-step changes that must not change the numbers, on four CPU devices (data=2 x expert=2, or replica_dcn=2 x
+expert=2 for weights replicated per node).
 
 - ``carry_compute_params``: the compute-dtype copy carried in the train state gives the same losses and parameters as
-  casting the parameters inside each step.
+  casting the parameters inside each step, also with the layer scan on a replicated mesh.
+- ``replicated_grad_reduction``: reducing the replicated weights' gradients in every layer or after the layer scan
+  trains the same on a replicated mesh.
 - The ring_dedup routing state saved for backward (``grug_moe_routing``) gives the same gradients as recomputing it.
 
 Each case runs in a subprocess so XLA can configure the CPU device count before JAX initializes.
@@ -36,14 +39,16 @@ BASE = GrugModelConfig(
     use_array_stacked_blocks=True, disable_pko=True,
 )
 MESH = compact_grug_mesh(expert_axis_size=2, replica_axis_size=1)
+# Weights replicated per node: replica_dcn=2, data=1, so every weight but the experts' is replicated.
+REPLICA_MESH = compact_grug_mesh(expert_axis_size=2, replica_axis_size=2)
 TOKENS = jax.random.randint(jax.random.key(1), (8, 8), 0, BASE.vocab_size)
 BATCH = collections.namedtuple("Batch", "tokens loss_weight attn_mask")(TOKENS, np.ones((8, 8), np.float32), None)
 POLICY = jmp.get_policy("p=f32,c=bfloat16")
 
 
-def train(cfg, *, carry_compute_params, steps=3):
+def train(cfg, *, carry_compute_params, mesh=MESH, steps=3):
     optimizer = optax.adam(1e-2)
-    with jax.set_mesh(MESH):
+    with jax.set_mesh(mesh):
         state = june_train.initial_state(
             cfg, optimizer=optimizer, mp=POLICY, key=jax.random.key(0), ema_beta=None,
             carry_compute_params=carry_compute_params,
@@ -92,5 +97,42 @@ def test_saving_routing_state_matches_recomputing_it():
         np.testing.assert_allclose(saved_losses, losses, rtol=1e-6)
         for a, b in zip(leaves(saved.params), leaves(state.params), strict=True):
             np.testing.assert_allclose(a, b, rtol=1e-6, atol=1e-7)
+        """
+    )
+
+
+@pytest.mark.timeout(900)
+def test_carried_compute_params_match_on_a_replicated_mesh():
+    _run(
+        """
+        for reduction in ("per_layer", "after_scan"):
+            cfg = dataclasses.replace(
+                BASE, remat_mode="save_moe_attn", replicated_grad_reduction=reduction, router_stats_reduction=reduction
+            )
+            losses, state = train(cfg, carry_compute_params=False, mesh=REPLICA_MESH)
+            carried_losses, carried = train(cfg, carry_compute_params=True, mesh=REPLICA_MESH)
+            np.testing.assert_allclose(carried_losses, losses, rtol=1e-6, err_msg=reduction)
+            for a, b in zip(leaves(carried.params), leaves(state.params), strict=True):
+                np.testing.assert_allclose(a, b, rtol=1e-6, atol=1e-7, err_msg=reduction)
+        """
+    )
+
+
+@pytest.mark.timeout(900)
+def test_replicated_gradients_per_layer_train_like_after_scan_on_a_replicated_mesh():
+    _run(
+        """
+        cfg = dataclasses.replace(BASE, remat_mode="save_moe_attn", router_stats_reduction="after_scan")
+        losses, _ = train(cfg, carry_compute_params=False, mesh=REPLICA_MESH, steps=4)
+        deferred_losses, _ = train(
+            dataclasses.replace(cfg, replicated_grad_reduction="after_scan"),
+            carry_compute_params=False,
+            mesh=REPLICA_MESH,
+            steps=4,
+        )
+        assert losses[-1] < losses[0], losses
+        # The bfloat16 gradients are summed in a different order. Adam turns that rounding into visible differences in
+        # parameters with near-zero gradients, so compare the losses, which stay within a few 1e-6.
+        np.testing.assert_allclose(deferred_losses, losses, rtol=3e-5)
         """
     )
