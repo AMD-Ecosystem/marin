@@ -181,6 +181,12 @@ def parse_args() -> argparse.Namespace:
         help="With --qb-balance per_node, average the nodes' QB thresholds every this many steps (0 never).",
     )
     parser.add_argument(
+        "--unstacked-blocks",
+        action="store_true",
+        help="Run the blocks one by one instead of in one layer scan (no stacked per-layer residuals or weights; "
+        "needs per_layer reductions).",
+    )
+    parser.add_argument(
         "--carry-compute-params",
         action="store_true",
         help="Keep a compute-dtype copy of the parameters in the train state, written by the update.",
@@ -267,6 +273,7 @@ def main() -> None:
         replicated_grad_max_bytes=int(args.replicated_grads_max_mib * (1 << 20)),
         router_stats_reduction=args.router_stats,
         qb_balance=args.qb_balance,
+        use_array_stacked_blocks=not args.unstacked_blocks,
     )
     if args.capacity_factor is not None:
         model = dataclasses.replace(model, capacity_factor=args.capacity_factor)
