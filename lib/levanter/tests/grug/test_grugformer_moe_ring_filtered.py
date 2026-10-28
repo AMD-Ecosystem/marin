@@ -157,3 +157,115 @@ def test_ring_filtered_matches_ring_and_dense_with_drops(
         # Each case drops what its parameters ask for; with no valid tokens nothing can drop.
         assert (expected_sender_dropped > 0) == (padding != "all" and transport_capacity_factor < 1.0)
         assert (expected_receiver_dropped > 0) == (padding != "all" and capacity_factor < 1.0)
+
+
+@pytest.mark.timeout(240)
+@pytest.mark.parametrize(
+    ("transport_capacity_factor", "capacity_factor", "padding"),
+    [
+        (8.0, 8.0, "none"),
+        (0.5, 8.0, "none"),
+        (8.0, 0.75, "none"),
+        (0.5, 0.3, "uneven"),
+    ],
+    ids=["no_drops", "sender_drops", "receiver_drops", "both_drops_uneven_padding"],
+)
+@pytest.mark.multidevice
+def test_ring_filtered_token_blocks_match_separate_calls_per_block(
+    transport_capacity_factor: float, capacity_factor: float, padding: str
+):
+    """ring_filtered with two token blocks per shard computes what two separate calls compute, one on each shard's
+    first half of tokens and one on its second half: outputs, drop counts and gradients, with the weight
+    gradients summed over the two calls. Without drops it also matches one unblocked call."""
+    with use_test_devices(8) as devices, jax.default_matmul_precision("highest"):
+        shards, tokens_per_shard, hidden, inter, experts, topk = 8, 24, 8, 6, 32, 4
+        blocks = 2
+        tokens = shards * tokens_per_shard
+        mesh = Mesh(
+            np.asarray(devices).reshape(1, shards, 1),
+            axis_names=("data", "expert", "model"),
+            axis_types=(AxisType.Explicit, AxisType.Explicit, AxisType.Explicit),
+        )
+        keys = jax.random.split(jax.random.key(0), 7)
+        x = np.asarray(jax.random.normal(keys[0], (tokens, hidden)))
+        selected = np.asarray(jnp.argsort(jax.random.uniform(keys[1], (tokens, experts)), axis=1)[:, :topk], np.int32)
+        combine_weights = np.asarray(jax.nn.softmax(jax.random.normal(keys[2], (tokens, topk)), axis=-1))
+        w_up_gate = jax.random.normal(keys[3], (experts, hidden, 2 * inter)) / math.sqrt(hidden)
+        w_down = jax.random.normal(keys[4], (experts, inter, hidden)) / math.sqrt(inter)
+        cotangent = np.asarray(jax.random.normal(keys[5], (tokens, hidden)))
+        if padding == "uneven":
+            keep_fraction = np.repeat(np.arange(shards) / (shards - 1), tokens_per_shard)
+            token_valid = np.asarray(jax.random.uniform(keys[6], (tokens,))) < keep_fraction
+        else:
+            token_valid = np.full(tokens, True)
+
+        batch = NamedSharding(mesh, P(("data", "expert"), None))
+        expert_sharding = NamedSharding(mesh, P("expert", None, None))
+        weights = (jax.device_put(w_up_gate, expert_sharding), jax.device_put(w_down, expert_sharding))
+
+        def run(rows, token_blocks):
+            # Tokens `rows` of every shard, sharded so that shard s holds its own rows.
+            def take(a):
+                per_shard = a.reshape(shards, tokens_per_shard, *a.shape[1:])[:, rows]
+                return per_shard.reshape(-1, *a.shape[1:])
+
+            x_part, cw_part, sel_part, cot_part = (
+                jax.device_put(take(a), batch) for a in (x, combine_weights, selected, cotangent)
+            )
+            valid_part = jax.device_put(jnp.asarray(take(token_valid)), NamedSharding(mesh, P(("data", "expert"))))
+
+            def loss(x, cw, w_up_gate, w_down):
+                out, counts = moe_mlp(
+                    x,
+                    sel_part,
+                    cw,
+                    w_up_gate,
+                    w_down,
+                    token_valid=valid_part,
+                    activation=jax.nn.silu,
+                    implementation="ring_filtered",
+                    mesh=mesh,
+                    capacity_factor=capacity_factor,
+                    pooled_transport_capacity_factor=transport_capacity_factor,
+                    report_capacity_overflow=True,
+                    token_blocks=token_blocks,
+                )
+                return jnp.sum(out * cot_part), (out, counts)
+
+            with jax.set_mesh(mesh):
+                grad_fn = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2, 3), has_aux=True))
+                (_, (out, counts)), grads = grad_fn(x_part, cw_part, *weights)
+
+            def to_np(a):
+                return np.asarray(a).reshape(shards, -1, *a.shape[1:])
+
+            return to_np(out), counts, (to_np(grads[0]), to_np(grads[1]), np.asarray(grads[2]), np.asarray(grads[3]))
+
+        half = tokens_per_shard // blocks
+        blocked_out, blocked_counts, blocked_grads = run(slice(None), token_blocks=blocks)
+        first = run(slice(0, half), token_blocks=1)
+        second = run(slice(half, None), token_blocks=1)
+
+        expected_out = np.concatenate([first[0], second[0]], axis=1)
+        expected_grads = (
+            np.concatenate([first[2][0], second[2][0]], axis=1),
+            np.concatenate([first[2][1], second[2][1]], axis=1),
+            first[2][2] + second[2][2],
+            first[2][3] + second[2][3],
+        )
+        np.testing.assert_allclose(blocked_out, expected_out, rtol=1e-5, atol=1e-5)
+        for actual, expected in zip(blocked_grads, expected_grads, strict=True):
+            np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+        expected_sender = int(first[1].sender_dropped) + int(second[1].sender_dropped)
+        expected_receiver = int(first[1].receiver_dropped) + int(second[1].receiver_dropped)
+        assert int(blocked_counts.sender_dropped) == expected_sender
+        assert int(blocked_counts.receiver_dropped) == expected_receiver
+        # Each case drops what its parameters ask for.
+        assert (expected_sender > 0) == (transport_capacity_factor < 1.0)
+        assert (expected_receiver > 0) == (capacity_factor < 1.0)
+
+        if expected_sender == 0 and expected_receiver == 0:
+            unblocked_out, _, unblocked_grads = run(slice(None), token_blocks=1)
+            np.testing.assert_allclose(blocked_out, unblocked_out, rtol=1e-5, atol=1e-5)
+            for actual, expected in zip(blocked_grads, unblocked_grads, strict=True):
+                np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)

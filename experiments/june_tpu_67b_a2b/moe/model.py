@@ -125,6 +125,9 @@ class GrugModelConfig:
     """Sender pool capacity per destination shard; required by ``ring_filtered`` and ``fixed_pooled_wave_all_to_all``."""
     num_expert_waves: int = 1
     """Static wave count for ``fixed_pooled_wave_all_to_all``; must divide the local expert count."""
+    moe_token_blocks: int = 1
+    """Token blocks per shard for ``ring_filtered``: each block has its own all-to-all exchange, so one
+    block's collectives can overlap another's expert matmuls. Must divide the local token count."""
     ce_implementation: str | None = None
     """Fused cross-entropy backend selection (levanter fused_cross_entropy_loss). None keeps the
     backend default (GPU: full-logits ``xla`` path). Set ``"batched_xla"`` to use the blocked-vocab
@@ -352,9 +355,7 @@ class CausalSelfAttention(eqx.Module):
         if not disable_rope:
             # Half-RoPE: rotary embedding only on the first half of Q/K head_dim; the second half is rope-free
             # on every layer.
-            q, k = _apply_half_rope(
-                q, k, seq_len=seq_len, head_dim=head_dim, rope=cfg.rope, position_ids=position_ids
-            )
+            q, k = _apply_half_rope(q, k, seq_len=seq_len, head_dim=head_dim, rope=cfg.rope, position_ids=position_ids)
         q = q * cfg.qk_mult * qk_mult_scale
         attn_out = attention(q, k, v, mask, implementation=self.cfg.attention_implementation)
         # Half-RoPE's slice+concat on the head_dim axis can leave the explicit-mesh
@@ -566,6 +567,7 @@ class MoEMLP(eqx.Module):
                 capacity_factor=cfg.capacity_factor,
                 pooled_transport_capacity_factor=cfg.pooled_transport_capacity_factor,
                 num_expert_waves=cfg.num_expert_waves,
+                token_blocks=cfg.moe_token_blocks,
             ),
             routed_moe=QBRoutedMoE(
                 num_experts_per_token=cfg.num_experts_per_token,
