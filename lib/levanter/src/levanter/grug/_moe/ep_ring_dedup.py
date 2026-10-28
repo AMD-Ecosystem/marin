@@ -14,8 +14,13 @@ full-size output, this moves only the rows a destination works on: with top-4 of
 
 Every hidden-width data movement is a gather whose transpose is another gather, so neither the
 forward nor the backward uses a hidden-width scatter-add.
+
+With ``token_blocks > 1`` each shard splits its tokens into that many contiguous blocks and runs the
+whole exchange once per block, so XLA can overlap one block's all-to-alls with another block's expert
+matmuls. Capacities are per block, sized from the block's tokens.
 """
 
+import functools
 import math
 from collections.abc import Callable
 
@@ -55,8 +60,12 @@ def _moe_mlp_ep_ring_dedup_local(
     capacity_factor: float,
     transport_capacity_factor: float,
     token_sharding_axes: tuple[str, ...],
+    token_blocks: int,
 ) -> tuple[Float[Array, "Tlocal H"], CapacityDrops]:
     """Deduplicated all-to-all dispatch, ring's grouped expert MLP, expert-side combine.
+
+    The shard's tokens are split into ``token_blocks`` contiguous blocks, each dispatched, run and
+    combined on its own, with the capacities below computed from the block's tokens.
 
     ``transport_capacity_factor`` limits each (sender, destination) pair to a multiple of the
     distinct tokens the sender would send that destination under uniform routing,
@@ -69,13 +78,66 @@ def _moe_mlp_ep_ring_dedup_local(
     runs at most ``capacity_factor * Tlocal * K`` assignments, allocated in local-expert order
     (receiver drops).
     """
-    tokens, topk = selected_experts_local.shape
-    hidden_dim = x_local.shape[1]
+    tokens = x_local.shape[0]
     local_experts = moe_w13_local.shape[0]
     if num_experts % local_experts != 0:
         raise ValueError(f"num_experts={num_experts} must be divisible by local expert count={local_experts}")
     if transport_capacity_factor <= 0:
         raise ValueError("transport_capacity_factor must be positive")
+    if token_blocks < 1 or tokens % token_blocks != 0:
+        raise ValueError(f"token_blocks={token_blocks} must be positive and divide the local token count {tokens}")
+
+    block = functools.partial(
+        _ring_dedup_block,
+        moe_w13_local=moe_w13_local,
+        moe_w2_local=moe_w2_local,
+        activation_fn=activation_fn,
+        num_experts=num_experts,
+        capacity_factor=capacity_factor,
+        transport_capacity_factor=transport_capacity_factor,
+    )
+    if token_blocks == 1:
+        out_local, sender_dropped, receiver_dropped = block(
+            x_local, selected_experts_local, combine_weights_local, token_valid_local
+        )
+    else:
+        block_tokens = tokens // token_blocks
+        outputs, sender_drops, receiver_drops = [], [], []
+        for i in range(token_blocks):
+            rows = slice(i * block_tokens, (i + 1) * block_tokens)
+            with jax.named_scope(f"token_block_{i}"):
+                out, sender, receiver = block(
+                    x_local[rows], selected_experts_local[rows], combine_weights_local[rows], token_valid_local[rows]
+                )
+            outputs.append(out)
+            sender_drops.append(sender)
+            receiver_drops.append(receiver)
+        out_local = jnp.concatenate(outputs, axis=0)
+        sender_dropped = sum(sender_drops)
+        receiver_dropped = sum(receiver_drops)
+
+    with jax.named_scope("combine"):
+        drops = jax.lax.psum(jnp.stack([sender_dropped, receiver_dropped]), token_sharding_axes)
+    return out_local, CapacityDrops(sender_dropped=drops[0], receiver_dropped=drops[1])
+
+
+def _ring_dedup_block(
+    x_local: Float[Array, "T H"],
+    selected_experts_local: Int[Array, "T K"],
+    combine_weights_local: Float[Array, "T K"],
+    token_valid_local: Bool[Array, "T"],
+    *,
+    moe_w13_local: Float[Array, "Elocal H I2"],
+    moe_w2_local: Float[Array, "Elocal I H"],
+    activation_fn: Callable[[jax.Array], jax.Array],
+    num_experts: int,
+    capacity_factor: float,
+    transport_capacity_factor: float,
+) -> tuple[Float[Array, "T H"], Int[Array, ""], Int[Array, ""]]:
+    """One block of tokens through the exchange: its output and its local sender and receiver drops."""
+    tokens, topk = selected_experts_local.shape
+    hidden_dim = x_local.shape[1]
+    local_experts = moe_w13_local.shape[0]
     ep_size = num_experts // local_experts
 
     hit_fraction = destination_hit_fraction(num_experts=num_experts, local_experts=local_experts, topk=topk)
@@ -197,5 +259,4 @@ def _moe_mlp_ep_ring_dedup_local(
             tiled=True,
         ).reshape(send_rows, hidden_dim)
         out_local = _combine_rows(returned, safe_source, slot_valid, slot).astype(x_local.dtype)
-        drops = jax.lax.psum(jnp.stack([sender_dropped, receiver_dropped]), token_sharding_axes)
-    return out_local, CapacityDrops(sender_dropped=drops[0], receiver_dropped=drops[1])
+    return out_local, sender_dropped, receiver_dropped

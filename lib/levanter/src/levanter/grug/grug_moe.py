@@ -451,6 +451,7 @@ class MoEExpertMlp(eqx.Module):
     pooled_transport_capacity_factor: float | None = eqx.field(static=True, default=None)
     expert_chunks: int = eqx.field(static=True, default=1)
     num_expert_waves: int = eqx.field(static=True, default=1)
+    token_blocks: int = eqx.field(static=True, default=1)
 
     @staticmethod
     def init(
@@ -467,6 +468,7 @@ class MoEExpertMlp(eqx.Module):
         pooled_transport_capacity_factor: float | None = None,
         expert_chunks: int = 1,
         num_expert_waves: int = 1,
+        token_blocks: int = 1,
         pspecs: MoEExpertMlpPspecs = MoEExpertMlpPspecs(),
     ) -> "MoEExpertMlp":
         resolved_implementation = resolve_moe_implementation(implementation)
@@ -490,6 +492,7 @@ class MoEExpertMlp(eqx.Module):
             pooled_transport_capacity_factor=pooled_transport_capacity_factor,
             expert_chunks=expert_chunks,
             num_expert_waves=num_expert_waves,
+            token_blocks=token_blocks,
         )
 
     @named_call
@@ -519,6 +522,7 @@ class MoEExpertMlp(eqx.Module):
             report_capacity_overflow=report_capacity_overflow,
             expert_chunks=self.expert_chunks,
             num_expert_waves=self.num_expert_waves,
+            token_blocks=self.token_blocks,
         )
 
 
@@ -539,6 +543,7 @@ def moe_mlp(
     report_capacity_overflow: bool = False,
     expert_chunks: int = 1,
     num_expert_waves: int = 1,
+    token_blocks: int = 1,
 ) -> Float[Array, "T D"] | tuple[Float[Array, "T D"], MoeDispatchCounts]:
     """Functional routed MoE MLP core used by Grug modules and benchmarks.
 
@@ -573,8 +578,15 @@ def moe_mlp(
     destination pool (`fixed_pooled_wave_all_to_all`) or destination shard
     (`ring_dedup`). `num_expert_waves` sets the static wave count for the
     fixed pooled-wave implementation.
+
+    `token_blocks` splits each shard's tokens into that many blocks, each with its own exchange, so
+    one block's collectives can overlap another block's expert matmuls (`ring_dedup` only).
     """
     resolved_implementation = resolve_moe_implementation(implementation)
+    if token_blocks < 1:
+        raise ValueError(f"token_blocks must be positive, got {token_blocks}")
+    if token_blocks > 1 and resolved_implementation != "ring_dedup":
+        raise ValueError(f"token_blocks > 1 requires ring_dedup, got implementation={resolved_implementation!r}")
 
     if mesh is None:
         mesh = _current_mesh()
@@ -677,6 +689,7 @@ def moe_mlp(
             shard_local_fn = partial(
                 _moe_mlp_ep_ring_dedup_local,
                 transport_capacity_factor=pooled_transport_capacity_factor,
+                token_blocks=token_blocks,
             )
         elif resolved_implementation == "ragged_all_to_all":
             shard_local_fn = _moe_mlp_ep_ragged_a2a_local

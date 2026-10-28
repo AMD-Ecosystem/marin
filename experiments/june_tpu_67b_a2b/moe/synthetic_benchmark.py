@@ -146,6 +146,13 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Waves for fixed_pooled_wave_all_to_all; must divide the local expert count.",
     )
+    parser.add_argument(
+        "--moe-token-blocks",
+        type=int,
+        default=1,
+        help="ring_dedup only: split each shard's tokens into this many blocks, each with its own all-to-alls, "
+        "so one block's exchange can overlap another's expert matmuls.",
+    )
     parser.add_argument("--profile-steps", type=int, default=0, help="Profile this many steps (0 disables).")
     parser.add_argument("--profile-start", type=int, default=10, help="First profiled step.")
     parser.add_argument("--log-dir", type=Path, default=Path("logs/june-synthetic"))
@@ -268,6 +275,7 @@ def main() -> None:
         remat_mode=args.remat_mode,
         pooled_transport_capacity_factor=args.pooled_transport_capacity_factor,
         num_expert_waves=args.num_expert_waves,
+        moe_token_blocks=args.moe_token_blocks,
         scan_unroll=args.scan_unroll,
         replicated_grad_reduction=args.replicated_grads,
         replicated_grad_max_bytes=int(args.replicated_grads_max_mib * (1 << 20)),
@@ -350,7 +358,7 @@ def main() -> None:
     flops_per_example, flops_summary = _compute_flops(model_config=model)
     logger.info(
         "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d seq_len=%d window=%d mp=%s "
-        "expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d remat=%s "
+        "expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d token_blocks=%d remat=%s "
         "replicated_grads=%s router_stats=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
         "watch_interval=%d flops_per_example=%.4e",
         args.size,
@@ -371,6 +379,7 @@ def main() -> None:
         model.capacity_factor,
         model.pooled_transport_capacity_factor,
         model.num_expert_waves,
+        model.moe_token_blocks,
         args.remat_mode,
         args.replicated_grads,
         args.router_stats,
