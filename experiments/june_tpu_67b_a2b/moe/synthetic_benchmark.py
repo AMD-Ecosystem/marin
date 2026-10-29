@@ -364,7 +364,8 @@ def main() -> None:
     flops_per_example, flops_summary = _compute_flops(model_config=model)
     logger.info(
         "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d seq_len=%d window=%d mp=%s "
-        "expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d token_blocks=%d token_block_groups=%s remat=%s "
+        "expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d token_blocks=%d "
+        "token_block_groups=%s remat=%s "
         "replicated_grads=%s router_stats=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
         "watch_interval=%d flops_per_example=%.4e",
         args.size,

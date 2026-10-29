@@ -400,9 +400,7 @@ def _expert_mlp(
             (group_sizes, picked, dispatch_valid, dispatch_row, position), _CHECKPOINT_ROUTING
         )
 
-        x_dispatch = _dispatch_rows(
-            dispatched.x, jnp.minimum(dispatch_row, send_rows - 1), dispatch_valid, position
-        )
+        x_dispatch = _dispatch_rows(dispatched.x, jnp.minimum(dispatch_row, send_rows - 1), dispatch_valid, position)
         x_dispatch = tree_checkpoint_name(x_dispatch, _CHECKPOINT_DISPATCH_INPUT)
 
     with jax.named_scope("moe_up_down"):
