@@ -128,6 +128,9 @@ class GrugModelConfig:
     moe_token_blocks: int = 1
     """Token blocks per shard for ``ring_dedup``: each block has its own all-to-all exchange, so one
     block's collectives can overlap another's expert matmuls. Must divide the local token count."""
+    moe_token_block_groups: bool = False
+    """With ``moe_token_blocks=2``, pipeline the two blocks through XLA scheduling groups (needs
+    ``--xla_gpu_experimental_keep_scheduling_annotations_on_compute`` to keep the Pallas GEMMs in the groups)."""
     ce_implementation: str | None = None
     """Fused cross-entropy backend selection (levanter fused_cross_entropy_loss). None keeps the
     backend default (GPU: full-logits ``xla`` path). Set ``"batched_xla"`` to use the blocked-vocab
@@ -568,6 +571,7 @@ class MoEMLP(eqx.Module):
                 pooled_transport_capacity_factor=cfg.pooled_transport_capacity_factor,
                 num_expert_waves=cfg.num_expert_waves,
                 token_blocks=cfg.moe_token_blocks,
+                token_block_groups=cfg.moe_token_block_groups,
             ),
             routed_moe=QBRoutedMoE(
                 num_experts_per_token=cfg.num_experts_per_token,

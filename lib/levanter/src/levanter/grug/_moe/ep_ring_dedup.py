@@ -18,16 +18,25 @@ forward nor the backward uses a hidden-width scatter-add.
 With ``token_blocks > 1`` each shard splits its tokens into that many contiguous blocks and runs the
 whole exchange once per block, so XLA can overlap one block's all-to-alls with another block's expert
 matmuls. Capacities are per block, sized from the block's tokens.
+
+With ``token_block_groups`` (two blocks) the overlap is requested rather than left to XLA's scheduler:
+the stages are emitted in pipeline order and tagged with XLA scheduling groups, block 1's dispatch
+all-to-alls with block 0's expert MLP, then block 0's combine all-to-all with block 1's expert MLP;
+the backward pass gets its own pair of groups. XLA keeps the annotations on the expert MLP's kernels
+only with ``--xla_gpu_experimental_keep_scheduling_annotations_on_compute``.
 """
 
-import functools
+import dataclasses
+import itertools
 import math
 from collections.abc import Callable
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 from haliax.jax_utils import tree_checkpoint_name
 from haliax.nn.ragged_dot import ragged_dot
+from jax.experimental.xla_metadata import xla_metadata_call2
 from jaxtyping import Array, Bool, Float, Int
 
 from levanter.grug._moe.common import (
@@ -41,10 +50,92 @@ from levanter.grug._moe.common import (
 from levanter.grug._moe.ep_common import _assignment_sources, _combine_gather_sum
 from levanter.grug._moe.ep_ring import _combine_rows, _dispatch_rows, _select_local_assignments
 
+# XLA frontend attribute that puts ops in a latency-hiding-scheduler group: scheduled together, the
+# group's async collectives overlapping its compute.
+SCHEDULING_GROUP_ATTR = "_scheduling_group_id"
+# Group ids must be unique per traced layer: one id in two unrolled layers makes one group with
+# unrelated ops between its members, which XLA's annotation legalization rejects.
+_scheduling_group_ids = itertools.count()
+
 
 def destination_hit_fraction(*, num_experts: int, local_experts: int, topk: int) -> float:
     """Probability that a token's ``topk`` distinct uniform experts include one on a given shard."""
     return 1.0 - math.comb(num_experts - local_experts, topk) / math.comb(num_experts, topk)
+
+
+@dataclasses.dataclass(frozen=True)
+class _BlockSizes:
+    """Static sizes of one block's exchange."""
+
+    tokens: int
+    topk: int
+    hidden_dim: int
+    local_experts: int
+    ep_size: int
+    hit_fraction: float
+    transport_capacity_factor: float
+    capacity_factor: float
+    pair_capacity: int
+    expert_capacity: int
+
+    @property
+    def send_rows(self) -> int:
+        return self.ep_size * self.pair_capacity
+
+    @property
+    def received_assignments(self) -> int:
+        return self.send_rows * self.topk
+
+
+def _block_sizes(
+    *,
+    tokens: int,
+    topk: int,
+    hidden_dim: int,
+    num_experts: int,
+    local_experts: int,
+    capacity_factor: float,
+    transport_capacity_factor: float,
+) -> _BlockSizes:
+    hit_fraction = destination_hit_fraction(num_experts=num_experts, local_experts=local_experts, topk=topk)
+    pair_capacity = min(tokens, max(1, math.ceil(transport_capacity_factor * hit_fraction * tokens)))
+    ep_size = num_experts // local_experts
+    received_assignments = ep_size * pair_capacity * topk
+    expert_capacity = min(received_assignments, max(local_experts, math.ceil(capacity_factor * tokens * topk)))
+    return _BlockSizes(
+        tokens=tokens,
+        topk=topk,
+        hidden_dim=hidden_dim,
+        local_experts=local_experts,
+        ep_size=ep_size,
+        hit_fraction=hit_fraction,
+        transport_capacity_factor=transport_capacity_factor,
+        capacity_factor=capacity_factor,
+        pair_capacity=pair_capacity,
+        expert_capacity=expert_capacity,
+    )
+
+
+class _Sent(NamedTuple):
+    """A block's send buffers, and what its sender needs to sum the returned rows."""
+
+    metadata: Float[Array, "ep C1 K2"]
+    send_x: Float[Array, "S H"]
+    safe_source: Int[Array, " S"]
+    slot_valid: Bool[Array, " S"]
+    slot: Int[Array, "T ep"]
+    sender_dropped: Int[Array, ""]
+
+
+class _Dispatched(NamedTuple):
+    """A block's rows and metadata as the expert shard received them."""
+
+    metadata: Float[Array, "ep C1 K2"]
+    x: Float[Array, "S H"]
+
+
+_ExpertFn = Callable[[_Dispatched], tuple[Float[Array, "S H"], Int[Array, ""]]]
+_BlockResult = tuple[Float[Array, "T H"], Int[Array, ""], Int[Array, ""]]
 
 
 def _moe_mlp_ep_ring_dedup_local(
@@ -61,11 +152,13 @@ def _moe_mlp_ep_ring_dedup_local(
     transport_capacity_factor: float,
     token_sharding_axes: tuple[str, ...],
     token_blocks: int,
+    token_block_groups: bool,
 ) -> tuple[Float[Array, "Tlocal H"], CapacityDrops]:
     """Deduplicated all-to-all dispatch, ring's grouped expert MLP, expert-side combine.
 
     The shard's tokens are split into ``token_blocks`` contiguous blocks, each dispatched, run and
     combined on its own, with the capacities below computed from the block's tokens.
+    ``token_block_groups`` (requires two blocks) pipelines them through XLA scheduling groups.
 
     ``transport_capacity_factor`` limits each (sender, destination) pair to a multiple of the
     distinct tokens the sender would send that destination under uniform routing,
@@ -78,7 +171,7 @@ def _moe_mlp_ep_ring_dedup_local(
     runs at most ``capacity_factor * Tlocal * K`` assignments, allocated in local-expert order
     (receiver drops).
     """
-    tokens = x_local.shape[0]
+    tokens, topk = selected_experts_local.shape
     local_experts = moe_w13_local.shape[0]
     if num_experts % local_experts != 0:
         raise ValueError(f"num_experts={num_experts} must be divisible by local expert count={local_experts}")
@@ -86,66 +179,120 @@ def _moe_mlp_ep_ring_dedup_local(
         raise ValueError("transport_capacity_factor must be positive")
     if token_blocks < 1 or tokens % token_blocks != 0:
         raise ValueError(f"token_blocks={token_blocks} must be positive and divide the local token count {tokens}")
+    if token_block_groups and token_blocks != 2:
+        raise ValueError(f"token_block_groups requires token_blocks=2, got {token_blocks}")
 
-    block = functools.partial(
-        _ring_dedup_block,
-        moe_w13_local=moe_w13_local,
-        moe_w2_local=moe_w2_local,
-        activation_fn=activation_fn,
+    sizes = _block_sizes(
+        tokens=tokens // token_blocks,
+        topk=topk,
+        hidden_dim=x_local.shape[1],
         num_experts=num_experts,
+        local_experts=local_experts,
         capacity_factor=capacity_factor,
         transport_capacity_factor=transport_capacity_factor,
     )
-    if token_blocks == 1:
-        out_local, sender_dropped, receiver_dropped = block(
-            x_local, selected_experts_local, combine_weights_local, token_valid_local
-        )
-    else:
-        block_tokens = tokens // token_blocks
-        outputs, sender_drops, receiver_drops = [], [], []
-        for i in range(token_blocks):
-            rows = slice(i * block_tokens, (i + 1) * block_tokens)
-            with jax.named_scope(f"token_block_{i}"):
-                out, sender, receiver = block(
-                    x_local[rows], selected_experts_local[rows], combine_weights_local[rows], token_valid_local[rows]
-                )
-            outputs.append(out)
-            sender_drops.append(sender)
-            receiver_drops.append(receiver)
-        out_local = jnp.concatenate(outputs, axis=0)
-        sender_dropped = sum(sender_drops)
-        receiver_dropped = sum(receiver_drops)
+    blocks = [
+        (x_local[rows], selected_experts_local[rows], combine_weights_local[rows], token_valid_local[rows])
+        for rows in (slice(i * sizes.tokens, (i + 1) * sizes.tokens) for i in range(token_blocks))
+    ]
 
+    def expert(dispatched: _Dispatched) -> tuple[Float[Array, "S H"], Int[Array, ""]]:
+        return _expert_mlp(dispatched, moe_w13_local, moe_w2_local, activation_fn, sizes)
+
+    if token_block_groups:
+        results = _pipelined_blocks(blocks, expert, sizes)
+    elif token_blocks == 1:
+        results = [_block(*blocks[0], expert=expert, sizes=sizes)]
+    else:
+        results = []
+        for i, block in enumerate(blocks):
+            with jax.named_scope(f"token_block_{i}"):
+                results.append(_block(*block, expert=expert, sizes=sizes))
+
+    if token_blocks == 1:
+        out_local = results[0][0]
+    else:
+        out_local = jnp.concatenate([out for out, _, _ in results], axis=0)
+    sender_dropped = sum(sender for _, sender, _ in results)
+    receiver_dropped = sum(receiver for _, _, receiver in results)
     with jax.named_scope("combine"):
         drops = jax.lax.psum(jnp.stack([sender_dropped, receiver_dropped]), token_sharding_axes)
     return out_local, CapacityDrops(sender_dropped=drops[0], receiver_dropped=drops[1])
 
 
-def _ring_dedup_block(
+def _block(
     x_local: Float[Array, "T H"],
     selected_experts_local: Int[Array, "T K"],
     combine_weights_local: Float[Array, "T K"],
     token_valid_local: Bool[Array, "T"],
     *,
-    moe_w13_local: Float[Array, "Elocal H I2"],
-    moe_w2_local: Float[Array, "Elocal I H"],
-    activation_fn: Callable[[jax.Array], jax.Array],
-    num_experts: int,
-    capacity_factor: float,
-    transport_capacity_factor: float,
-) -> tuple[Float[Array, "T H"], Int[Array, ""], Int[Array, ""]]:
+    expert: _ExpertFn,
+    sizes: _BlockSizes,
+) -> _BlockResult:
     """One block of tokens through the exchange: its output and its local sender and receiver drops."""
-    tokens, topk = selected_experts_local.shape
-    hidden_dim = x_local.shape[1]
-    local_experts = moe_w13_local.shape[0]
-    ep_size = num_experts // local_experts
+    sent = _send(x_local, selected_experts_local, combine_weights_local, token_valid_local, sizes)
+    expert_combined, receiver_dropped = expert(_dispatch(sent, sizes))
+    out_local = _receive(_return_rows(expert_combined, sizes), sent, x_local.dtype)
+    return out_local, sent.sender_dropped, receiver_dropped
 
-    hit_fraction = destination_hit_fraction(num_experts=num_experts, local_experts=local_experts, topk=topk)
-    pair_capacity = min(tokens, max(1, math.ceil(transport_capacity_factor * hit_fraction * tokens)))
-    send_rows = ep_size * pair_capacity
-    received_assignments = send_rows * topk
-    expert_capacity = min(received_assignments, max(local_experts, math.ceil(capacity_factor * tokens * topk)))
 
+def _pipelined_blocks(
+    blocks: list[tuple[Array, Array, Array, Array]],
+    expert: _ExpertFn,
+    sizes: _BlockSizes,
+) -> list[_BlockResult]:
+    """Two blocks in pipeline order, each overlapping pair of stages in an XLA scheduling group.
+
+    Forward: b0 dispatch, [b1 dispatch | b0 expert MLP], [b0 combine | b1 expert MLP], b1 combine.
+    The backward pass runs the stages in reverse, in fresh groups: [b0 combine^T | b1 expert MLP^T],
+    then [b1 dispatch^T | b0 expert MLP^T].
+    """
+    (x0, *routing0), (x1, *routing1) = blocks
+    group_a, group_a_bwd, group_b, group_b_bwd = (next(_scheduling_group_ids) for _ in range(4))
+
+    def grouped(fn, group: int, backward_group: int):
+        return xla_metadata_call2(
+            fn, {SCHEDULING_GROUP_ATTR: group}, ad_metadata={SCHEDULING_GROUP_ATTR: backward_group}
+        )
+
+    def stage_a(sent1: _Sent, dispatched0: _Dispatched):
+        with jax.named_scope("token_block_1"):
+            dispatched1 = _dispatch(sent1, sizes)
+        with jax.named_scope("token_block_0"):
+            return dispatched1, expert(dispatched0)
+
+    def stage_b(expert_combined0: Float[Array, "S H"], dispatched1: _Dispatched):
+        with jax.named_scope("token_block_0"):
+            returned0 = _return_rows(expert_combined0, sizes)
+        with jax.named_scope("token_block_1"):
+            return returned0, expert(dispatched1)
+
+    with jax.named_scope("token_block_0"):
+        sent0 = _send(x0, *routing0, sizes)
+        dispatched0 = _dispatch(sent0, sizes)
+    with jax.named_scope("token_block_1"):
+        sent1 = _send(x1, *routing1, sizes)
+    dispatched1, (expert_combined0, receiver_dropped0) = grouped(stage_a, group_a, group_a_bwd)(sent1, dispatched0)
+    returned0, (expert_combined1, receiver_dropped1) = grouped(stage_b, group_b, group_b_bwd)(
+        expert_combined0, dispatched1
+    )
+    with jax.named_scope("token_block_0"):
+        out0 = _receive(returned0, sent0, x0.dtype)
+    with jax.named_scope("token_block_1"):
+        out1 = _receive(_return_rows(expert_combined1, sizes), sent1, x1.dtype)
+    return [(out0, sent0.sender_dropped, receiver_dropped0), (out1, sent1.sender_dropped, receiver_dropped1)]
+
+
+def _send(
+    x_local: Float[Array, "T H"],
+    selected_experts_local: Int[Array, "T K"],
+    combine_weights_local: Float[Array, "T K"],
+    token_valid_local: Bool[Array, "T"],
+    sizes: _BlockSizes,
+) -> _Sent:
+    """Routes a block's tokens to send rows and builds the send buffer and its metadata."""
+    tokens, topk, local_experts, ep_size = sizes.tokens, sizes.topk, sizes.local_experts, sizes.ep_size
+    pair_capacity, send_rows = sizes.pair_capacity, sizes.send_rows
     with jax.named_scope("dispatch"):
         selected = selected_experts_local.astype(jnp.int32)
         destination = selected // local_experts
@@ -155,7 +302,7 @@ def _ring_dedup_block(
         valid_tokens = jnp.sum(token_valid_local, dtype=jnp.int32)
         logical_pair_capacity = _scaled_capacity(
             valid_tokens,
-            capacity_factor=transport_capacity_factor * hit_fraction,
+            capacity_factor=sizes.transport_capacity_factor * sizes.hit_fraction,
             maximum=pair_capacity,
         )
         keep = hit & (rank < logical_pair_capacity)
@@ -194,14 +341,36 @@ def _ring_dedup_block(
         trailer = jnp.zeros((ep_size, 1, 2 * topk), jnp.float32).at[:, 0, 0].set(valid_assignments.astype(jnp.float32))
         metadata = jnp.concatenate([metadata, trailer], axis=1)
 
-        received_metadata = jax.lax.all_to_all(metadata, "expert", split_axis=0, concat_axis=0, tiled=True)
-        received_metadata = tree_checkpoint_name(received_metadata, _CHECKPOINT_DISPATCH_INPUT)
-
         send_x = _dispatch_rows(x_local, safe_source, slot_valid, slot)
-        received_x = jax.lax.all_to_all(
-            send_x.reshape(ep_size, pair_capacity, hidden_dim), "expert", split_axis=0, concat_axis=0, tiled=True
-        ).reshape(send_rows, hidden_dim)
+    return _Sent(metadata, send_x, safe_source, slot_valid, slot, sender_dropped)
 
+
+def _dispatch(sent: _Sent, sizes: _BlockSizes) -> _Dispatched:
+    """The dispatch all-to-alls: each destination receives its rows and their metadata."""
+    with jax.named_scope("dispatch"):
+        received_metadata = jax.lax.all_to_all(sent.metadata, "expert", split_axis=0, concat_axis=0, tiled=True)
+        received_metadata = tree_checkpoint_name(received_metadata, _CHECKPOINT_DISPATCH_INPUT)
+        received_x = jax.lax.all_to_all(
+            sent.send_x.reshape(sizes.ep_size, sizes.pair_capacity, sizes.hidden_dim),
+            "expert",
+            split_axis=0,
+            concat_axis=0,
+            tiled=True,
+        ).reshape(sizes.send_rows, sizes.hidden_dim)
+    return _Dispatched(received_metadata, received_x)
+
+
+def _expert_mlp(
+    dispatched: _Dispatched,
+    moe_w13_local: Float[Array, "Elocal H I2"],
+    moe_w2_local: Float[Array, "Elocal I H"],
+    activation_fn: Callable[[jax.Array], jax.Array],
+    sizes: _BlockSizes,
+) -> tuple[Float[Array, "S H"], Int[Array, ""]]:
+    """The expert shard's side: group the received assignments, run the MLP, sum each row's outputs."""
+    topk, local_experts, ep_size = sizes.topk, sizes.local_experts, sizes.ep_size
+    pair_capacity, send_rows, received_assignments = sizes.pair_capacity, sizes.send_rows, sizes.received_assignments
+    received_metadata = dispatched.metadata
     with jax.named_scope("expert_dispatch"):
         group_valid_assignments = jnp.sum(received_metadata[:, pair_capacity, 0]).astype(jnp.int32)
         received_weights = received_metadata[:, :pair_capacity, :topk].reshape(send_rows, topk)
@@ -211,17 +380,17 @@ def _ring_dedup_block(
         local_expert = jnp.where(assignment_mask, received_ids, 0)
         logical_capacity = _scaled_capacity(
             group_valid_assignments,
-            capacity_factor=capacity_factor,
+            capacity_factor=sizes.capacity_factor,
             divisor=ep_size,
             minimum=local_experts,
-            maximum=expert_capacity,
+            maximum=sizes.expert_capacity,
         )
         group_sizes, receiver_dropped, picked, dispatch_valid = _select_local_assignments(
             local_expert,
             assignment_mask,
             local_experts=local_experts,
             logical_capacity=logical_capacity,
-            physical_capacity=expert_capacity,
+            physical_capacity=sizes.expert_capacity,
         )
         picked = jnp.where(dispatch_valid, picked, received_assignments)
         dispatch_row = jnp.where(dispatch_valid, picked // topk, send_rows)
@@ -231,7 +400,9 @@ def _ring_dedup_block(
             (group_sizes, picked, dispatch_valid, dispatch_row, position), _CHECKPOINT_ROUTING
         )
 
-        x_dispatch = _dispatch_rows(received_x, jnp.minimum(dispatch_row, send_rows - 1), dispatch_valid, position)
+        x_dispatch = _dispatch_rows(
+            dispatched.x, jnp.minimum(dispatch_row, send_rows - 1), dispatch_valid, position
+        )
         x_dispatch = tree_checkpoint_name(x_dispatch, _CHECKPOINT_DISPATCH_INPUT)
 
     with jax.named_scope("moe_up_down"):
@@ -251,12 +422,22 @@ def _ring_dedup_block(
             received_weights,
             out_dispatch.dtype,
         )
-        returned = jax.lax.all_to_all(
-            expert_combined.reshape(ep_size, pair_capacity, hidden_dim),
+    return expert_combined, receiver_dropped
+
+
+def _return_rows(expert_combined: Float[Array, "S H"], sizes: _BlockSizes) -> Float[Array, "S H"]:
+    """The combine all-to-all: each sender gets back one summed row per row it sent."""
+    with jax.named_scope("combine"):
+        return jax.lax.all_to_all(
+            expert_combined.reshape(sizes.ep_size, sizes.pair_capacity, sizes.hidden_dim),
             "expert",
             split_axis=0,
             concat_axis=0,
             tiled=True,
-        ).reshape(send_rows, hidden_dim)
-        out_local = _combine_rows(returned, safe_source, slot_valid, slot).astype(x_local.dtype)
-    return out_local, sender_dropped, receiver_dropped
+        ).reshape(sizes.send_rows, sizes.hidden_dim)
+
+
+def _receive(returned: Float[Array, "S H"], sent: _Sent, dtype: jnp.dtype) -> Float[Array, "T H"]:
+    """Sums each token's returned rows."""
+    with jax.named_scope("combine"):
+        return _combine_rows(returned, sent.safe_source, sent.slot_valid, sent.slot).astype(dtype)

@@ -153,6 +153,11 @@ def parse_args() -> argparse.Namespace:
         help="ring_dedup only: split each shard's tokens into this many blocks, each with its own all-to-alls, "
         "so one block's exchange can overlap another's expert matmuls.",
     )
+    parser.add_argument(
+        "--moe-token-block-groups",
+        action="store_true",
+        help="With --moe-token-blocks 2: pipeline the blocks through XLA scheduling groups.",
+    )
     parser.add_argument("--profile-steps", type=int, default=0, help="Profile this many steps (0 disables).")
     parser.add_argument("--profile-start", type=int, default=10, help="First profiled step.")
     parser.add_argument("--log-dir", type=Path, default=Path("logs/june-synthetic"))
@@ -276,6 +281,7 @@ def main() -> None:
         pooled_transport_capacity_factor=args.pooled_transport_capacity_factor,
         num_expert_waves=args.num_expert_waves,
         moe_token_blocks=args.moe_token_blocks,
+        moe_token_block_groups=args.moe_token_block_groups,
         scan_unroll=args.scan_unroll,
         replicated_grad_reduction=args.replicated_grads,
         replicated_grad_max_bytes=int(args.replicated_grads_max_mib * (1 << 20)),
@@ -358,7 +364,7 @@ def main() -> None:
     flops_per_example, flops_summary = _compute_flops(model_config=model)
     logger.info(
         "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d seq_len=%d window=%d mp=%s "
-        "expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d token_blocks=%d remat=%s "
+        "expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d token_blocks=%d token_block_groups=%s remat=%s "
         "replicated_grads=%s router_stats=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
         "watch_interval=%d flops_per_example=%.4e",
         args.size,
@@ -380,6 +386,7 @@ def main() -> None:
         model.pooled_transport_capacity_factor,
         model.num_expert_waves,
         model.moe_token_blocks,
+        model.moe_token_block_groups,
         args.remat_mode,
         args.replicated_grads,
         args.router_stats,
