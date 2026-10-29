@@ -1884,14 +1884,12 @@ def test_ring_dedup_token_blocks_match_separate_calls_per_block(
 ):
     """ring_dedup with two token blocks per shard computes what two separate calls compute, one on each shard's
     first half of tokens and one on its second half: outputs, drop counts and gradients, with the weight
-    gradients summed over the two calls. Without drops it also matches one unblocked call. Pipelining the blocks
-    through scheduling groups computes the same, and tags four groups: two forward, two backward."""
+    gradients summed over the two calls. Without drops it also matches one unblocked call."""
     env = os.environ.copy()
     env["JAX_PLATFORMS"] = "cpu"
     env["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
     script = """
         import math
-        import re
 
         import jax
         import jax.numpy as jnp
@@ -1928,7 +1926,7 @@ def test_ring_dedup_token_blocks_match_separate_calls_per_block(
         expert_sharding = NamedSharding(mesh, P("expert", None, None))
         weights = (jax.device_put(w_up_gate, expert_sharding), jax.device_put(w_down, expert_sharding))
 
-        def run(rows, token_blocks, token_block_groups=False):
+        def run(rows, token_blocks):
             # Tokens `rows` of every shard, sharded so that shard s holds its own rows.
             def take(a):
                 per_shard = a.reshape(shards, tokens_per_shard, *a.shape[1:])[:, rows]
@@ -1952,23 +1950,19 @@ def test_ring_dedup_token_blocks_match_separate_calls_per_block(
                     pooled_transport_capacity_factor=transport_capacity_factor,
                     report_capacity_overflow=True,
                     token_blocks=token_blocks,
-                    token_block_groups=token_block_groups,
                 )
                 return jnp.sum(out * cot_part), (out, counts)
 
             with jax.set_mesh(mesh):
                 grad_fn = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2, 3), has_aux=True))
                 (_, (out, counts)), grads = grad_fn(x_part, cw_part, *weights)
-                lowered = grad_fn.lower(x_part, cw_part, *weights).as_text()
             to_np = lambda a: np.asarray(a).reshape(shards, -1, *a.shape[1:])
-            grads = (to_np(grads[0]), to_np(grads[1]), np.asarray(grads[2]), np.asarray(grads[3]))
-            return to_np(out), counts, grads, lowered
+            return to_np(out), counts, (to_np(grads[0]), to_np(grads[1]), np.asarray(grads[2]), np.asarray(grads[3]))
 
         half = tokens_per_shard // blocks
-        blocked_out, blocked_counts, blocked_grads, blocked_text = run(slice(None), token_blocks=blocks)
-        assert "_scheduling_group_id" not in blocked_text
-        first = run(slice(0, half), token_blocks=1)[:3]
-        second = run(slice(half, None), token_blocks=1)[:3]
+        blocked_out, blocked_counts, blocked_grads = run(slice(None), token_blocks=blocks)
+        first = run(slice(0, half), token_blocks=1)
+        second = run(slice(half, None), token_blocks=1)
 
         expected_out = np.concatenate([first[0], second[0]], axis=1)
         expected_grads = (
@@ -1988,18 +1982,8 @@ def test_ring_dedup_token_blocks_match_separate_calls_per_block(
         assert (expected_sender > 0) == (transport_capacity_factor < 1.0)
         assert (expected_receiver > 0) == (capacity_factor < 1.0)
 
-        grouped_out, grouped_counts, grouped_grads, grouped_text = run(
-            slice(None), token_blocks=blocks, token_block_groups=True
-        )
-        np.testing.assert_allclose(grouped_out, blocked_out, rtol=1e-5, atol=1e-5)
-        for actual, expected in zip(grouped_grads, blocked_grads, strict=True):
-            np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
-        assert int(grouped_counts.sender_dropped) == expected_sender
-        assert int(grouped_counts.receiver_dropped) == expected_receiver
-        assert len(set(re.findall(r'_scheduling_group_id = "(\\d+)"', grouped_text))) == 4
-
         if expected_sender == 0 and expected_receiver == 0:
-            unblocked_out, _, unblocked_grads, _ = run(slice(None), token_blocks=1)
+            unblocked_out, _, unblocked_grads = run(slice(None), token_blocks=1)
             np.testing.assert_allclose(blocked_out, unblocked_out, rtol=1e-5, atol=1e-5)
             for actual, expected in zip(blocked_grads, unblocked_grads, strict=True):
                 np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
