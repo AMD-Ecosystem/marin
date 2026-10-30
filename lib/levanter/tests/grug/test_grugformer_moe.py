@@ -2004,6 +2004,94 @@ def test_ring_dedup_token_blocks_match_separate_calls_per_block(
     assert result.returncode == 0, result.stderr
 
 
+
+@pytest.mark.timeout(240)
+@pytest.mark.parametrize("implementation", ["ring_dedup", "ring"])
+def test_joint_expert_grad_reduction_matches_and_reduces_once(implementation: str):
+    """With experts replicated over a data axis, joint_expert_grad_reduction computes the same outputs and
+    gradients, and reduces the two expert weights' gradients in one all-reduce instead of two."""
+    env = os.environ.copy()
+    env["JAX_PLATFORMS"] = "cpu"
+    env["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
+    script = """
+        import math
+        import re
+
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+        from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
+
+        from levanter.grug.grug_moe import moe_mlp
+
+        replicas, shards, tokens_per_device, hidden, inter, experts, topk = 2, 4, 16, 8, 6, 32, 4
+        tokens = replicas * shards * tokens_per_device
+        mesh = Mesh(
+            np.asarray(jax.devices()).reshape(replicas, shards, 1),
+            axis_names=("data", "expert", "model"),
+            axis_types=(AxisType.Explicit, AxisType.Explicit, AxisType.Explicit),
+        )
+        keys = jax.random.split(jax.random.key(0), 6)
+        x = jax.random.normal(keys[0], (tokens, hidden))
+        selected = jnp.argsort(jax.random.uniform(keys[1], (tokens, experts)), axis=1)[:, :topk].astype(jnp.int32)
+        combine_weights = jax.nn.softmax(jax.random.normal(keys[2], (tokens, topk)), axis=-1)
+        w_up_gate = jax.random.normal(keys[3], (experts, hidden, 2 * inter)) / math.sqrt(hidden)
+        w_down = jax.random.normal(keys[4], (experts, inter, hidden)) / math.sqrt(inter)
+        cotangent = jax.random.normal(keys[5], (tokens, hidden))
+
+        batch = NamedSharding(mesh, P(("data", "expert"), None))
+        expert_sharding = NamedSharding(mesh, P("expert", None, None))
+        x, combine_weights, selected, cotangent = (jax.device_put(a, batch) for a in (x, combine_weights, selected, cotangent))
+        w_up_gate, w_down = jax.device_put(w_up_gate, expert_sharding), jax.device_put(w_down, expert_sharding)
+
+        def run(joint):
+            def loss(x, cw, w_up_gate, w_down):
+                out = moe_mlp(
+                    x, selected, cw, w_up_gate, w_down,
+                    activation=jax.nn.silu,
+                    implementation="__IMPL__",
+                    mesh=mesh,
+                    capacity_factor=8.0,
+                    pooled_transport_capacity_factor=8.0,
+                    joint_expert_grad_reduction=joint,
+                )
+                return jnp.sum(out * cotangent)
+
+            with jax.set_mesh(mesh):
+                grad_fn = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2, 3)))
+                value, grads = grad_fn(x, combine_weights, w_up_gate, w_down)
+                text = grad_fn.lower(x, combine_weights, w_up_gate, w_down).as_text()
+            return value, [np.asarray(g) for g in grads], text
+
+        def weight_grad_all_reduces(text):
+            # all-reduces whose operands carry the expert weights' local gradients (expert dimension experts/shards)
+            local = experts // shards
+            pattern = re.compile(r"stablehlo\\.all_reduce.*?:\\s*\\((tensor<[^)]*)\\)", re.S)
+            found = 0
+            for line in text.splitlines():
+                if "all_reduce" in line and f"tensor<{local}x" in line:
+                    found += 1
+            return found
+
+        value, grads, text = run(False)
+        joint_value, joint_grads, joint_text = run(True)
+        np.testing.assert_allclose(joint_value, value, rtol=1e-5, atol=1e-5)
+        for actual, expected in zip(joint_grads, grads, strict=True):
+            np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+        separate, joint = weight_grad_all_reduces(text), weight_grad_all_reduces(joint_text)
+        assert (separate, joint) == (2, 1), (separate, joint)
+    """
+    script = script.replace("__IMPL__", implementation)
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
 def test_ring_dedup_expert_combine_keeps_bf16_sums_in_float32():
     """The expert-side combine sums each received row's bf16 expert outputs in float32 and rounds once. Its
     backward rounds each output-row gradient once and returns the float32 routing-weight gradient unrounded."""

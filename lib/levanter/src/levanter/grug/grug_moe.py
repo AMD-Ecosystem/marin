@@ -14,6 +14,7 @@ Implementation overview:
   keeps the stable public API used by Grug model code and benchmarks.
 """
 
+import math
 from collections.abc import Callable
 from functools import partial
 from typing import cast
@@ -452,6 +453,7 @@ class MoEExpertMlp(eqx.Module):
     expert_chunks: int = eqx.field(static=True, default=1)
     num_expert_waves: int = eqx.field(static=True, default=1)
     token_blocks: int = eqx.field(static=True, default=1)
+    joint_expert_grad_reduction: bool = eqx.field(static=True, default=False)
 
     @staticmethod
     def init(
@@ -469,6 +471,7 @@ class MoEExpertMlp(eqx.Module):
         expert_chunks: int = 1,
         num_expert_waves: int = 1,
         token_blocks: int = 1,
+        joint_expert_grad_reduction: bool = False,
         pspecs: MoEExpertMlpPspecs = MoEExpertMlpPspecs(),
     ) -> "MoEExpertMlp":
         resolved_implementation = resolve_moe_implementation(implementation)
@@ -493,6 +496,7 @@ class MoEExpertMlp(eqx.Module):
             expert_chunks=expert_chunks,
             num_expert_waves=num_expert_waves,
             token_blocks=token_blocks,
+            joint_expert_grad_reduction=joint_expert_grad_reduction,
         )
 
     @named_call
@@ -523,6 +527,7 @@ class MoEExpertMlp(eqx.Module):
             expert_chunks=self.expert_chunks,
             num_expert_waves=self.num_expert_waves,
             token_blocks=self.token_blocks,
+            joint_expert_grad_reduction=self.joint_expert_grad_reduction,
         )
 
 
@@ -544,6 +549,7 @@ def moe_mlp(
     expert_chunks: int = 1,
     num_expert_waves: int = 1,
     token_blocks: int = 1,
+    joint_expert_grad_reduction: bool = False,
 ) -> Float[Array, "T D"] | tuple[Float[Array, "T D"], MoeDispatchCounts]:
     """Functional routed MoE MLP core used by Grug modules and benchmarks.
 
@@ -581,6 +587,10 @@ def moe_mlp(
 
     `token_blocks` splits each shard's tokens into that many blocks, each with its own exchange, so
     one block's collectives can overlap another block's expert matmuls (`ring_dedup` only).
+
+    `joint_expert_grad_reduction` passes both expert weights into the expert-parallel `shard_map` as one packed
+    array, so the backward reduces their gradients over the axes the experts are replicated on (e.g. across nodes)
+    in one all-reduce instead of one per weight. It costs a copy of the weights into the packed array per call.
     """
     resolved_implementation = resolve_moe_implementation(implementation)
     if token_blocks < 1:
@@ -716,27 +726,44 @@ def moe_mlp(
         w_up_gate = _reshard_for_shard_map(w_up_gate, mesh, w_up_gate_spec)
         w_down = _reshard_for_shard_map(w_down, mesh, w_down_spec)
 
-        shard_fn = shard_map(
-            partial(
-                shard_local_fn,
-                activation_fn=activation_fn,
-                num_experts=num_experts,
-                capacity_factor=capacity_factor,
-                token_sharding_axes=token_sharding_axes,
-            ),
-            mesh=mesh,
-            in_specs=(
-                token_spec,
-                token_spec,
-                token_spec,
-                token_spec,
-                w_up_gate_spec,
-                w_down_spec,
-            ),
-            out_specs=(token_spec, CapacityDrops(sender_dropped=P(), receiver_dropped=P())),
-            check_vma=False,
+        local_fn = partial(
+            shard_local_fn,
+            activation_fn=activation_fn,
+            num_experts=num_experts,
+            capacity_factor=capacity_factor,
+            token_sharding_axes=token_sharding_axes,
         )
-        out, drops = shard_fn(x, selected_experts, combine_weights, token_valid, w_up_gate, w_down)
+        out_specs = (token_spec, CapacityDrops(sender_dropped=P(), receiver_dropped=P()))
+        if joint_expert_grad_reduction:
+            # shard_map's transpose reduces each replicated input's cotangent with its own psum; one packed input
+            # gives one psum.
+            packed = jnp.concatenate(
+                [w_up_gate.reshape(w_up_gate.shape[0], -1), w_down.reshape(w_down.shape[0], -1)], axis=1
+            )
+            split = math.prod(w_up_gate.shape[1:])
+
+            def packed_local_fn(x, selected, weights, valid, packed_local):
+                w_up_gate_local = packed_local[:, :split].reshape(-1, *w_up_gate.shape[1:])
+                w_down_local = packed_local[:, split:].reshape(-1, *w_down.shape[1:])
+                return local_fn(x, selected, weights, valid, w_up_gate_local, w_down_local)
+
+            shard_fn = shard_map(
+                packed_local_fn,
+                mesh=mesh,
+                in_specs=(token_spec, token_spec, token_spec, token_spec, P("expert", None)),
+                out_specs=out_specs,
+                check_vma=False,
+            )
+            out, drops = shard_fn(x, selected_experts, combine_weights, token_valid, packed)
+        else:
+            shard_fn = shard_map(
+                local_fn,
+                mesh=mesh,
+                in_specs=(token_spec, token_spec, token_spec, token_spec, w_up_gate_spec, w_down_spec),
+                out_specs=out_specs,
+                check_vma=False,
+            )
+            out, drops = shard_fn(x, selected_experts, combine_weights, token_valid, w_up_gate, w_down)
         if report_capacity_overflow:
             return out, dispatch_counts(drops)
         return out

@@ -128,6 +128,9 @@ class GrugModelConfig:
     moe_token_blocks: int = 1
     """Token blocks per shard for ``ring_dedup``: each block has its own all-to-all exchange, so one
     block's collectives can overlap another's expert matmuls. Must divide the local token count."""
+    moe_joint_expert_grad_reduction: bool = False
+    """Reduce the gradients of both expert weights across replicas in one all-reduce per layer instead of two (the
+    weights are packed into one array at the expert-parallel boundary, a copy per call)."""
     ce_implementation: str | None = None
     """Fused cross-entropy backend selection (levanter fused_cross_entropy_loss). None keeps the
     backend default (GPU: full-logits ``xla`` path). Set ``"batched_xla"`` to use the blocked-vocab
@@ -568,6 +571,7 @@ class MoEMLP(eqx.Module):
                 pooled_transport_capacity_factor=cfg.pooled_transport_capacity_factor,
                 num_expert_waves=cfg.num_expert_waves,
                 token_blocks=cfg.moe_token_blocks,
+                joint_expert_grad_reduction=cfg.moe_joint_expert_grad_reduction,
             ),
             routed_moe=QBRoutedMoE(
                 num_experts_per_token=cfg.num_experts_per_token,
