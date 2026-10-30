@@ -2004,7 +2004,6 @@ def test_ring_dedup_token_blocks_match_separate_calls_per_block(
     assert result.returncode == 0, result.stderr
 
 
-
 @pytest.mark.timeout(240)
 @pytest.mark.parametrize("implementation", ["ring_dedup", "ring"])
 def test_joint_expert_grad_reduction_matches_and_reduces_once(implementation: str):
@@ -2088,6 +2087,7 @@ def test_joint_expert_grad_reduction_matches_and_reduces_once(implementation: st
     )
 
     assert result.returncode == 0, result.stderr
+
 
 def test_ring_dedup_expert_combine_keeps_bf16_sums_in_float32():
     """The expert-side combine sums each received row's bf16 expert outputs in float32 and rounds once. Its
