@@ -2064,14 +2064,11 @@ def test_joint_expert_grad_reduction_matches_and_reduces_once(implementation: st
             return value, [np.asarray(g) for g in grads], text
 
         def weight_grad_all_reduces(text):
-            # all-reduces whose operands carry the expert weights' local gradients (expert dimension experts/shards)
+            # all-reduces whose operands are the expert weights' local gradients (leading dimension experts/shards);
+            # an all-reduce's operand types follow its reduction region: `}) : (tensor<...>, ...) -> ...`
             local = experts // shards
-            pattern = re.compile(r"stablehlo\\.all_reduce.*?:\\s*\\((tensor<[^)]*)\\)", re.S)
-            found = 0
-            for line in text.splitlines():
-                if "all_reduce" in line and f"tensor<{local}x" in line:
-                    found += 1
-            return found
+            signatures = re.findall(r"stablehlo\\.all_reduce.*?\\}\\) : \\(([^)]*)\\)", text, re.S)
+            return sum(1 for sig in signatures if f"tensor<{local}x" in sig)
 
         value, grads, text = run(False)
         joint_value, joint_grads, joint_text = run(True)
