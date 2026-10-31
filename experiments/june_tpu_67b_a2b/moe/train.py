@@ -57,6 +57,7 @@ from experiments.june_tpu_67b_a2b.moe.model import (
     qb_group_count,
     router_token_validity,
     summarize_loss_metrics,
+    unreduced_to_local,
 )
 
 # This file intentionally mirrors `experiments/grug/base/train.py` with
@@ -447,6 +448,7 @@ def _make_train_step(
     diagnose_numerics: bool = False,
     qb_sync_interval: int = 0,
     microbatches: int = 1,
+    overlap_last_microbatch: bool = False,
 ):
     if microbatches < 1:
         raise ValueError(f"microbatches must be at least 1, got {microbatches}")
@@ -480,13 +482,14 @@ def _make_train_step(
                 return_router_metrics=True,
             )
 
-        def loss_terms_fn(compute_params, microbatch):
+        def loss_terms_fn(compute_params, microbatch, block_grad_offsets=None):
             return compute_params.next_token_loss_terms(
                 microbatch.tokens,
                 microbatch.loss_weight,
                 mask=microbatch.attn_mask,
                 reduction="sum",
                 logsumexp_weight=z_loss,
+                block_grad_offsets=block_grad_offsets,
             )
 
         if microbatches > 1:
@@ -495,7 +498,7 @@ def _make_train_step(
             else:
                 qb_compute_params = _apply_qb_betas(state.compute_params, state.pending_qb_betas)
             loss, summarized_metrics, accumulated_grads = _microbatched_loss_and_grads(
-                loss_terms_fn, qb_compute_params, batch, microbatches
+                loss_terms_fn, qb_compute_params, batch, microbatches, overlap_last_microbatch
             )
             grads = mp.cast_to_param(accumulated_grads)
         elif state.compute_params is None:
@@ -616,6 +619,7 @@ def _microbatched_loss_and_grads(
     params: Transformer,
     batch,
     microbatches: int,
+    overlap_last_microbatch: bool = False,
 ) -> tuple[jax.Array, dict, Transformer]:
     """Loss, summarized metrics and gradients of the whole ``batch``, one microbatch at a time.
 
@@ -662,6 +666,7 @@ def _microbatched_loss_and_grads(
 
     value_and_grad = jax.value_and_grad(loss_and_terms, has_aux=True)
     marked_params = _mark_batch_reduced(params)
+    looped = microbatches - 1 if overlap_last_microbatch else microbatches
 
     def body(carry, xs):
         grad_sum, loss_sum, cross_entropy_sum, aux_sum = carry
@@ -675,12 +680,61 @@ def _microbatched_loss_and_grads(
 
     zero = jnp.zeros((), jnp.float32)
     init = (jax.tree.map(_zero_accumulator, marked_params), zero, zero, zero)
-    (grad_sum, loss, cross_entropy_loss, aux_loss), stacked_router_metrics = jax.lax.scan(
-        body, init, (split_batch, token_shares)
+    head = (split_batch, token_shares)
+    if overlap_last_microbatch:
+        head = jax.tree.map(lambda x: x[:looped], head)
+    (grad_sum, loss, cross_entropy_loss, aux_loss), stacked_router_metrics = jax.lax.scan(body, init, head)
+    if not overlap_last_microbatch:
+        router_metrics = _combine_microbatch_router_metrics(stacked_router_metrics, token_shares)
+        grads = jax.tree.map(_finalize_accumulated_grad, grad_sum, params)
+        return loss, summarize_loss_metrics(router_metrics, cross_entropy_loss, aux_loss), grads
+
+    # The last microbatch, outside the loop: its expert weights stay unmarked, and each layer's gradient plus the
+    # earlier microbatches' sum is reduced inside the backward of the layer scan, as soon as that layer is done.
+    last_microbatch, last_share = jax.tree.map(lambda x: x[looped], (split_batch, token_shares))
+    # Start the last microbatch only after the loop: otherwise XLA may run its forward first and keep its activations
+    # live through the whole loop.
+    last_microbatch, grad_sum = jax.lax.optimization_barrier((last_microbatch, grad_sum))
+    per_layer = _per_layer_reduced(params)
+    last_params = jax.tree.map(lambda p, m, pl: p if pl else m, params, marked_params, per_layer)
+    offsets = jax.tree.map(
+        lambda acc, pl: unreduced_to_local(acc, leading=1) if pl else None,
+        grad_sum.stacked_blocks.stacked,
+        per_layer.stacked_blocks.stacked,
+    )
+
+    def last_loss_and_terms(p, microbatch, token_share):
+        cross_entropy_sum, aux, router = loss_terms_fn(p, microbatch, offsets)
+        cross_entropy = cross_entropy_sum / loss_denominator
+        aux = token_share * aux
+        return cross_entropy + aux, (cross_entropy, aux, router)
+
+    (last_loss, (last_ce, last_aux, last_router)), last_grads = jax.value_and_grad(last_loss_and_terms, has_aux=True)(
+        last_params, last_microbatch, last_share
+    )
+    stacked_router_metrics = jax.tree.map(
+        lambda h, t: jnp.concatenate([h, t[None]], axis=0), stacked_router_metrics, last_router
     )
     router_metrics = _combine_microbatch_router_metrics(stacked_router_metrics, token_shares)
-    grads = jax.tree.map(_finalize_accumulated_grad, grad_sum, params)
+
+    def finalize(acc, g, p, pl):
+        if pl:
+            return g  # Already reduced in the backward, with the accumulator added.
+        return _finalize_accumulated_grad(acc + g.astype(jnp.float32), p) if isinstance(acc, jax.Array) else acc
+
+    grads = jax.tree.map(finalize, grad_sum, last_grads, params, per_layer)
+    loss, cross_entropy_loss, aux_loss = loss + last_loss, cross_entropy_loss + last_ce, aux_loss + last_aux
     return loss, summarize_loss_metrics(router_metrics, cross_entropy_loss, aux_loss), grads
+
+
+def _per_layer_reduced(params: Transformer) -> Transformer:
+    """True for the stacked block weights sharded over ``expert`` (the expert weights): the last microbatch reduces
+    their gradients one layer at a time inside the backward. Everything else is reduced after it, as for the loop."""
+    flags = jax.tree.map(lambda _: False, params)
+    stacked = jax.tree.map(
+        lambda x: isinstance(x, jax.Array) and _EXPERT_AXIS in jax.typeof(x).sharding.spec, params.stacked_blocks.stacked
+    )
+    return eqx.tree_at(lambda t: t.stacked_blocks.stacked, flags, stacked)
 
 
 def _mark_batch_reduced(params: Transformer) -> Transformer:
