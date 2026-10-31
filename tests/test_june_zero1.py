@@ -290,3 +290,49 @@ def test_zero1_checkpoint_restores_with_zero1_off_and_on(saved_with_zero1):
             np.testing.assert_allclose(next_losses[True], next_losses[False], rtol=1e-6)
         """
     )
+
+
+@pytest.mark.timeout(900)
+def test_zero1_eval_hooks_gather_each_model_once_per_step():
+    # With ZeRO-1 the eval hooks evaluate float32 models in the compute copy's sharding, one model per hook, so a
+    # sharded master never reaches the evaluator (which would gather it in every layer of every eval batch) and only
+    # one gathered model is live at a time. A step evaluated already gathers nothing.
+    _run(
+        """
+        import levanter.eval
+        from levanter.callbacks import StepInfo
+        from levanter.callbacks.state_adapter import CallbackStateView
+
+        evaluated = []
+
+        def fake_eval_model(evaluator, model, prefix=""):
+            evaluated.append((prefix, specs(model), {x.dtype for x in jax.tree.leaves(model)}))
+            return {}
+
+        levanter.eval.eval_model = fake_eval_model
+        mesh = MESHES["replica4_expert2"]
+        state = zero1_state(mesh, optax.adam(1e-2), zero1=True)
+        model_shardings = jax.tree.map(lambda x: x.sharding, state.compute_params)
+        assert specs(state.params) != specs(state.compute_params)
+        for current, ema in ((True, True), (True, False), (False, True)):
+            hooks = june_train._eval_hooks(
+                None, prefix="eval", eval_current=current, eval_ema=ema, model_shardings=model_shardings
+            )
+            assert len(hooks) == current + ema, (current, ema, hooks)
+            evaluated.clear()
+            view = CallbackStateView(
+                step=state.step + 1, model=state.params, eval_model=state.ema_params, opt_state=state.opt_state
+            )
+            with jax.set_mesh(mesh):
+                for hook in hooks:
+                    hook(StepInfo(state=view, loss=0.0, step_duration=0.0))
+                # The same step again, forced, with models that cannot be gathered: nothing runs.
+                unusable = dataclasses.replace(view, model=object(), eval_model=object())
+                for hook in hooks:
+                    hook(StepInfo(state=unusable, loss=0.0, step_duration=0.0), force=True)
+            assert [prefix for prefix, _, _ in evaluated] == ["eval"] * current + ["eval/ema"] * ema, evaluated
+            for prefix, model_specs, dtypes in evaluated:
+                assert model_specs == specs(state.compute_params), prefix
+                assert dtypes == {np.dtype(np.float32)}, (prefix, dtypes)
+        """
+    )
