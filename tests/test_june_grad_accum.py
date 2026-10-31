@@ -115,10 +115,11 @@ Reduction = collections.namedtuple("Reduction", "in_loop elements scalar op_name
 _REDUCTIONS = ("all-reduce", "all-reduce-start", "reduce-scatter")
 
 
-def replica_reductions(hlo, mesh):
-    # The all-reduces and reduce-scatters of a compiled CPU module that sum across replica_dcn: whether each runs
-    # inside a while loop (the microbatch loop, the layer scans), how many elements it reduces (its operands', so a
-    # reduce-scatter counts its output times its group size), whether every operand is a scalar, and its source op.
+def replica_reductions(hlo, mesh, ops=_REDUCTIONS):
+    # The all-reduces and reduce-scatters (or other collectives ``ops``) of a compiled CPU module that cross
+    # replica_dcn: whether each runs inside a while loop (the microbatch loop, the layer scans), how many elements it
+    # reduces (its operands', so a reduce-scatter counts its output times its group size; an all-gather its output),
+    # whether every operand is a scalar, and its source op.
     computations, current = {}, None
     for line in hlo.splitlines():
         header = re.match(r"(ENTRY )?%?([\w.\-]+) .*\{$", line)
@@ -145,19 +146,28 @@ def replica_reductions(hlo, mesh):
     for name, (_, lines) in computations.items():
         for line in lines:
             m = re.match(r"(?:ROOT )?%?[\w.\-]+ = (.+?) ([\w\-]+)\((.*)$", line)
-            if not m or m.group(2) not in _REDUCTIONS:
+            if not m or m.group(2) not in ops:
                 continue
             shape, _, attrs = m.groups()
             named = re.search(r"replica_groups=mesh\[([^\]]*)\]\s*\{([^}]*)\}", attrs)
+            # Iota groups: [groups, size]<=[dims], optionally T(permutation) of the dims.
+            iota = re.search(r"replica_groups=\[(\d+),(\d+)\]<=\[([\d,]+)\](?:T\(([\d,]+)\))?", attrs)
             if named:
                 sizes = {axis: int(size) for axis, size in re.findall(r"'(\w+)'=(\d+)", named.group(1))}
                 axes = re.findall(r"'(\w+)'", named.group(2))
                 crosses = "replica_dcn" in axes
                 group_size = int(np.prod([sizes[axis] for axis in axes]))
             else:
-                groups = re.search(r"replica_groups=\{(.*?)\}\}", attrs)
-                assert groups, line
-                groups = [group.split(",") for group in re.findall(r"\{([\d,]+)", groups.group(0))]
+                if iota:
+                    count, size, dims, permutation = iota.groups()
+                    ids = np.arange(mesh.devices.size).reshape([int(d) for d in dims.split(",")])
+                    if permutation:
+                        ids = ids.transpose([int(d) for d in permutation.split(",")])
+                    groups = ids.reshape(int(count), int(size)).tolist()
+                else:
+                    groups = re.search(r"replica_groups=\{(.*?)\}\}", attrs)
+                    assert groups, line
+                    groups = [group.split(",") for group in re.findall(r"\{([\d,]+)", groups.group(0))]
                 crosses = any(len({coords[int(d)][replica] for d in group}) > 1 for group in groups)
                 group_size = len(groups[0])
             if crosses:
