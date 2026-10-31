@@ -133,6 +133,21 @@ class GrugTrainerConfig:
     ``--xla_gpu_enable_while_loop_unrolling=WHILE_LOOP_UNROLLING_NO_UNROLL`` in ``XLA_FLAGS`` to keep the peak at
     that of 2 microbatches."""
 
+    overlap_last_microbatch: bool = False
+    """With ``microbatches`` > 1: run the last microbatch after the microbatch loop and reduce each layer's expert
+    weight gradients (the float32 sum of the earlier microbatches plus the last one's, cast to the compute dtype)
+    inside its backward, as soon as that layer's backward is done, so the reductions overlap the backward of the
+    layers below it instead of running after the step's last backward. Every weight is still reduced once per step,
+    and the gradients are the same as without it. The other weights are reduced after the last microbatch, as
+    without it. Peak memory goes up by about one layer's expert gradients.
+
+    On GPU the overlap needs XLA flags: ``--xla_gpu_all_reduce_combine_threshold_bytes`` above one layer's expert
+    gradient bytes (so the per-layer all-reduces of one layer combine into one), stream domains for in-node
+    collectives (``--xla_gpu_collective_domain_assignment=scale_up_fabric``, so in-node all-to-alls do not queue
+    behind the per-layer all-reduce), room for the latency-hiding scheduler
+    (``--xla_gpu_memory_limit_slop_factor=200``; the default keeps it in memory-pressure mode) and a PGLE profile that
+    costs the per-layer all-reduce. Without them the per-layer reductions run synchronously and hide nothing."""
+
     sft_weights_only_init: bool = False
     """SFT/RL init semantics (marin #650). When True and the run has no checkpoint of
     its own to auto-resume from, the trainer loads only the model weights (params +
@@ -452,6 +467,8 @@ def _make_train_step(
 ):
     if microbatches < 1:
         raise ValueError(f"microbatches must be at least 1, got {microbatches}")
+    if overlap_last_microbatch and microbatches < 2:
+        raise ValueError(f"overlap_last_microbatch needs at least 2 microbatches, got {microbatches}")
     one = jnp.array(1, dtype=jnp.int32)
     z_loss = z_loss_weight if z_loss_weight > 0 else None
     if watch_config is not None:
@@ -638,6 +655,13 @@ def _microbatched_loss_and_grads(
     all-reduce, or a reduce-scatter for a weight sharded over a batch axis. Only the loss, routing statistics and QB
     threshold reductions of the forward still run once per microbatch. The returned gradients have the dtype and
     sharding of ``params``.
+
+    With ``overlap_last_microbatch`` the loop runs the first ``microbatches - 1`` microbatches and the last one runs
+    after it, with the expert weights (``_per_layer_reduced``) left unmarked. Its layer scan gets each layer's slice
+    of their accumulators as ``block_grad_offsets``, and its backward reduces that layer's ``accumulator + gradient``,
+    cast as ``_finalize_accumulated_grad`` casts it, as soon as the layer is done: the same arithmetic and one reduction
+    per weight per step, but overlapping the backward of the layers below it. The other weights are reduced after the
+    last microbatch, as without it.
     """
     batch_size = batch.tokens.shape[0]
     batch_shards = _batch_shards(get_abstract_mesh())
@@ -860,6 +884,7 @@ def _run_grug_local(config: GrugRunConfig, *, step_hooks: Sequence[Callable[[cal
         diagnose_numerics=config.trainer.diagnose_numerics,
         qb_sync_interval=config.trainer.qb_sync_interval,
         microbatches=config.trainer.microbatches,
+        overlap_last_microbatch=config.trainer.overlap_last_microbatch,
     )
 
     data_key, model_key = jax.random.split(jax.random.PRNGKey(trainer.seed), 2)
