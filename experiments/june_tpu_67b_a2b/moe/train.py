@@ -53,6 +53,7 @@ from experiments.june_tpu_67b_a2b.moe.model import (
     GrugModelConfig,
     Transformer,
     _long_layer_schedule,
+    after_scan_reduced_spec,
     qb_betas_spec,
     qb_group_count,
     router_token_validity,
@@ -739,11 +740,21 @@ def _microbatched_loss_and_grads(
 
 def _per_layer_reduced(params: Transformer) -> Transformer:
     """True for the stacked block weights sharded over ``expert`` (the expert weights): the last microbatch reduces
-    their gradients one layer at a time inside the backward. Everything else is reduced after it, as for the loop."""
+    their gradients one layer at a time inside the backward. Everything else is reduced after it, as for the loop.
+
+    Not the expert weights the layer scan itself marks ``reduced`` (``replicated_grad_reduction="after_scan"`` with
+    a size-1 ``expert`` axis and at most ``replicated_grad_max_bytes`` per layer): they are reduced after the scan
+    anyway, so they take the same path as the other weights."""
+    cfg = params.config
+    max_bytes = cfg.replicated_grad_max_bytes if cfg.replicated_grad_reduction == "after_scan" else -1
+
+    def per_layer(path, x):
+        if not isinstance(x, jax.Array) or _EXPERT_AXIS not in jax.typeof(x).sharding.spec:
+            return False
+        return after_scan_reduced_spec(path, x, max_bytes) is None
+
     flags = jax.tree.map(lambda _: False, params)
-    stacked = jax.tree.map(
-        lambda x: isinstance(x, jax.Array) and _EXPERT_AXIS in jax.typeof(x).sharding.spec, params.stacked_blocks.stacked
-    )
+    stacked = jax.tree_util.tree_map_with_path(per_layer, params.stacked_blocks.stacked)
     return eqx.tree_at(lambda t: t.stacked_blocks.stacked, flags, stacked)
 
 

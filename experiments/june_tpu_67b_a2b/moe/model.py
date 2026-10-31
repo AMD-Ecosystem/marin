@@ -655,22 +655,28 @@ def _mark_reduced(blocks: "Block", max_bytes: int) -> "Block":
     which overlaps with the backward; so do the expert weights, sharded over ``expert``. ``router_bias`` is excluded:
     it is added elementwise and has no gradient.
     """
-    mesh = get_abstract_mesh()
 
     def mark(path, x):
-        if not isinstance(x, jax.Array) or any(getattr(k, "name", None) == "router_bias" for k in path):
-            return x
-        if x.size * x.dtype.itemsize // x.shape[0] > max_bytes:  # stacked: leading axis is the layer
-            return x
-        if jax.typeof(x).sharding.spec.reduced:  # Marked by the caller, e.g. the microbatch loop.
-            return x
-        spec = _without_unit_axes(jax.typeof(x).sharding.spec, mesh)
-        if spec is None:
-            return x
-        # Every batch axis, size-1 ones included: a dot's unreduced output must name its contracting dim's axes.
-        return reshard(x, P(*spec, reduced=frozenset(_BATCH_AXES)))
+        spec = after_scan_reduced_spec(path, x, max_bytes)
+        return x if spec is None else reshard(x, spec)
 
     return jax.tree_util.tree_map_with_path(mark, blocks)
+
+
+def after_scan_reduced_spec(path, x, max_bytes: int) -> P | None:
+    """The ``reduced`` spec ``_mark_reduced`` gives the stacked block weight ``x`` at ``path``, or None if it leaves
+    ``x`` alone (a size-1 ``expert`` axis counts as replicated, so small expert weights are marked too)."""
+    if not isinstance(x, jax.Array) or any(getattr(k, "name", None) == "router_bias" for k in path):
+        return None
+    if x.size * x.dtype.itemsize // x.shape[0] > max_bytes:  # stacked: leading axis is the layer
+        return None
+    if jax.typeof(x).sharding.spec.reduced:  # Marked by the caller, e.g. the microbatch loop.
+        return None
+    spec = _without_unit_axes(jax.typeof(x).sharding.spec, get_abstract_mesh())
+    if spec is None:
+        return None
+    # Every batch axis, size-1 ones included: a dot's unreduced output must name its contracting dim's axes.
+    return P(*spec, reduced=frozenset(_BATCH_AXES))
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(2, 3))
