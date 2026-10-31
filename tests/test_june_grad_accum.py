@@ -99,13 +99,14 @@ def compiled_step_hlo(cfg, mesh, policy, *, microbatches):
         return train_step.lower(state, BATCH).compile().as_text()
 
 
-Reduction = collections.namedtuple("Reduction", "in_loop elements op_name")
+Reduction = collections.namedtuple("Reduction", "in_loop elements scalar op_name")
 _REDUCTIONS = ("all-reduce", "all-reduce-start", "reduce-scatter")
 
 
 def replica_reductions(hlo, mesh):
     # The all-reduces and reduce-scatters of a compiled CPU module that sum across replica_dcn: whether each runs
-    # inside a while loop (the microbatch loop, the layer scans), how many elements it reduces and its source op.
+    # inside a while loop (the microbatch loop, the layer scans), how many elements it reduces (its operands', so a
+    # reduce-scatter counts its output times its group size), whether every operand is a scalar, and its source op.
     computations, current = {}, None
     for line in hlo.splitlines():
         header = re.match(r"(ENTRY )?%?([\w.\-]+) .*\{$", line)
@@ -135,21 +136,26 @@ def replica_reductions(hlo, mesh):
             if not m or m.group(2) not in _REDUCTIONS:
                 continue
             shape, _, attrs = m.groups()
-            named = re.search(r"replica_groups=mesh\[[^\]]*\]\s*\{([^}]*)\}", attrs)
+            named = re.search(r"replica_groups=mesh\[([^\]]*)\]\s*\{([^}]*)\}", attrs)
             if named:
-                crosses = "'replica_dcn'" in named.group(1)
+                sizes = {axis: int(size) for axis, size in re.findall(r"'(\w+)'=(\d+)", named.group(1))}
+                axes = re.findall(r"'(\w+)'", named.group(2))
+                crosses = "replica_dcn" in axes
+                group_size = int(np.prod([sizes[axis] for axis in axes]))
             else:
                 groups = re.search(r"replica_groups=\{(.*?)\}\}", attrs)
                 assert groups, line
-                crosses = any(
-                    len({coords[int(d)][replica] for d in group.split(",")}) > 1
-                    for group in re.findall(r"\{([\d,]+)", groups.group(0))
-                )
+                groups = [group.split(",") for group in re.findall(r"\{([\d,]+)", groups.group(0))]
+                crosses = any(len({coords[int(d)][replica] for d in group}) > 1 for group in groups)
+                group_size = len(groups[0])
             if crosses:
-                dims = re.findall(r"\[([\d,]*)\]", shape)
-                elements = sum(int(np.prod([int(d) for d in each.split(",") if d])) for each in dims)
+                dims = [[int(d) for d in each.split(",") if d] for each in re.findall(r"\[([\d,]*)\]", shape)]
+                elements = sum(int(np.prod(each)) for each in dims)
+                if m.group(2) == "reduce-scatter":
+                    elements *= group_size
                 op_name = re.search(r'op_name="([^"]*)"', attrs)
-                out.append(Reduction(in_loop[name], elements, op_name.group(1) if op_name else ""))
+                scalar = all(not each for each in dims)
+                out.append(Reduction(in_loop[name], elements, scalar, op_name.group(1) if op_name else ""))
     return out
 
 
@@ -225,10 +231,11 @@ def test_microbatches_match_the_whole_batch_in_float32(case):
 @pytest.mark.timeout(900)
 def test_microbatches_match_the_whole_batch_with_bfloat16_compute():
     # The forward is the same for every token, so the loss matches to float32 rounding. The gradients do not: each
-    # microbatch rounds its bfloat16 weight gradients and their cross-device sums on its own. The whole batch's
-    # bfloat16 gradients are themselves off the float32 ones, by up to 2e-2 (the norm weights, whose gradient sums
-    # many terms), so require every microbatched gradient leaf to be no further from its float32 counterpart than the
-    # whole batch's, with a margin and a floor of one bfloat16 rounding (2**-8).
+    # microbatch rounds its own bfloat16 weight gradients, and each device's float32 sum of them is rounded to
+    # bfloat16 once more before the single cross-device sum after the loop. The whole batch's bfloat16 gradients are
+    # themselves off the float32 ones, by up to 2e-2 (the norm weights, whose gradient sums many terms), so require
+    # every microbatched gradient leaf to be no further from its float32 counterpart than the whole batch's, with a
+    # margin and a floor of one bfloat16 rounding (2**-8).
     _run(
         """
         policy = jmp.get_policy("p=f32,c=bfloat16")
@@ -276,9 +283,10 @@ def test_qb_thresholds_are_the_mean_over_microbatches():
 def test_gradients_are_reduced_across_replicas_once_after_the_microbatch_loop():
     # Backward ops carry "transpose(" in their op name. In the whole-batch step the expert weights' gradients are
     # reduced across the replicas in every layer of the backward layer scan; with microbatches, no backward reduction
-    # across the replicas runs in any loop, only the forward's loss and routing statistics. After the loop, the
-    # reductions across the replicas cover every weight's per-device gradient exactly once: in total its element
-    # count, plus a few scalars (the loss weight), fewer than the smallest weight has.
+    # of an array across the replicas runs in any loop, only the forward's loss and routing statistics. The scalar
+    # cotangent of the loss weight is a backward reduction that may stay in the loop (it does on GPU), so it is not
+    # counted as a weight gradient. After the loop, the reductions across the replicas cover every weight's per-device
+    # gradient exactly once: in total its element count, plus a few scalars, fewer than the smallest weight has.
     _run(
         """
         policy = jmp.get_policy("p=f32,c=bfloat16")
@@ -299,7 +307,7 @@ def test_gradients_are_reduced_across_replicas_once_after_the_microbatch_loop():
                 msg = f"{name} K={k}"
                 reductions = replica_reductions(compiled_step_hlo(BASE, mesh, policy, microbatches=k), mesh)
                 in_loop = [r for r in reductions if r.in_loop]
-                assert in_loop and not any("transpose(" in r.op_name for r in in_loop), (msg, in_loop)
+                assert in_loop and not any("transpose(" in r.op_name and not r.scalar for r in in_loop), (msg, in_loop)
                 after_loop = sum(r.elements for r in reductions if not r.in_loop)
                 assert sum(sizes) <= after_loop < sum(sizes) + min(sizes), (msg, after_loop, sum(sizes), reductions)
         """
