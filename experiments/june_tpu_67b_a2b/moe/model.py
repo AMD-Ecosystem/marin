@@ -917,6 +917,34 @@ class Transformer(eqx.Module):
         loss_dtype: jnp.dtype = jnp.float32,
         return_router_metrics: bool = False,
     ) -> jax.Array | tuple[jax.Array, dict[str, jax.Array | SummaryStats]]:
+        cross_entropy_loss, aux_loss, router_metrics = self.next_token_loss_terms(
+            token_ids,
+            loss_weight,
+            mask=mask,
+            reduction=reduction,
+            logsumexp_weight=logsumexp_weight,
+            loss_dtype=loss_dtype,
+        )
+        loss = cross_entropy_loss + aux_loss if reduction != "none" else cross_entropy_loss
+        if return_router_metrics:
+            return loss, summarize_loss_metrics(router_metrics, cross_entropy_loss, aux_loss)
+        return loss
+
+    def next_token_loss_terms(
+        self,
+        token_ids: Int[Array, "B S"],
+        loss_weight: Float[Array, "B S"],
+        *,
+        mask: AttentionMask | jax.Array | None = None,
+        reduction: str = "mean",
+        logsumexp_weight: float | None = None,
+        loss_dtype: jnp.dtype = jnp.float32,
+    ) -> tuple[jax.Array, jax.Array, dict[str, jax.Array]]:
+        """The cross-entropy loss, the weighted router aux loss and the raw per-layer router metrics.
+
+        ``next_token_loss`` is their sum, with the metrics summarized by ``summarize_loss_metrics``. Callers that
+        combine several batches, such as gradient accumulation, combine the raw metrics first and summarize once.
+        """
         hidden, router_metrics = self(token_ids, mask=mask)
         labels = jnp.concatenate([token_ids[:, 1:], token_ids[:, :1] * 0], axis=1).astype(jnp.int32)
         loss_weight = loss_weight.astype(loss_dtype)
@@ -935,18 +963,22 @@ class Transformer(eqx.Module):
         num_moe_layers = router_metrics["router_z_loss_per_layer"].shape[0]
         rzl = jnp.sum(router_metrics["router_z_loss_per_layer"]) / num_moe_layers
         aux_loss = self.config.router_z_loss_coef * rzl
-        loss = cross_entropy_loss + aux_loss if reduction != "none" else cross_entropy_loss
-        if return_router_metrics:
-            summarized_metrics = _summarize_router_metrics(router_metrics)
-            summarized_metrics["train/cross_entropy_loss"] = cross_entropy_loss
-            summarized_metrics["train/router/aux_loss_weighted"] = aux_loss
-            summarized_metrics[MOE_DROPPED_ASSIGNMENTS_METRIC] = router_metrics["capacity_overflow_per_layer"]
-            summarized_metrics[MOE_SKIPPED_PADDING_ASSIGNMENTS_METRIC] = router_metrics["skipped_assignments_per_layer"]
-            summarized_metrics[MOE_VALID_ASSIGNMENTS_METRIC] = jnp.sum(
-                router_metrics["routing_counts_per_layer"], axis=-1, dtype=jnp.int32
-            )
-            return loss, summarized_metrics
-        return loss
+        return cross_entropy_loss, aux_loss, router_metrics
+
+
+def summarize_loss_metrics(
+    router_metrics: dict[str, jax.Array], cross_entropy_loss: jax.Array, aux_loss: jax.Array
+) -> dict[str, jax.Array | SummaryStats]:
+    """The training metrics ``next_token_loss`` returns from its raw per-layer router metrics and loss terms."""
+    summarized_metrics = _summarize_router_metrics(router_metrics)
+    summarized_metrics["train/cross_entropy_loss"] = cross_entropy_loss
+    summarized_metrics["train/router/aux_loss_weighted"] = aux_loss
+    summarized_metrics[MOE_DROPPED_ASSIGNMENTS_METRIC] = router_metrics["capacity_overflow_per_layer"]
+    summarized_metrics[MOE_SKIPPED_PADDING_ASSIGNMENTS_METRIC] = router_metrics["skipped_assignments_per_layer"]
+    summarized_metrics[MOE_VALID_ASSIGNMENTS_METRIC] = jnp.sum(
+        router_metrics["routing_counts_per_layer"], axis=-1, dtype=jnp.int32
+    )
+    return summarized_metrics
 
 
 def _init_weight(key: PRNGKeyArray, shape: tuple[int, ...], std: float) -> Float[Array, "..."]:
