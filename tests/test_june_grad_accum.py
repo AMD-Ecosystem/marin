@@ -8,7 +8,8 @@ replicas and expert parallelism (replica_dcn=4 x expert=2) and on one that also 
 (replica_dcn=2 x data=2 x expert=2). The capacity factors are high enough that no expert overflows, since capacity
 applies per microbatch. This holds with the logit and router z-losses on, with padding that leaves the microbatches
 unequal valid tokens, and with a microbatch that carries no loss weight at all. The next step's QB thresholds are the
-mean of those of the microbatches.
+mean of those of the microbatches. Every weight's gradient is reduced across the replicas once per step, after the
+microbatch loop.
 
 Each case runs in a subprocess so XLA can configure the CPU device count before JAX initializes.
 """
@@ -18,9 +19,10 @@ import textwrap
 import pytest
 from levanter.testing.cpu_devices import run_on_cpu_devices
 
-_PRELUDE = """
+_PRELUDE = r"""
 import collections
 import dataclasses
+import re
 
 import jax
 import jax.numpy as jnp
@@ -85,6 +87,70 @@ def step(cfg, mesh, policy, *, microbatches, carry_compute_params=False, batch=B
         )
         state, metrics, _ = train_step(state, batch)
     return state, jax.device_get(metrics)
+
+
+def compiled_step_hlo(cfg, mesh, policy, *, microbatches):
+    optimizer = optax.adam(1e-2)
+    with jax.set_mesh(mesh):
+        state = june_train.initial_state(cfg, optimizer=optimizer, mp=policy, key=jax.random.key(0), ema_beta=None)
+        train_step = june_train._make_train_step(
+            optimizer, policy, z_loss_weight=0.0, ema_beta=None, microbatches=microbatches
+        )
+        return train_step.lower(state, BATCH).compile().as_text()
+
+
+Reduction = collections.namedtuple("Reduction", "in_loop elements op_name")
+_REDUCTIONS = ("all-reduce", "all-reduce-start", "reduce-scatter")
+
+
+def replica_reductions(hlo, mesh):
+    # The all-reduces and reduce-scatters of a compiled CPU module that sum across replica_dcn: whether each runs
+    # inside a while loop (the microbatch loop, the layer scans), how many elements it reduces and its source op.
+    computations, current = {}, None
+    for line in hlo.splitlines():
+        header = re.match(r"(ENTRY )?%?([\w.\-]+) .*\{$", line)
+        if header and not line.startswith(" "):
+            current = header.group(2)
+            computations[current] = (bool(header.group(1)), [])
+        elif current and line.startswith(" "):
+            computations[current][1].append(line.strip())
+    # A computation runs in a loop if it is a while body or is called from one.
+    in_loop, stack = {}, [(name, False) for name, (entry, _) in computations.items() if entry]
+    while stack:
+        name, looped = stack.pop()
+        if in_loop.get(name, False) >= looped and name in in_loop:
+            continue
+        in_loop[name] = looped
+        for line in computations[name][1]:
+            body = re.search(r"\bbody=%?([\w.\-]+)", line)
+            for callee in re.findall(r"%([\w.\-]+)", line):
+                if callee in computations:
+                    stack.append((callee, looped or (body is not None and callee == body.group(1))))
+    coords = np.stack(np.unravel_index(np.arange(mesh.devices.size), mesh.devices.shape), axis=1)
+    replica = mesh.axis_names.index("replica_dcn")
+    out = []
+    for name, (_, lines) in computations.items():
+        for line in lines:
+            m = re.match(r"(?:ROOT )?%?[\w.\-]+ = (.+?) ([\w\-]+)\((.*)$", line)
+            if not m or m.group(2) not in _REDUCTIONS:
+                continue
+            shape, _, attrs = m.groups()
+            named = re.search(r"replica_groups=mesh\[[^\]]*\]\s*\{([^}]*)\}", attrs)
+            if named:
+                crosses = "'replica_dcn'" in named.group(1)
+            else:
+                groups = re.search(r"replica_groups=\{(.*?)\}\}", attrs)
+                assert groups, line
+                crosses = any(
+                    len({coords[int(d)][replica] for d in group.split(",")}) > 1
+                    for group in re.findall(r"\{([\d,]+)", groups.group(0))
+                )
+            if crosses:
+                dims = re.findall(r"\[([\d,]*)\]", shape)
+                elements = sum(int(np.prod([int(d) for d in each.split(",") if d])) for each in dims)
+                op_name = re.search(r'op_name="([^"]*)"', attrs)
+                out.append(Reduction(in_loop[name], elements, op_name.group(1) if op_name else ""))
+    return out
 
 
 def leaves(tree):
@@ -202,5 +268,39 @@ def test_qb_thresholds_are_the_mean_over_microbatches():
             )
             assert jax.typeof(state.pending_qb_betas).sharding.spec == june_train.qb_betas_spec(cfg), qb_balance
             np.testing.assert_allclose(state.pending_qb_betas, expected, rtol=1e-6, atol=1e-7, err_msg=qb_balance)
+        """
+    )
+
+
+@pytest.mark.timeout(900)
+def test_gradients_are_reduced_across_replicas_once_after_the_microbatch_loop():
+    # Backward ops carry "transpose(" in their op name. In the whole-batch step the expert weights' gradients are
+    # reduced across the replicas in every layer of the backward layer scan; with microbatches, no backward reduction
+    # across the replicas runs in any loop, only the forward's loss and routing statistics. After the loop, the
+    # reductions across the replicas cover every weight's per-device gradient exactly once: in total its element
+    # count, plus a few scalars (the loss weight), fewer than the smallest weight has.
+    _run(
+        """
+        policy = jmp.get_policy("p=f32,c=bfloat16")
+        for name, mesh in MESHES.items():
+            whole = replica_reductions(compiled_step_hlo(BASE, mesh, policy, microbatches=1), mesh)
+            assert any(r.in_loop and "transpose(" in r.op_name for r in whole), (name, whole)
+            with jax.set_mesh(mesh):
+                params = june_train.initial_state(
+                    BASE, optimizer=optax.adam(1e-2), mp=policy, key=jax.random.key(0), ema_beta=None
+                ).params
+                marked = jax.eval_shape(june_train._mark_batch_reduced, params)
+            sizes = [
+                int(np.prod(x.sharding.shard_shape(x.shape)))
+                for path, x in jax.tree_util.tree_leaves_with_path(marked)
+                if getattr(path[-1], "name", None) != "router_bias"
+            ]
+            for k in (2, 4):
+                msg = f"{name} K={k}"
+                reductions = replica_reductions(compiled_step_hlo(BASE, mesh, policy, microbatches=k), mesh)
+                in_loop = [r for r in reductions if r.in_loop]
+                assert in_loop and not any("transpose(" in r.op_name for r in in_loop), (msg, in_loop)
+                after_loop = sum(r.elements for r in reductions if not r.in_loop)
+                assert sum(sizes) <= after_loop < sum(sizes) + min(sizes), (msg, after_loop, sum(sizes), reductions)
         """
     )
