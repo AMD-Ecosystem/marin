@@ -122,7 +122,8 @@ class GrugTrainerConfig:
     batch shards. Each device takes every ``microbatches``-th of its own rows, so the split moves no data. The loss,
     the gradients and the routing counts equal those of the whole batch up to rounding, as long as no expert overflows
     its capacity, which applies per microbatch. The next step's QB thresholds are the mean of the microbatches'
-    thresholds weighted by their valid tokens, each estimated from its own tokens. 1 runs the whole batch at once."""
+    thresholds weighted by their valid tokens, each estimated from its own tokens. 1 runs the whole batch at once.
+    The levanter ``TrainerConfig.per_device_parallelism``, if set, must agree: rows per batch shard per microbatch."""
 
     sft_weights_only_init: bool = False
     """SFT/RL init semantics (marin #650). When True and the run has no checkpoint of
@@ -663,6 +664,20 @@ def _batch_shards(mesh) -> int:
     return math.prod(mesh.shape[axis] for axis in _BATCH_AXES)
 
 
+def _check_per_device_parallelism(
+    per_device_parallelism: int, train_batch_size: int | Sequence, *, microbatches: int, batch_shards: int
+) -> None:
+    """Fail fast when a launcher sets levanter's ``per_device_parallelism`` to a microbatch size the grug loop would
+    not use: only ``GrugTrainerConfig.microbatches`` splits the batch. Unset (-1) and batch-size schedules pass."""
+    if per_device_parallelism < 0 or not isinstance(train_batch_size, int):
+        return
+    if per_device_parallelism * batch_shards * microbatches != train_batch_size:
+        raise ValueError(
+            f"per_device_parallelism ({per_device_parallelism}) x batch shards ({batch_shards}) x microbatches "
+            f"({microbatches}) must equal train_batch_size ({train_batch_size}); set GrugTrainerConfig.microbatches "
+            "to accumulate gradients"
+        )
+
 
 def _tree_all_finite(tree: object) -> jax.Array:
     finite = jnp.array(True)
@@ -703,6 +718,8 @@ def _run_grug_local(config: GrugRunConfig, *, step_hooks: Sequence[Callable[[cal
     ``step_hooks`` run after every step alongside the logging hooks, for example to collect step durations.
     """
     trainer = config.trainer.trainer
+    # Read before ``initialize`` fills it in from the batch size and levanter's own mesh, whose batch axis can differ.
+    requested_per_device_parallelism = trainer.per_device_parallelism
     trainer.initialize()
     levanter.tracker.log_configuration(config)
 
@@ -735,6 +752,12 @@ def _run_grug_local(config: GrugRunConfig, *, step_hooks: Sequence[Callable[[cal
         expert_axis_size=config.trainer.expert_axis_size,
         replica_axis_size=config.trainer.replica_axis_size,
         model_axis_size=config.trainer.model_axis_size,
+    )
+    _check_per_device_parallelism(
+        requested_per_device_parallelism,
+        trainer.train_batch_size,
+        microbatches=config.trainer.microbatches,
+        batch_shards=_batch_shards(mesh),
     )
     with set_mesh(mesh):
         batch_schedule = trainer.batch_schedule
