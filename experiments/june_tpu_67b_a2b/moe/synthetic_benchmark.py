@@ -123,6 +123,11 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Accumulate each step's gradients over this many microbatches of the batch (1 = whole batch at once).",
     )
+    parser.add_argument(
+        "--overlap-last-microbatch",
+        action="store_true",
+        help="With --microbatches > 1, reduce the expert gradients layer by layer in the last microbatch's backward.",
+    )
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--mp", help="jmp policy override, e.g. 'p=f32,c=float16' (default: preset).")
@@ -370,12 +375,14 @@ def main() -> None:
             carry_compute_params=args.carry_compute_params,
             microbatches=args.microbatches,
             zero1=args.zero1,
+            overlap_last_microbatch=args.overlap_last_microbatch,
         ),
         eval=None,
     )
     flops_per_example, flops_summary = _compute_flops(model_config=model)
     logger.info(
-        "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d microbatches=%d seq_len=%d "
+        "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d microbatches=%d "
+        "overlap_last_microbatch=%s seq_len=%d "
         "window=%d mp=%s expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d "
         "token_blocks=%d remat=%s "
         "replicated_grads=%s router_stats=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
@@ -389,6 +396,7 @@ def main() -> None:
         model.num_kv_heads,
         batch_size,
         args.microbatches,
+        args.overlap_last_microbatch,
         model.max_seq_len,
         model.sliding_window,
         trainer.mp,
