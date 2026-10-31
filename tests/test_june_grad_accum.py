@@ -98,15 +98,17 @@ def step(
     return state, jax.device_get(metrics)
 
 
-def compiled_step_hlo(cfg, mesh, policy, *, microbatches, overlap_last_microbatch=False):
+def compiled_step_hlo(cfg, mesh, policy, *, microbatches, overlap_last_microbatch=False, combine_all_reduces=True):
     optimizer = optax.adam(1e-2)
+    # Without the combiner every reduction keeps its own instruction and op_name.
+    options = {} if combine_all_reduces else {"xla_disable_hlo_passes": "cpu-all-reduce-combiner"}
     with jax.set_mesh(mesh):
         state = june_train.initial_state(cfg, optimizer=optimizer, mp=policy, key=jax.random.key(0), ema_beta=None)
         train_step = june_train._make_train_step(
             optimizer, policy, z_loss_weight=0.0, ema_beta=None, microbatches=microbatches,
             overlap_last_microbatch=overlap_last_microbatch,
         )
-        return train_step.lower(state, BATCH).compile().as_text()
+        return train_step.lower(state, BATCH).compile(compiler_options=options).as_text()
 
 
 Reduction = collections.namedtuple("Reduction", "in_loop elements scalar op_name")
@@ -367,13 +369,37 @@ def test_overlapping_the_last_microbatch_gives_the_same_step(case):
 
 
 @pytest.mark.timeout(900)
+@pytest.mark.parametrize(
+    "cfg", ["BASE", "dataclasses.replace(BASE, replicated_grad_max_bytes=0)"], ids=["after_scan", "per_layer"]
+)
+def test_overlapping_the_last_microbatch_with_one_expert_shard(cfg):
+    # With a size-1 expert axis the expert weights are replicated: small enough, the layer scan itself marks them
+    # reduced after the scan (replicated_grad_reduction="after_scan"), and they then take the same path as the other
+    # weights; larger ones are reduced per layer. Either way the step is bit-identical to the hoisted one.
+    _run(
+        f"""
+        cfg = {cfg}
+        mesh = compact_grug_mesh(expert_axis_size=1, replica_axis_size=8)
+        for k in (2, 4):
+            hoisted, hoisted_metrics = step(cfg, mesh, jmp.get_policy("f32"), microbatches=k)
+            overlapped, metrics = step(cfg, mesh, jmp.get_policy("f32"), microbatches=k, overlap_last_microbatch=True)
+            for key in metrics:
+                np.testing.assert_array_equal(metrics[key], hoisted_metrics[key], err_msg=f"K={{k}} {{key}}")
+            overlapped_grads, hoisted_grads = (jax.tree_util.tree_leaves(s.opt_state) for s in (overlapped, hoisted))
+            for a, b in zip(overlapped_grads, hoisted_grads, strict=True):
+                assert a.dtype == b.dtype and a.sharding == b.sharding, k
+                np.testing.assert_array_equal(np.asarray(a), np.asarray(b), err_msg=f"K={{k}}")
+        """
+    )
+
+
+@pytest.mark.timeout(900)
 def test_overlapping_the_last_microbatch_reduces_the_expert_gradients_per_layer():
     # With overlap_last_microbatch, the expert weights' gradients are reduced across the replicas inside the backward
     # layer scan of the last microbatch, which runs after the microbatch loop: one layer's slice of each per
     # iteration, so over the scan each expert weight once. No other backward reduction of an array runs in a loop.
-    # After it, the reductions cover every other weight's gradient exactly once, plus the scalars and the routing
-    # statistics of the forward the compiler combines with them (fewer elements than one layer's slice of an expert
-    # weight).
+    # After it, there is exactly one reduction for every other weight's gradient. Compiled without the all-reduce
+    # combiner, which would merge them with each other and with the forward's routing statistics.
     _run(
         """
         policy = jmp.get_policy("p=f32,c=bfloat16")
@@ -396,7 +422,10 @@ def test_overlapping_the_last_microbatch_reduces_the_expert_gradients_per_layer(
             for k in (2, 4):
                 msg = f"{name} K={k}"
                 reductions = replica_reductions(
-                    compiled_step_hlo(BASE, mesh, policy, microbatches=k, overlap_last_microbatch=True), mesh
+                    compiled_step_hlo(
+                        BASE, mesh, policy, microbatches=k, overlap_last_microbatch=True, combine_all_reduces=False
+                    ),
+                    mesh,
                 )
                 backward_in_loop = [r for r in reductions if r.in_loop and "transpose(" in r.op_name and not r.scalar]
                 assert backward_in_loop and all(r.op_name.startswith(layer_scan) for r in backward_in_loop), (
@@ -404,9 +433,10 @@ def test_overlapping_the_last_microbatch_reduces_the_expert_gradients_per_layer(
                     backward_in_loop,
                 )
                 assert sum(r.elements for r in backward_in_loop) == sum(layer_slices), (msg, backward_in_loop)
-                after_loop = sum(r.elements for r in reductions if not r.in_loop)
-                bounds = (sum(other), sum(other) + min(layer_slices))
-                assert bounds[0] <= after_loop < bounds[1], (msg, after_loop, bounds, reductions)
+                forward = [r for r in reductions if "jvp(" in r.op_name and "transpose(" not in r.op_name]
+                assert forward, (msg, reductions)  # The routing statistics, so the op_name test means something.
+                after_loop = [r.elements for r in reductions if not r.in_loop and not r.scalar and r not in forward]
+                assert sorted(after_loop) == sorted(other), (msg, reductions)
         """
     )
 
