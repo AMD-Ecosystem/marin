@@ -6,7 +6,9 @@
 A train step with ``microbatches=K`` gives the loss, gradients and routing counts of the whole batch, on a mesh with
 replicas and expert parallelism (replica_dcn=4 x expert=2) and on one that also shards the parameters over ``data``
 (replica_dcn=2 x data=2 x expert=2). The capacity factors are high enough that no expert overflows, since capacity
-applies per microbatch. The next step's QB thresholds are the mean of those of the microbatches.
+applies per microbatch. This holds with the logit and router z-losses on, with padding that leaves the microbatches
+unequal valid tokens, and with a microbatch that carries no loss weight at all. The next step's QB thresholds are the
+mean of those of the microbatches.
 
 Each case runs in a subprocess so XLA can configure the CPU device count before JAX initializes.
 """
@@ -25,6 +27,7 @@ import jax.numpy as jnp
 import jmp
 import numpy as np
 import optax
+from levanter.grug.attention import AttentionMask
 from levanter.grug.sharding import compact_grug_mesh
 
 from experiments.june_tpu_67b_a2b.moe import train as june_train
@@ -48,6 +51,18 @@ LOSS_WEIGHT[:, -1] = 0
 LOSS_WEIGHT[::3, :4] = 0  # Microbatches with unequal loss weight.
 Batch = collections.namedtuple("Batch", "tokens loss_weight attn_mask")
 BATCH = Batch(TOKENS, LOSS_WEIGHT, None)
+# Rows 0, 3, 6, ... end in three padding positions, so the microbatches route unequal numbers of tokens.
+SEGMENT_IDS = np.zeros((32, 8), np.int32)
+SEGMENT_IDS[::3, -3:] = -1
+PADDED_BATCH = Batch(
+    TOKENS,
+    np.where(SEGMENT_IDS >= 0, LOSS_WEIGHT, 0),
+    AttentionMask(is_causal=True, segment_ids=(SEGMENT_IDS, SEGMENT_IDS)),
+)
+# Rows 0, 4, 8, ... carry no loss weight: microbatch 0 of four has none.
+UNWEIGHTED_ROWS_WEIGHT = LOSS_WEIGHT.copy()
+UNWEIGHTED_ROWS_WEIGHT[::4] = 0
+UNWEIGHTED_MICROBATCH = Batch(TOKENS, UNWEIGHTED_ROWS_WEIGHT, None)
 
 
 def keep_gradients():
@@ -58,7 +73,7 @@ def keep_gradients():
     )
 
 
-def step(cfg, mesh, policy, *, microbatches, carry_compute_params=False, batch=BATCH):
+def step(cfg, mesh, policy, *, microbatches, carry_compute_params=False, batch=BATCH, z_loss_weight=0.0):
     optimizer = keep_gradients()
     with jax.set_mesh(mesh):
         state = june_train.initial_state(
@@ -66,7 +81,7 @@ def step(cfg, mesh, policy, *, microbatches, carry_compute_params=False, batch=B
             carry_compute_params=carry_compute_params,
         )
         train_step = june_train._make_train_step(
-            optimizer, policy, z_loss_weight=0.0, ema_beta=None, microbatches=microbatches
+            optimizer, policy, z_loss_weight=z_loss_weight, ema_beta=None, microbatches=microbatches
         )
         state, metrics, _ = train_step(state, batch)
     return state, jax.device_get(metrics)
@@ -84,18 +99,25 @@ def grad_errors(state, reference):
     ]
 
 
-def assert_matches_whole_batch(cfg, policy, check_grads, *, carry_compute_params=False):
+def assert_matches_whole_batch(cfg, policy, check_grads, *, carry_compute_params=False, **step_args):
     for name, mesh in MESHES.items():
-        whole, whole_metrics = step(cfg, mesh, policy, microbatches=1, carry_compute_params=carry_compute_params)
+        whole, whole_metrics = step(
+            cfg, mesh, policy, microbatches=1, carry_compute_params=carry_compute_params, **step_args
+        )
         assert np.sum(whole_metrics["moe/dropped_assignments"]) == 0, name
         for k in (2, 4):
             msg = f"{name} K={k}"
-            accumulated, metrics = step(cfg, mesh, policy, microbatches=k, carry_compute_params=carry_compute_params)
-            assert metrics.keys() == whole_metrics.keys(), msg
-            np.testing.assert_allclose(metrics["train/loss"], whole_metrics["train/loss"], rtol=1e-6, err_msg=msg)
-            np.testing.assert_allclose(
-                metrics["train/cross_entropy_loss"], whole_metrics["train/cross_entropy_loss"], rtol=1e-6, err_msg=msg
+            accumulated, metrics = step(
+                cfg, mesh, policy, microbatches=k, carry_compute_params=carry_compute_params, **step_args
             )
+            assert metrics.keys() == whole_metrics.keys(), msg
+            for key in (
+                "train/loss",
+                "train/cross_entropy_loss",
+                "train/router/aux_loss_weighted",
+                "train/router/router_z_loss",
+            ):
+                np.testing.assert_allclose(metrics[key], whole_metrics[key], rtol=1e-6, err_msg=f"{msg} {key}")
             # Same routing for every token, and no drops: capacity applies per microbatch.
             np.testing.assert_array_equal(
                 metrics["train/router/routing_counts_per_layer"],
@@ -112,14 +134,24 @@ def _run(body: str) -> None:
 
 
 @pytest.mark.timeout(900)
-def test_microbatches_match_the_whole_batch_in_float32():
+@pytest.mark.parametrize(
+    "case",
+    [
+        "BASE, batch=BATCH",
+        # The logit z-loss is weighted by loss weight, the router z-loss averages over valid tokens.
+        "dataclasses.replace(BASE, router_z_loss_coef=0.1), batch=PADDED_BATCH, z_loss_weight=1e-2",
+        "dataclasses.replace(BASE, router_z_loss_coef=0.1), batch=UNWEIGHTED_MICROBATCH",
+    ],
+    ids=["unequal_loss_weight", "z_losses_and_padding", "unweighted_microbatch"],
+)
+def test_microbatches_match_the_whole_batch_in_float32(case):
     # Only the order of the float32 sums changes: a few ulps (2**-23 each); 4e-7 observed.
     _run(
-        """
+        f"""
         def check_grads(accumulated, whole, name, msg):
             assert max(grad_errors(accumulated, whole)) <= 1e-5, msg
 
-        assert_matches_whole_batch(BASE, jmp.get_policy("f32"), check_grads)
+        assert_matches_whole_batch({case}, policy=jmp.get_policy("f32"), check_grads=check_grads)
         """
     )
 
@@ -128,18 +160,19 @@ def test_microbatches_match_the_whole_batch_in_float32():
 def test_microbatches_match_the_whole_batch_with_bfloat16_compute():
     # The forward is the same for every token, so the loss matches to float32 rounding. The gradients do not: each
     # microbatch rounds its bfloat16 weight gradients and their cross-device sums on its own. The whole batch's
-    # bfloat16 gradients are themselves up to 2e-2 off the float32 ones (the norm weights, whose gradient sums many
-    # terms), so require the microbatched gradients to be no further from the float32 ones than that, with a margin.
+    # bfloat16 gradients are themselves off the float32 ones, by up to 2e-2 (the norm weights, whose gradient sums
+    # many terms), so require every microbatched gradient leaf to be no further from its float32 counterpart than the
+    # whole batch's, with a margin and a floor of one bfloat16 rounding (2**-8).
     _run(
         """
         policy = jmp.get_policy("p=f32,c=bfloat16")
         cfg = dataclasses.replace(BASE, remat_mode="save_moe_attn")
         exact = {name: step(cfg, mesh, jmp.get_policy("f32"), microbatches=1)[0] for name, mesh in MESHES.items()}
-        bfloat16_error = {}
 
         def check_grads(accumulated, whole, name, msg):
-            bound = bfloat16_error.setdefault(name, max(grad_errors(whole, exact[name])))
-            assert max(grad_errors(accumulated, exact[name])) <= 1.5 * bound, (msg, bound)
+            bounds = 1.5 * np.asarray(grad_errors(whole, exact[name])) + 2**-8
+            errors = np.asarray(grad_errors(accumulated, exact[name]))
+            assert np.all(errors <= bounds), (msg, errors, bounds)
 
         assert_matches_whole_batch(cfg, policy, check_grads)
         assert_matches_whole_batch(cfg, policy, check_grads, carry_compute_params=True)

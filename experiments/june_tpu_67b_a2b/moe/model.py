@@ -966,6 +966,17 @@ class Transformer(eqx.Module):
         return cross_entropy_loss, aux_loss, router_metrics
 
 
+def router_token_validity(token_ids: Int[Array, "B S"], mask: AttentionMask | jax.Array | None) -> Bool[Array, "B S"]:
+    """The positions every MoE layer of ``Transformer.__call__`` routes and counts as tokens, for example in the
+    router z-loss's mean: only the segment IDs of ``mask`` mark padding."""
+    segment_ids = mask.segment_ids if isinstance(mask, AttentionMask) else None
+    return token_validity_from_attention_mask(
+        AttentionMask(is_causal=True, segment_ids=segment_ids),
+        batch_size=token_ids.shape[0],
+        sequence_length=token_ids.shape[1],
+    )
+
+
 def summarize_loss_metrics(
     router_metrics: dict[str, jax.Array], cross_entropy_loss: jax.Array, aux_loss: jax.Array
 ) -> dict[str, jax.Array | SummaryStats]:

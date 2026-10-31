@@ -55,6 +55,7 @@ from experiments.june_tpu_67b_a2b.moe.model import (
     _long_layer_schedule,
     qb_betas_spec,
     qb_group_count,
+    router_token_validity,
     summarize_loss_metrics,
 )
 
@@ -121,7 +122,7 @@ class GrugTrainerConfig:
     batch shards. Each device takes every ``microbatches``-th of its own rows, so the split moves no data. The loss,
     the gradients and the routing counts equal those of the whole batch up to rounding, as long as no expert overflows
     its capacity, which applies per microbatch. The next step's QB thresholds are the mean of the microbatches'
-    thresholds, each estimated from its own tokens. 1 runs the whole batch at once."""
+    thresholds weighted by their valid tokens, each estimated from its own tokens. 1 runs the whole batch at once."""
 
     sft_weights_only_init: bool = False
     """SFT/RL init semantics (marin #650). When True and the run has no checkpoint of
@@ -475,7 +476,7 @@ def _make_train_step(
                 microbatch.tokens,
                 microbatch.loss_weight,
                 mask=microbatch.attn_mask,
-                reduction="mean",
+                reduction="sum",
                 logsumexp_weight=z_loss,
             )
 
@@ -576,22 +577,31 @@ def _split_microbatches(x: jax.Array, microbatches: int) -> jax.Array:
     return jnp.swapaxes(rows, 0, 1)
 
 
-def _combine_microbatch_router_metrics(stacked: dict[str, jax.Array]) -> dict[str, jax.Array]:
+def _combine_microbatch_router_metrics(stacked: dict[str, jax.Array], token_shares: jax.Array) -> dict[str, jax.Array]:
     """Per-layer router metrics stacked over K microbatches, [K, L, ...] -> those of the whole batch, [L, ...].
 
-    Counts add up, and the routing entropy is recomputed from them, as for one batch. The load-balancing and router
-    z-loss diagnostics are means over the microbatches. The QB thresholds are the plain mean of the microbatches'
-    thresholds, which equals their valid-token-weighted mean when every microbatch has as many valid tokens.
+    ``token_shares[k]`` is microbatch k's share of the batch's routed (valid) tokens. Counts add up, and the routing
+    entropy is recomputed from them; the router z-loss, a mean over valid tokens, is the token-share-weighted sum of
+    the microbatches'. Both equal the whole batch's. The QB thresholds are the token-share-weighted mean of the
+    microbatches' thresholds, each estimated from its own tokens: with global balancing that is the same
+    valid-token-weighted mean over shards the whole batch takes, over K times as many local estimates; with per-node
+    balancing the weights are the global shares, which are each node's whenever padding is spread evenly over the
+    nodes. The load-balancing loss, nonlinear in the counts, is the token-share-weighted mean of the microbatches'
+    values, a diagnostic that differs from the whole batch's.
     """
+
+    def weighted_sum(x: jax.Array) -> jax.Array:
+        return jnp.sum(token_shares.reshape(-1, *(1,) * (x.ndim - 1)) * x, axis=0)
+
     counts = jnp.sum(stacked["routing_counts_per_layer"], axis=0)
     fraction = counts / jnp.maximum(jnp.sum(counts, axis=-1, keepdims=True), 1.0)
     qb_betas = stacked["qb_beta_per_layer"]
     return {
         "routing_counts_per_layer": counts,
         "routing_entropy_per_layer": -jnp.sum(fraction * jnp.log(fraction + 1e-6), axis=-1),
-        "load_balancing_loss_per_layer": jnp.mean(stacked["load_balancing_loss_per_layer"], axis=0),
-        "router_z_loss_per_layer": jnp.mean(stacked["router_z_loss_per_layer"], axis=0),
-        "qb_beta_per_layer": reshard(jnp.mean(qb_betas, axis=0), P(*jax.typeof(qb_betas).sharding.spec[1:])),
+        "load_balancing_loss_per_layer": weighted_sum(stacked["load_balancing_loss_per_layer"]),
+        "router_z_loss_per_layer": weighted_sum(stacked["router_z_loss_per_layer"]),
+        "qb_beta_per_layer": reshard(weighted_sum(qb_betas), P(*jax.typeof(qb_betas).sharding.spec[1:])),
         "capacity_overflow_per_layer": jnp.sum(stacked["capacity_overflow_per_layer"], axis=0),
         "skipped_assignments_per_layer": jnp.sum(stacked["skipped_assignments_per_layer"], axis=0),
     }
@@ -605,9 +615,13 @@ def _microbatched_loss_and_grads(
 ) -> tuple[jax.Array, dict, Transformer]:
     """Loss, summarized metrics and float32 gradients of the whole ``batch``, one microbatch at a time.
 
-    ``loss_terms_fn(params, microbatch)`` returns the microbatch's mean cross-entropy, its weighted aux loss and its
-    raw per-layer router metrics. Each microbatch's mean loss and gradient are weighted by its share of the batch's
-    loss weight, so the sums are those of the whole batch's mean loss.
+    ``loss_terms_fn(params, microbatch)`` returns the microbatch's summed (``reduction="sum"``) cross-entropy, its
+    weighted router aux loss and its raw per-layer router metrics. The loss each microbatch differentiates is its
+    share of the whole batch's: its cross-entropy sum over the batch's total loss weight, and its aux loss, a mean
+    over valid tokens, weighted by its share of the batch's valid tokens. Weighting the loss rather than the gradient
+    keeps the accumulation a plain ``accumulator + gradient``, and dividing by the batch's weight rather than the
+    microbatch's keeps a microbatch without loss weight from producing a 0/0 gradient. A batch with no loss weight
+    has zero cross-entropy and gradient.
 
     The gradient of each microbatch is taken in full, cross-device reductions included, so today these still run
     once per microbatch: the expert weights' over ``replica_dcn`` and ``data`` and the large dense block weights' in
@@ -616,8 +630,7 @@ def _microbatched_loss_and_grads(
     and QB threshold reductions of the forward. The accumulator has the parameters' sharding.
     """
     batch_size = batch.tokens.shape[0]
-    mesh = get_abstract_mesh()
-    batch_shards = math.prod(mesh.shape[axis] for axis in _BATCH_AXES)
+    batch_shards = _batch_shards(get_abstract_mesh())
     if batch_size % (microbatches * batch_shards) != 0:
         raise ValueError(
             f"batch size {batch_size} must be a multiple of microbatches ({microbatches}) times the batch shards "
@@ -625,33 +638,44 @@ def _microbatched_loss_and_grads(
         )
     split_batch = jax.tree.map(lambda x: _split_microbatches(x, microbatches), batch)
     total_weight = jnp.sum(batch.loss_weight.astype(jnp.float32))
+    loss_denominator = jnp.where(total_weight > 0, total_weight, 1.0)
+    valid_tokens = jnp.sum(
+        _split_microbatches(router_token_validity(batch.tokens, batch.attn_mask), microbatches).astype(jnp.float32),
+        axis=(1, 2),
+    )
+    total_valid_tokens = jnp.sum(valid_tokens)
+    token_shares = jnp.where(
+        total_valid_tokens > 0, valid_tokens / jnp.maximum(total_valid_tokens, 1.0), 1.0 / microbatches
+    )
 
-    def loss_and_terms(p, microbatch):
-        cross_entropy_loss, aux_loss, router_metrics = loss_terms_fn(p, microbatch)
+    def loss_and_terms(p, microbatch, token_share):
+        cross_entropy_sum, aux_loss, router_metrics = loss_terms_fn(p, microbatch)
+        cross_entropy_loss = cross_entropy_sum / loss_denominator
+        aux_loss = token_share * aux_loss
         return cross_entropy_loss + aux_loss, (cross_entropy_loss, aux_loss, router_metrics)
 
     value_and_grad = jax.value_and_grad(loss_and_terms, has_aux=True)
 
-    def body(carry, microbatch):
+    def body(carry, xs):
         grad_sum, loss_sum, cross_entropy_sum, aux_sum = carry
-        share = jnp.where(
-            total_weight > 0, jnp.sum(microbatch.loss_weight.astype(jnp.float32)) / total_weight, 1.0 / microbatches
-        )
-        (loss, (cross_entropy_loss, aux_loss, router_metrics)), grads = value_and_grad(params, microbatch)
-        grad_sum = jax.tree.map(lambda acc, g: acc + share * g.astype(jnp.float32), grad_sum, grads)
-        carry = (
-            grad_sum,
-            loss_sum + share * loss,
-            cross_entropy_sum + share * cross_entropy_loss,
-            aux_sum + share * aux_loss,
-        )
+        microbatch, token_share = xs
+        (loss, (cross_entropy_loss, aux_loss, router_metrics)), grads = value_and_grad(params, microbatch, token_share)
+        grad_sum = jax.tree.map(lambda acc, g: acc + g.astype(jnp.float32), grad_sum, grads)
+        carry = (grad_sum, loss_sum + loss, cross_entropy_sum + cross_entropy_loss, aux_sum + aux_loss)
         return carry, router_metrics
 
     zero = jnp.zeros((), jnp.float32)
     init = (jax.tree.map(lambda p: jnp.zeros_like(p, dtype=jnp.float32), params), zero, zero, zero)
-    (grads, loss, cross_entropy_loss, aux_loss), stacked_router_metrics = jax.lax.scan(body, init, split_batch)
-    router_metrics = _combine_microbatch_router_metrics(stacked_router_metrics)
+    (grads, loss, cross_entropy_loss, aux_loss), stacked_router_metrics = jax.lax.scan(
+        body, init, (split_batch, token_shares)
+    )
+    router_metrics = _combine_microbatch_router_metrics(stacked_router_metrics, token_shares)
     return loss, summarize_loss_metrics(router_metrics, cross_entropy_loss, aux_loss), grads
+
+
+def _batch_shards(mesh) -> int:
+    return math.prod(mesh.shape[axis] for axis in _BATCH_AXES)
+
 
 
 def _tree_all_finite(tree: object) -> jax.Array:
