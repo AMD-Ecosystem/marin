@@ -126,7 +126,11 @@ class GrugTrainerConfig:
     the gradients and the routing counts equal those of the whole batch up to rounding, as long as no expert overflows
     its capacity, which applies per microbatch. The next step's QB thresholds are the mean of the microbatches'
     thresholds weighted by their valid tokens, each estimated from its own tokens. 1 runs the whole batch at once.
-    The levanter ``TrainerConfig.per_device_parallelism``, if set, must agree: rows per batch shard per microbatch."""
+    The levanter ``TrainerConfig.per_device_parallelism``, if set, must agree: rows per batch shard per microbatch.
+    On GPU, XLA's default while-loop unrolling unrolls a loop of 4 or more microbatches and keeps extra copies of the
+    accumulator live (about 20 GiB per device at 8 x 4k with 4 microbatches); pass
+    ``--xla_gpu_enable_while_loop_unrolling=WHILE_LOOP_UNROLLING_NO_UNROLL`` in ``XLA_FLAGS`` to keep the peak at
+    that of 2 microbatches."""
 
     sft_weights_only_init: bool = False
     """SFT/RL init semantics (marin #650). When True and the run has no checkpoint of
