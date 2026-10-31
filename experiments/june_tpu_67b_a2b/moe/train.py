@@ -129,10 +129,8 @@ class GrugTrainerConfig:
     its capacity, which applies per microbatch. The next step's QB thresholds are the mean of the microbatches'
     thresholds weighted by their valid tokens, each estimated from its own tokens. 1 runs the whole batch at once.
     The levanter ``TrainerConfig.per_device_parallelism``, if set, must agree: rows per batch shard per microbatch.
-    On GPU, XLA's default while-loop unrolling unrolls a loop of 4 or more microbatches and keeps extra copies of the
-    accumulator live (about 20 GiB per device at 8 x 4k with 4 microbatches); pass
-    ``--xla_gpu_enable_while_loop_unrolling=WHILE_LOOP_UNROLLING_NO_UNROLL`` in ``XLA_FLAGS`` to keep the peak at
-    that of 2 microbatches."""
+    XLA's GPU loop unrolling may run the copies of the microbatch loop body in any order; an optimization barrier at
+    the top of each microbatch keeps them in order, so one microbatch's gradients are summed before the next starts."""
 
     overlap_last_microbatch: bool = False
     """With ``microbatches`` > 1: run the last microbatch after the microbatch loop and reduce each layer's expert
@@ -682,6 +680,9 @@ def _microbatched_loss_and_grads(
     def body(carry, xs):
         grad_sum, loss_sum, cross_entropy_sum, aux_sum = carry
         microbatch, token_share = xs
+        # When XLA unrolls this loop, the barrier keeps each microbatch after the previous one's gradients are summed,
+        # so only one per-microbatch gradient tree is live at a time.
+        grad_sum, microbatch, token_share = jax.lax.optimization_barrier((grad_sum, microbatch, token_share))
         (loss, (cross_entropy_loss, aux_loss, router_metrics)), grads = value_and_grad(
             marked_params, microbatch, token_share
         )
