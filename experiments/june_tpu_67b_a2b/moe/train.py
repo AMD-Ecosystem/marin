@@ -137,11 +137,12 @@ class GrugTrainerConfig:
     ``replica_dcn`` as well as ``expert``, so each replica keeps and updates 1/``replica_dcn`` of them. Each expert
     weight's gradient is then reduced once per step into that shard (a reduce-scatter in place of an all-reduce, half
     the bytes), and the updated compute-dtype parameters are all-gathered back to every replica at the end of the step,
-    after the update. The other weights are unchanged: the embedding and output projection are already sharded over
-    the replicas, and the block weights stay replicated. The numbers are those of the replicated update up to the order
-    of the optimizer's norm sums. Needs ``microbatches`` >= 2, ``carry_compute_params`` (the all-gather writes the
-    compute copy, which the forward reads), and the expert count divisible by ``expert`` x ``replica_dcn``. The
-    checkpoint layout is unchanged, so a checkpoint saved with it on loads with it off and the other way round."""
+    after the update. With ``overlap_last_microbatch`` the per-layer reductions in the last microbatch's backward are
+    reduce-scatters into that shard. The other weights are unchanged: the embedding and output projection are already
+    sharded over the replicas, and the block weights stay replicated. The numbers are those of the replicated update up
+    to the order of the optimizer's norm sums. Needs ``microbatches`` >= 2, ``carry_compute_params`` (the all-gather
+    writes the compute copy, which the forward reads), and the expert count divisible by ``expert`` x ``replica_dcn``.
+    The checkpoint layout is unchanged, so a checkpoint saved with it on loads with it off and the other way round."""
 
     overlap_last_microbatch: bool = False
     """With ``microbatches`` > 1: run the last microbatch after the microbatch loop and reduce each layer's expert
@@ -570,7 +571,7 @@ def _make_train_step(
                 return_router_metrics=True,
             )
 
-        def loss_terms_fn(compute_params, microbatch, block_grad_offsets=None):
+        def loss_terms_fn(compute_params, microbatch, block_grad_offsets=None, block_grad_sinks=None):
             return compute_params.next_token_loss_terms(
                 microbatch.tokens,
                 microbatch.loss_weight,
@@ -578,6 +579,7 @@ def _make_train_step(
                 reduction="sum",
                 logsumexp_weight=z_loss,
                 block_grad_offsets=block_grad_offsets,
+                block_grad_sinks=block_grad_sinks,
             )
 
         if microbatches > 1:
@@ -748,7 +750,9 @@ def _microbatched_loss_and_grads(
     of their accumulators as ``block_grad_offsets``, and its backward reduces that layer's ``accumulator + gradient``,
     cast as ``_finalize_accumulated_grad`` casts it, as soon as the layer is done: the same arithmetic and one reduction
     per weight per step, but overlapping the backward of the layers below it. The other weights are reduced after the
-    last microbatch, as without it.
+    last microbatch, as without it. An expert weight whose ``grad_shardings`` entry shards more than ``params`` does
+    (ZeRO-1) is reduce-scattered there, per layer: its gradient leaves the layer scan through a zero "sink" input with
+    that sharding (``block_grad_sinks``), since the weight's own gradient must keep the weight's sharding.
     """
     batch_size = batch.tokens.shape[0]
     batch_shards = _batch_shards(get_abstract_mesh())
@@ -817,15 +821,34 @@ def _microbatched_loss_and_grads(
         per_layer.stacked_blocks.stacked,
     )
 
-    def last_loss_and_terms(p, microbatch, token_share):
-        cross_entropy_sum, aux, router = loss_terms_fn(p, microbatch, offsets)
+    def sink(p, target, pl):
+        # A zero in the gradient's sharding, for an expert weight whose gradient shards more than the weight.
+        spec = jax.typeof(target).sharding.spec
+        return jnp.zeros(p.shape, p.dtype, out_sharding=spec) if pl and spec != jax.typeof(p).sharding.spec else None
+
+    sinks = jax.tree.map(
+        sink, params.stacked_blocks.stacked, grad_shardings.stacked_blocks.stacked, per_layer.stacked_blocks.stacked
+    )
+    if all(x is None for x in jax.tree.leaves(sinks, is_leaf=lambda x: x is None)):
+        sinks = None
+
+    def last_loss_and_terms(p, block_sinks, microbatch, token_share):
+        cross_entropy_sum, aux, router = loss_terms_fn(p, microbatch, offsets, block_sinks)
         cross_entropy = cross_entropy_sum / loss_denominator
         aux = token_share * aux
         return cross_entropy + aux, (cross_entropy, aux, router)
 
-    (last_loss, (last_ce, last_aux, last_router)), last_grads = jax.value_and_grad(last_loss_and_terms, has_aux=True)(
-        last_params, last_microbatch, last_share
-    )
+    (last_loss, (last_ce, last_aux, last_router)), (last_grads, sink_grads) = jax.value_and_grad(
+        last_loss_and_terms, argnums=(0, 1), has_aux=True
+    )(last_params, sinks, last_microbatch, last_share)
+    if sinks is not None:
+        # The sinks' gradients are the reduce-scattered expert gradients; the weights' own are zero.
+        stacked = jax.tree.map(
+            lambda g, sink_grad: g if sink_grad is None else sink_grad,
+            last_grads.stacked_blocks.stacked,
+            sink_grads,
+        )
+        last_grads = eqx.tree_at(lambda t: t.stacked_blocks.stacked, last_grads, stacked)
     stacked_router_metrics = jax.tree.map(
         lambda h, t: jnp.concatenate([h, t[None]], axis=0), stacked_router_metrics, last_router
     )
@@ -833,8 +856,7 @@ def _microbatched_loss_and_grads(
 
     def finalize(acc, g, p, target, pl):
         if pl:
-            # Already reduced in the backward, with the accumulator added, into the sharding of ``p``; with zero1 each
-            # device then keeps its own slice of it.
+            # Already reduced in the backward, with the accumulator added, into the sharding of ``target``.
             return reshard(g, jax.typeof(target).sharding)
         if not isinstance(acc, jax.Array):
             return acc
