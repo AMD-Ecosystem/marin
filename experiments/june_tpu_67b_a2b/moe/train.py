@@ -971,21 +971,51 @@ def _check_step_numerics(metrics: dict, step: int, diagnose_numerics: bool) -> N
         raise FloatingPointError(f"Non-finite Grug update at step {step}: {diagnostics}")
 
 
-def _with_models_resharded(hook: Callable[..., None], shardings: Transformer) -> Callable[..., None]:
-    """``hook`` run on the step's models resharded to ``shardings``, a tree of shardings like the model's.
+def _eval_hooks(
+    evaluator: TaggedEvaluator,
+    *,
+    prefix: str,
+    eval_current: bool,
+    eval_ema: bool,
+    model_shardings: Transformer | None,
+) -> list[Callable[..., None]]:
+    """The eval hooks: one evaluating the current and/or the EMA model, or with ``model_shardings`` one per model, each
+    gathering its model to ``model_shardings`` first (``_with_model_resharded``)."""
+    if model_shardings is None:
+        return [cb_tagged_evaluate(evaluator, prefix=prefix, eval_current=eval_current, eval_ema=eval_ema)]
+    return [
+        _with_model_resharded(
+            cb_tagged_evaluate(evaluator, prefix=prefix, eval_current=not ema, eval_ema=ema), model_shardings, ema=ema
+        )
+        for ema, enabled in ((False, eval_current), (True, eval_ema))
+        if enabled
+    ]
+
+
+def _with_model_resharded(hook: Callable[..., None], shardings: Transformer, *, ema: bool) -> Callable[..., None]:
+    """``hook`` run with the step's current model (``ema``: its EMA model) resharded to ``shardings``, a tree of
+    shardings like the model's, once per step.
 
     With ``zero1`` the float32 models shard the expert weights over the replicas; evaluating them as they are would
-    all-gather every expert weight in every layer of every eval batch. This gathers them once per call."""
+    all-gather every expert weight in every layer of every eval batch. This gathers the one model the hook evaluates
+    once, in float32 as the evaluator runs it, and drops it when the hook returns, so one gathered model is live at a
+    time. A step already evaluated (the forced call after the last step) gathers nothing."""
 
     @jax.jit
     def gather(model: Transformer) -> Transformer:
         return jax.tree.map(lambda x, s: reshard(x, s) if isinstance(x, jax.Array) else x, model, shardings)
 
+    field_name = "eval_model" if ema else "model"
+    last_step: int | None = None
+
     def resharded_hook(info: callbacks.StepInfo, force: bool = False) -> None:
+        nonlocal last_step
+        if info.step < 0 or info.step == last_step:
+            return
         view = info.state
-        model = gather(view.model)
-        eval_model = model if view.eval_model is view.model else gather(view.eval_model)
-        hook(dataclasses.replace(info, state=dataclasses.replace(view, model=model, eval_model=eval_model)), force)
+        model = gather(getattr(view, field_name))
+        hook(dataclasses.replace(info, state=dataclasses.replace(view, **{field_name: model})), force)
+        last_step = info.step
 
     return resharded_hook
 
@@ -1163,17 +1193,18 @@ def _run_grug_local(config: GrugRunConfig, *, step_hooks: Sequence[Callable[[cal
             interval = eval_cfg.steps_per_eval
             eval_ema = eval_cfg.eval_ema and config.trainer.ema_beta is not None
             if interval is not None and interval > 0 and (eval_cfg.eval_current or eval_ema):
-                eval_hook = cb_tagged_evaluate(
+                model_shardings = None
+                if config.trainer.zero1:
+                    assert state.compute_params is not None
+                    model_shardings = jax.tree.map(lambda x: x.sharding, state.compute_params)
+                for eval_hook in _eval_hooks(
                     evaluator,
                     prefix=eval_cfg.prefix,
                     eval_current=eval_cfg.eval_current,
                     eval_ema=eval_ema,
-                )
-                if config.trainer.zero1:
-                    assert state.compute_params is not None
-                    model_shardings = jax.tree.map(lambda x: x.sharding, state.compute_params)
-                    eval_hook = _with_models_resharded(eval_hook, model_shardings)
-                state_callbacks.add_hook(eval_hook, every=interval)
+                    model_shardings=model_shardings,
+                ):
+                    state_callbacks.add_hook(eval_hook, every=interval)
 
         last_loss: float | jax.Array = 0.0
         last_step_duration = 0.0

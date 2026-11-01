@@ -36,6 +36,18 @@ from experiments.june_tpu_67b_a2b.moe.optimizer import GrugMoeMuonHConfig
 
 # Eight experts, so that they split over expert=2 x replica_dcn=4.
 ZERO1_CFG = dataclasses.replace(BASE, num_experts=8, remat_mode="save_moe_attn")
+LAYOUTS = {
+    "stacked": ZERO1_CFG,
+    # QB balanced per node: router_bias and the QB betas are sharded over replica_dcn already, and stay as they are.
+    "per_node_qb": dataclasses.replace(ZERO1_CFG, qb_balance="per_node"),
+    # One [E, ...] expert weight per layer, which MuonH orthogonalizes per expert on the sharded stack.
+    "unstacked": dataclasses.replace(
+        ZERO1_CFG,
+        use_array_stacked_blocks=False,
+        replicated_grad_reduction=GrugModelConfig.replicated_grad_reduction,
+        router_stats_reduction=GrugModelConfig.router_stats_reduction,
+    ),
+}
 POLICY = jmp.get_policy("p=f32,c=bfloat16")
 OPTIMIZERS = {
     "adamw": lambda: AdamConfig(learning_rate=1e-2, warmup=0.0, weight_decay=0.1, max_grad_norm=1.0).build(10),
@@ -45,11 +57,11 @@ EMA_BETA = 0.9
 GATHERS = ("all-gather", "all-gather-start")
 
 
-def zero1_state(mesh, optimizer, *, zero1):
+def zero1_state(mesh, optimizer, *, zero1, cfg=ZERO1_CFG):
     with jax.set_mesh(mesh):
         return jax.jit(
             lambda key: june_train.initial_state(
-                ZERO1_CFG, optimizer=optimizer, mp=POLICY, key=key, ema_beta=EMA_BETA, carry_compute_params=True,
+                cfg, optimizer=optimizer, mp=POLICY, key=key, ema_beta=EMA_BETA, carry_compute_params=True,
                 zero1=zero1,
             )
         )(jax.random.key(0))
@@ -71,9 +83,10 @@ def specs(tree):
 
 
 def zero1_spec(spec):
-    # The expert dimension (1) of a stacked expert weight also split over the replicas.
+    # The expert dimension of an expert weight also split over the replicas.
     entries = list(spec)
-    entries[1] = (entries[1], "replica_dcn")
+    i = entries.index("expert")
+    entries[i] = ("expert", "replica_dcn")
     return P(*entries)
 
 
@@ -96,19 +109,21 @@ def _run(body: str) -> None:
 
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize("optimizer", ["adamw", "muonh"])
-def test_zero1_matches_the_replicated_update(optimizer):
+@pytest.mark.parametrize("layout", ["stacked", "per_node_qb", "unstacked"])
+def test_zero1_matches_the_replicated_update(layout, optimizer):
     # After one step only the order of the optimizer's norm sums differs (the global clip norm, MuonH's per-layer
     # hyperball norm), a few float32 ulps: below 1e-6 relative, 4.6e-7 observed. Later steps start from compute copies
     # that can round differently to bfloat16 and train on, so after three steps every leaf need only be within one
     # bfloat16 rounding (2**-8) of the replicated run's; MuonH, which normalizes each update, shows 4.2e-4. The losses,
-    # means over the batch, move far less: they matched exactly.
+    # means over the batch, move far less: they matched exactly. Only the expert weights' parameters move to the
+    # replicas: with per-node QB, router_bias and the betas keep their sharding.
     _run(
         f"""
         for name, mesh in MESHES.items():
             optimizer = OPTIMIZERS[{optimizer!r}]()
             runs = {{}}
             for zero1 in (False, True):
-                state = zero1_state(mesh, optimizer, zero1=zero1)
+                state = zero1_state(mesh, optimizer, zero1=zero1, cfg=LAYOUTS[{layout!r}])
                 train_step = zero1_step(optimizer, zero1=zero1)
                 losses, after_one_step = [], None
                 with jax.set_mesh(mesh):
@@ -118,6 +133,13 @@ def test_zero1_matches_the_replicated_update(optimizer):
                         if after_one_step is None:
                             after_one_step = jax.tree.map(np.asarray, (state.params, state.ema_params))
                 runs[zero1] = (losses, after_one_step, jax.tree.map(np.asarray, (state.params, state.ema_params)))
+                if zero1:
+                    for path, spec in specs(state.params).items():
+                        expected = zero1_spec(replicated_specs[path]) if "expert_mlp" in path else replicated_specs[path]
+                        assert spec == expected, (name, path, spec)
+                    assert specs(state.compute_params) == replicated_compute_specs, name
+                else:
+                    replicated_specs, replicated_compute_specs = specs(state.params), specs(state.compute_params)
             (losses, one, three), (zero1_losses, zero1_one, zero1_three) = runs[False], runs[True]
             np.testing.assert_allclose(zero1_losses, losses, rtol=1e-5, err_msg=name)
             errors = relative_errors(zero1_one, one)
@@ -231,16 +253,22 @@ def test_zero1_crosses_the_replicas_once_per_step_after_the_microbatch_loop():
 
 
 @pytest.mark.timeout(900)
-def test_zero1_checkpoint_restores_with_zero1_off_and_on():
-    # The checkpoint keeps the tree and the global shapes, so the exemplar's sharding decides what each device reads.
-    # The compute copy rebuilt from the restored parameters has the model's sharding either way.
+@pytest.mark.parametrize("saved_with_zero1", [True, False])
+def test_zero1_checkpoint_restores_with_zero1_off_and_on(saved_with_zero1):
+    # The checkpoint keeps the tree and the global shapes, so the exemplar's sharding decides what each device reads:
+    # a run can turn ZeRO-1 on or off when it resumes. The compute copy rebuilt from the restored parameters has the
+    # model's sharding either way.
     _run(
-        """
+        f"""
         mesh = MESHES["replica4_expert2"]
-        optimizer = OPTIMIZERS["adamw"]()
+        optimizer = OPTIMIZERS["muonh"]()
+        saved_zero1 = {saved_with_zero1!r}
         with jax.set_mesh(mesh):
-            state, _, _ = zero1_step(optimizer, zero1=True)(zero1_state(mesh, optimizer, zero1=True), BATCH)
+            state, _, _ = zero1_step(optimizer, zero1=saved_zero1)(
+                zero1_state(mesh, optimizer, zero1=saved_zero1), BATCH
+            )
         saved = jax.tree.map(np.asarray, state)
+        next_losses = {{}}
         with tempfile.TemporaryDirectory() as tmpdir:
             with jax.set_mesh(mesh):
                 save_checkpoint(state, step=1, checkpoint_path=tmpdir)
@@ -257,6 +285,56 @@ def test_zero1_checkpoint_restores_with_zero1_off_and_on():
                     jax.tree.leaves(rebuilt.compute_params), jax.tree.leaves(POLICY.cast_to_compute(saved.params))
                 ):
                     np.testing.assert_array_equal(np.asarray(a), np.asarray(b), err_msg=str(zero1))
+                with jax.set_mesh(mesh):
+                    _, metrics, _ = zero1_step(optimizer, zero1=zero1)(rebuilt, BATCH)
+                next_losses[zero1] = float(metrics["train/loss"])
+            np.testing.assert_allclose(next_losses[True], next_losses[False], rtol=1e-6)
+        """
+    )
+
+
+@pytest.mark.timeout(900)
+def test_zero1_eval_hooks_gather_each_model_once_per_step():
+    # With ZeRO-1 the eval hooks evaluate float32 models in the compute copy's sharding, one model per hook, so a
+    # sharded master never reaches the evaluator (which would gather it in every layer of every eval batch) and only
+    # one gathered model is live at a time. A step evaluated already gathers nothing.
+    _run(
+        """
+        import levanter.eval
+        from levanter.callbacks import StepInfo
+        from levanter.callbacks.state_adapter import CallbackStateView
+
+        evaluated = []
+
+        def fake_eval_model(evaluator, model, prefix=""):
+            evaluated.append((prefix, specs(model), {x.dtype for x in jax.tree.leaves(model)}))
+            return {}
+
+        levanter.eval.eval_model = fake_eval_model
+        mesh = MESHES["replica4_expert2"]
+        state = zero1_state(mesh, optax.adam(1e-2), zero1=True)
+        model_shardings = jax.tree.map(lambda x: x.sharding, state.compute_params)
+        assert specs(state.params) != specs(state.compute_params)
+        for current, ema in ((True, True), (True, False), (False, True)):
+            hooks = june_train._eval_hooks(
+                None, prefix="eval", eval_current=current, eval_ema=ema, model_shardings=model_shardings
+            )
+            assert len(hooks) == current + ema, (current, ema, hooks)
+            evaluated.clear()
+            view = CallbackStateView(
+                step=state.step + 1, model=state.params, eval_model=state.ema_params, opt_state=state.opt_state
+            )
+            with jax.set_mesh(mesh):
+                for hook in hooks:
+                    hook(StepInfo(state=view, loss=0.0, step_duration=0.0))
+                # The same step again, forced, with models that cannot be gathered: nothing runs.
+                unusable = dataclasses.replace(view, model=object(), eval_model=object())
+                for hook in hooks:
+                    hook(StepInfo(state=unusable, loss=0.0, step_duration=0.0), force=True)
+            assert [prefix for prefix, _, _ in evaluated] == ["eval"] * current + ["eval/ema"] * ema, evaluated
+            for prefix, model_specs, dtypes in evaluated:
+                assert model_specs == specs(state.compute_params), prefix
+                assert dtypes == {np.dtype(np.float32)}, (prefix, dtypes)
         """
     )
 
