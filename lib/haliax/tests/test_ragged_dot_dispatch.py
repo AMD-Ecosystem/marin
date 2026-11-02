@@ -4,6 +4,7 @@
 
 import importlib
 import sys
+import types
 from typing import Literal
 
 import jax
@@ -14,6 +15,12 @@ import pytest
 from haliax.nn import ragged_dot
 
 ragged_dot_module = importlib.import_module("haliax.nn.ragged_dot")
+
+
+@pytest.fixture(autouse=True)
+def _no_ragged_dot_impl_override(monkeypatch):
+    """RAGGED_DOT_IMPL beats an explicit implementation=, so a launch env that sets it would test the wrong kernel."""
+    monkeypatch.delenv("RAGGED_DOT_IMPL", raising=False)
 
 
 def _inputs():
@@ -343,7 +350,8 @@ def test_flydsl_ragged_dot_value_and_gradients_match_xla_f32(rows, k, n, group_s
     dout = jax.random.normal(key_dout, (rows, n), jnp.float32).astype(jnp.bfloat16)
     sizes = jnp.array(group_sizes, dtype=jnp.int32)
     in_groups = (jnp.arange(rows) < active)[:, None]
-    # The kernels must neither read the rows past the last group nor leave them unwritten.
+    # No group may read the rows past the last group. This does not show that those output rows get zeroed: the
+    # kernels never write them, and a fresh output buffer often reads 0 anyway (see the tail-kernel test below).
     poisoned_lhs = jnp.where(in_groups, lhs, jnp.nan)
     poisoned_dout = jnp.where(in_groups, dout, jnp.nan)
 
@@ -381,12 +389,65 @@ def test_flydsl_ragged_dot_value_and_gradients_match_xla_f32(rows, k, n, group_s
     assert bool(jnp.all(drhs[np.array(group_sizes) == 0] == 0))
 
 
+@pytest.mark.parametrize("active", [0, 64, 917, 1023, 1024])
+def test_flydsl_tail_kernel_zeroes_only_the_rows_past_the_groups(active):
+    """The in-place tail kernel zeroes exactly the rows from ``sum(group_sizes)`` on and keeps every other row.
+
+    The FlyDSL kernels never write those rows, so this kernel alone makes them zero; reused buffers inside a
+    scanned or rematerialized train step hold stale values there.
+    """
+    if jax.default_backend() != "gpu" or not ragged_dot_module._has_pallas_triton:
+        pytest.skip("requires a GPU with Pallas Triton")
+    rows, n = 1024, 192
+    stale = jax.random.normal(jax.random.key(3), (rows, n), jnp.float32).astype(jnp.bfloat16)
+    stale = stale.at[rows // 2].set(jnp.nan)
+    sizes = jnp.array([active // 2, 0, active - active // 2], jnp.int32)
+
+    out = jax.jit(ragged_dot_module._zero_rows_past_groups_in_place)(stale, sizes)
+
+    out, stale = _to_cpu_f32(out, stale)
+    np.testing.assert_array_equal(np.asarray(out[:active]), np.asarray(stale[:active]))
+    assert bool(jnp.all(out[active:] == 0))
+
+
 def test_flydsl_ragged_dot_without_jax_flydsl_raises_import_error(monkeypatch):
     """An explicit flydsl request fails instead of falling back when the optional package is missing."""
+    monkeypatch.setattr(ragged_dot_module, "_has_pallas_triton", True)
     for module in ("jax_flydsl", "jax_flydsl.ops", "jax_flydsl.ops.grouped_gemm_bf16"):
         monkeypatch.setitem(sys.modules, module, None)
     lhs = jnp.zeros((512, 128), jnp.bfloat16)
     rhs = jnp.zeros((2, 128, 128), jnp.bfloat16)
 
-    with pytest.raises(ImportError, match='implementation="flydsl"'):
+    with pytest.raises(ImportError, match="optional jax-flydsl package"):
         ragged_dot(lhs, rhs, jnp.array([256, 256], jnp.int32), implementation="flydsl")
+
+
+def test_ragged_dot_env_override_reraises_the_implementation_error(monkeypatch):
+    """A RAGGED_DOT_IMPL override leaves nothing to fall back to, so its own error surfaces even with "auto"."""
+    monkeypatch.setenv("RAGGED_DOT_IMPL", "flydsl")
+
+    def fail(*args):
+        raise RuntimeError("flydsl compile failed")
+
+    monkeypatch.setattr(ragged_dot_module, "_ragged_dot_flydsl_impl", fail)
+    monkeypatch.setattr(ragged_dot_module, "_flydsl_grouped_gemm_ops", lambda: None)
+    lhs, rhs, sizes = jnp.zeros((512, 128), jnp.bfloat16), jnp.zeros((2, 128, 128), jnp.bfloat16), jnp.array([1, 2])
+
+    with pytest.raises(RuntimeError, match="flydsl compile failed"):
+        ragged_dot(lhs, rhs, sizes.astype(jnp.int32))
+
+
+def test_flydsl_arch_mismatch_raises_instead_of_compiling(monkeypatch):
+    """FlyDSL's silent gfx942 fallback on another GPU raises a clear error rather than aborting inside LLVM."""
+
+    class _Device:
+        compute_capability = "gfx950"
+
+    monkeypatch.setattr(ragged_dot_module.jax, "devices", lambda *args: [_Device()])
+    monkeypatch.setitem(sys.modules, "jax_flydsl", types.SimpleNamespace(get_rocm_arch_str=lambda: "gfx942"))
+    ragged_dot_module._check_flydsl_arch.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="FLYDSL_GPU_ARCH=gfx950"):
+            ragged_dot_module._check_flydsl_arch()
+    finally:
+        ragged_dot_module._check_flydsl_arch.cache_clear()
