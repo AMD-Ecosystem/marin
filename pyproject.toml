@@ -449,6 +449,9 @@ ignore-missing-imports = [
     "cutlass.*",
     "jax_triton",
     "jax_triton.*",
+    # jax-flydsl (AMD ROCm only) backs haliax ragged_dot(implementation="flydsl"), imported lazily.
+    "jax_flydsl",
+    "jax_flydsl.*",
     "jaxlib",
     "jaxlib.*",
     "kubernetes",

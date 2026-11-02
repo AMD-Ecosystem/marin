@@ -4,6 +4,7 @@
 
 import dataclasses
 import functools
+import importlib
 import logging
 import math
 import os
@@ -46,7 +47,12 @@ except (ImportError, ModuleNotFoundError):
 # - Tile map: forward and dlhs launch one program per (group, row tile, column tile) from a
 #   device-side tile map, as megablox's make_group_metadata, instead of a full row grid per group;
 #   dlhs reads the weights transposed in place, and drhs uses one flat grid over all groups.
-Implementation: TypeAlias = Literal["auto", "megablox", "triton", "triton_group_grid", "triton_tile_map", "xla"]
+#
+# "flydsl" runs jax-flydsl's BF16 grouped GEMM kernels on AMD Instinct GPUs. jax-flydsl is an optional
+# dependency, imported only when this implementation runs; "auto" never selects it.
+Implementation: TypeAlias = Literal[
+    "auto", "flydsl", "megablox", "triton", "triton_group_grid", "triton_tile_map", "xla"
+]
 _AUTO_FALLBACK_EXCEPTIONS = (NotImplementedError, RuntimeError)
 _HAS_WARNED_AUTO_FALLBACK = False
 _TRITON_DEFAULT_BLOCK_N = 128
@@ -846,6 +852,143 @@ def _ragged_dot_triton_bwd(family, residuals, dout):
 _ragged_dot_triton_impl.defvjp(_ragged_dot_triton_fwd, _ragged_dot_triton_bwd)
 
 
+# jax-flydsl's grouped GEMMs contract over and emit dims that are multiples of 64 and at least 128: both
+# rhs dims, since K is the forward's contraction and N the dlhs one.
+_FLYDSL_DIM_MULTIPLE = 64
+_FLYDSL_MIN_DIM = 128
+# The drhs kernel ranks the groups across the 64 lanes of one wavefront.
+_FLYDSL_MAX_GROUPS = 64
+# Rows per program of the kernel that zeroes the rows past the last group.
+_ZERO_TAIL_BLOCK_M = 64
+
+
+def _zero_tail_kernel(active_ref, rows_ref, out_ref, *, m: int, n: int):
+    """Zero this program's rows from ``active`` on; programs entirely before ``active`` return at once."""
+    del rows_ref  # aliased to out_ref
+    start_m = pl.program_id(0) * _ZERO_TAIL_BLOCK_M
+    active = active_ref[()]
+
+    @pl.when(start_m + _ZERO_TAIL_BLOCK_M > active)
+    def _zero():
+        rows = start_m + jnp.arange(_ZERO_TAIL_BLOCK_M)
+        mask = ((rows >= active) & (rows < m))[:, None]
+        zeros = jnp.zeros((_ZERO_TAIL_BLOCK_M, _FLYDSL_DIM_MULTIPLE), out_ref.dtype)
+
+        def body(j, carry):
+            span = (pl.ds(start_m, _ZERO_TAIL_BLOCK_M), pl.ds(j * _FLYDSL_DIM_MULTIPLE, _FLYDSL_DIM_MULTIPLE))
+            plgpu.store(out_ref.at[span], zeros, mask=mask)
+            return carry
+
+        jax.lax.fori_loop(0, n // _FLYDSL_DIM_MULTIPLE, body, 0)
+
+
+@functools.lru_cache(maxsize=None)
+def _zero_tail_call(m: int, n: int, dtype) -> Callable[..., jax.Array]:
+    return pl.pallas_call(
+        functools.partial(_zero_tail_kernel, m=m, n=n),
+        out_shape=jax.ShapeDtypeStruct((m, n), dtype),
+        in_specs=[pl.no_block_spec, pl.no_block_spec],
+        out_specs=pl.no_block_spec,
+        grid=(pl.cdiv(m, _ZERO_TAIL_BLOCK_M),),
+        input_output_aliases={1: 0},
+        compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1),
+    )
+
+
+def _zero_rows_past_groups_in_place(out: jax.Array, group_sizes: jax.Array) -> jax.Array:
+    """``_zero_rows_past_groups`` for a ``[M, N]`` output with ``N`` a multiple of 64, writing only those rows.
+
+    Unless XLA fuses it into a consumer, the ``jnp.where`` mask reads and writes all of ``out``: 0.11-0.23 ms,
+    or 15-27% of a FlyDSL GEMM, at June's MoE shapes on MI355X. This kernel writes only the rows past the last
+    group, in place, in about 6 us.
+    """
+    m, n = out.shape
+    return _zero_tail_call(m, n, out.dtype)(jnp.sum(group_sizes, dtype=jnp.int32), out)
+
+
+def _flydsl_grouped_gemm_ops():
+    """The ``jax_flydsl.ops.grouped_gemm_bf16`` module, imported on demand since jax-flydsl is optional."""
+    if not _has_pallas_triton:
+        raise ImportError('ragged_dot(implementation="flydsl") needs Pallas Triton to zero the rows past the groups')
+    try:
+        # jax_flydsl.ops re-exports the differentiable op under the module's own name.
+        return importlib.import_module("jax_flydsl.ops.grouped_gemm_bf16")
+    except ImportError as exc:
+        raise ImportError(
+            'ragged_dot(implementation="flydsl") needs the optional jax-flydsl package (with FlyDSL and torch), '
+            "which runs on AMD Instinct GPUs"
+        ) from exc
+
+
+def _check_flydsl_operands(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array) -> None:
+    """Reject operands the FlyDSL kernels cannot run, before tracing any of them."""
+    if lhs.dtype != jnp.bfloat16 or rhs.dtype != jnp.bfloat16:
+        raise ValueError(f"ragged_dot flydsl: lhs and rhs must be bfloat16, got {lhs.dtype} and {rhs.dtype}")
+    if lhs.ndim != 2 or rhs.ndim != 3 or lhs.shape[1] != rhs.shape[1] or group_sizes.shape != rhs.shape[:1]:
+        raise ValueError(
+            "ragged_dot flydsl: need lhs [M, K], rhs [G, K, N] and group_sizes [G], got "
+            f"{lhs.shape}, {rhs.shape} and {group_sizes.shape}"
+        )
+    num_groups, k, n = rhs.shape
+    for name, dim in (("K", k), ("N", n)):
+        if dim % _FLYDSL_DIM_MULTIPLE or dim < _FLYDSL_MIN_DIM:
+            raise ValueError(
+                f"ragged_dot flydsl: {name}={dim} must be a multiple of {_FLYDSL_DIM_MULTIPLE} "
+                f"and at least {_FLYDSL_MIN_DIM}"
+            )
+    if num_groups > _FLYDSL_MAX_GROUPS:
+        raise ValueError(f"ragged_dot flydsl: at most {_FLYDSL_MAX_GROUPS} groups, got {num_groups}")
+
+
+def _flydsl_grouped_matmul(
+    lhs: jax.Array,
+    rhs: jax.Array,
+    group_sizes: jax.Array,
+    ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers = _DEFAULT_DIM_NUMS,
+) -> jax.Array:
+    """jax-flydsl grouped matmul for the forward and VJP layouts of ``ragged_dot``.
+
+    The kernels read the group offsets on the device and never write rows past the last group,
+    so FWD and DLHS zero those rows here; the DRHS kernel writes zeros for an empty group itself.
+    """
+    layout = next((lay for lay, dims in _LAYOUT_DIM_NUMS.items() if dims == ragged_dot_dimension_numbers), None)
+    if layout is None:
+        raise ValueError(f"Unsupported ragged dot dimension numbers for flydsl: {ragged_dot_dimension_numbers}")
+    ops = _flydsl_grouped_gemm_ops()
+    # Clamped to the row count, so groups that overrun it are truncated instead of written out of bounds.
+    offsets = jnp.minimum(jnp.cumulative_sum(group_sizes.astype(jnp.int32), include_initial=True), lhs.shape[0])
+    if layout == RaggedLayout.DRHS:
+        # lhs [M, K] and dout [M, N] -> [G, K, N]
+        return ops.grouped_gemm_bf16_wgrad(lhs, rhs, offsets)
+    if layout == RaggedLayout.FWD:
+        # lhs [M, K] @ rhs[g] [K, N] -> [M, N]
+        out = ops.grouped_gemm_bf16_nn(lhs, rhs, offsets)
+    else:
+        # dout [M, N] @ rhs[g].T, reading rhs [G, K, N] as the [G, N', K'] the NT kernel takes -> [M, K]
+        out = ops.grouped_gemm_bf16_nt(lhs, rhs, offsets)
+    return _zero_rows_past_groups_in_place(out, group_sizes)
+
+
+@jax.custom_vjp
+def _ragged_dot_flydsl_impl(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array) -> jax.Array:
+    """jax-flydsl BF16 grouped matmul with an explicit backward pass through its dlhs and drhs kernels."""
+    return _flydsl_grouped_matmul(lhs, rhs, group_sizes)
+
+
+def _ragged_dot_flydsl_fwd(lhs, rhs, group_sizes):
+    return _flydsl_grouped_matmul(lhs, rhs, group_sizes), (lhs, rhs, group_sizes)
+
+
+def _ragged_dot_flydsl_bwd(residuals, dout):
+    lhs, rhs, group_sizes = residuals
+    dlhs = _flydsl_grouped_matmul(dout, rhs, group_sizes, _DLHS_DIM_NUMS)
+    drhs = _flydsl_grouped_matmul(lhs, dout, group_sizes, _DRHS_DIM_NUMS)
+    return dlhs, drhs, None
+
+
+_ragged_dot_flydsl_impl.defvjp(_ragged_dot_flydsl_fwd, _ragged_dot_flydsl_bwd)
+
+
 def _ragged_dot_xla_impl(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array) -> jax.Array:
     out = jax.lax.ragged_dot_general(
         lhs=lhs,
@@ -865,6 +1008,7 @@ def _preferred_implementations(implementation: Implementation) -> tuple[Implemen
     #   RAGGED_DOT_IMPL=xla     → force XLA
     #   RAGGED_DOT_IMPL=triton  → force Triton
     #   RAGGED_DOT_IMPL=triton_tile_map or triton_group_grid → force Triton with one kernel family
+    #   RAGGED_DOT_IMPL=flydsl  → force jax-flydsl
     env_override = os.environ.get("RAGGED_DOT_IMPL")
     if env_override is not None:
         return (env_override,)  # type: ignore[return-value]
@@ -882,6 +1026,10 @@ def _preferred_implementations(implementation: Implementation) -> tuple[Implemen
 
 
 def _run_impl(name: Implementation, lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array) -> jax.Array:
+    if name == "flydsl":
+        _flydsl_grouped_gemm_ops()
+        _check_flydsl_operands(lhs, rhs, group_sizes)
+        return _ragged_dot_flydsl_impl(lhs, rhs, group_sizes)
     if name == "megablox":
         return _ragged_dot_megablox_impl(lhs, rhs, group_sizes)
     if name == "triton":
@@ -913,6 +1061,10 @@ def ragged_dot(
             ``"triton"`` forces GPU Pallas Triton kernels, of the family this GPU runs by
             default; ``"triton_group_grid"`` and ``"triton_tile_map"`` force one family. ``"megablox"`` forces
             TPU megablox. ``"xla"`` forces ``jax.lax.ragged_dot_general``.
+            ``"flydsl"`` forces jax-flydsl's grouped GEMM on AMD Instinct GPUs: bfloat16 only,
+            with both ``rhs_`` dims multiples of 64 and at least 128, and at most 64 groups.
+            It needs the optional jax-flydsl package and raises ``ImportError`` without it,
+            or ``ValueError`` on operands it cannot run, instead of falling back.
 
     Returns:
         A [tokens, out] array. Rows past ``sum(group_sizes_)`` are zero on every implementation, so
