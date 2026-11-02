@@ -322,8 +322,12 @@ def test_zero1_eval_hooks_gather_each_model_once_per_step():
         mesh = MESHES["replica4_expert2"]
         state = zero1_state(mesh, optax.adam(1e-2), zero1=True, gather=True)
         model_specs = specs(zero1_state(mesh, optax.adam(1e-2), zero1=False).compute_params)
+        trainer = june_train.GrugTrainerConfig(carry_compute_params=True, zero1=True, gather_in_first_microbatch=True)
         with jax.set_mesh(mesh):
-            model_shardings = june_train._model_shardings(ZERO1_CFG, jax.random.key(0))
+            # The shardings _run_grug_local gives the eval hooks.
+            model_shardings = june_train._eval_model_shardings(trainer, ZERO1_CFG, jax.random.key(0))
+            unsharded = dataclasses.replace(trainer, zero1=False, gather_in_first_microbatch=False)
+            assert june_train._eval_model_shardings(unsharded, ZERO1_CFG, jax.random.key(0)) is None
         sharding_specs = {
             jax.tree_util.keystr(path): s.spec for path, s in jax.tree_util.tree_leaves_with_path(model_shardings)
         }
@@ -456,32 +460,62 @@ def test_zero1_with_the_overlapped_last_microbatch_reduces_into_the_shard_per_la
 
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize("optimizer", ["adamw", "muonh"])
-def test_gather_in_first_microbatch_matches_zero1(optimizer):
+@pytest.mark.parametrize("layout", ["stacked", "per_node_qb"])
+def test_gather_in_first_microbatch_matches_zero1(layout, optimizer):
     # Gathering the expert weights in the first microbatch's forward rather than at the end of the step does the same
     # arithmetic in the same order: three steps match ZeRO-1 without it bit for bit, with and without the overlapped
     # last microbatch, and with K=2, where no microbatch loop runs between the first and the overlapped last
-    # microbatch. The compute copy stays in the parameters' ZeRO-1 sharding from step to step.
+    # microbatch. Also with padding, and with a first microbatch without loss weight, whose gradients start the
+    # accumulators. The compute copy stays in the parameters' ZeRO-1 sharding from step to step.
     _run(
         f"""
-        for name, mesh in MESHES.items():
-            for k, overlap in ((4, False), (4, True), (2, True)):
-                msg = f"{{name}} K={{k}} overlap={{overlap}}"
-                optimizer = OPTIMIZERS[{optimizer!r}]()
-                runs = {{}}
-                for gather in (False, True):
-                    state = zero1_state(mesh, optimizer, zero1=True, gather=gather)
-                    train_step = zero1_step(optimizer, zero1=True, microbatches=k, overlap=overlap, gather=gather)
-                    losses = []
-                    with jax.set_mesh(mesh):
-                        for _ in range(3):
-                            state, metrics, _ = train_step(state, BATCH)
-                            losses.append(float(metrics["train/loss"]))
-                    runs[gather] = (losses, jax.tree.map(np.asarray, (state.params, state.ema_params, state.opt_state)))
-                    if gather:
-                        assert specs(state.compute_params) == specs(state.params), msg
-                assert runs[True][0] == runs[False][0], (msg, runs[True][0], runs[False][0])
-                for a, b in zip(jax.tree.leaves(runs[True][1]), jax.tree.leaves(runs[False][1]), strict=True):
-                    np.testing.assert_array_equal(a, b, err_msg=msg)
+        cases = [(name, k, overlap, "BATCH") for name in MESHES for k, overlap in ((4, False), (4, True), (2, True))]
+        cases += [
+            ("replica4_expert2", 4, True, "UNWEIGHTED_MICROBATCH"),
+            ("replica2_data2_expert2", 4, False, "PADDED_BATCH"),
+        ]
+        for name, k, overlap, batch_name in cases:
+            mesh, batch = MESHES[name], globals()[batch_name]
+            msg = f"{{name}} K={{k}} overlap={{overlap}} {{batch_name}}"
+            optimizer = OPTIMIZERS[{optimizer!r}]()
+            cfg = LAYOUTS[{layout!r}]
+            runs = {{}}
+            for gather in (False, True):
+                state = zero1_state(mesh, optimizer, zero1=True, cfg=cfg, gather=gather)
+                train_step = zero1_step(optimizer, zero1=True, microbatches=k, overlap=overlap, gather=gather)
+                losses = []
+                with jax.set_mesh(mesh):
+                    for _ in range(3):
+                        state, metrics, _ = train_step(state, batch)
+                        losses.append(float(metrics["train/loss"]))
+                runs[gather] = (losses, jax.tree.map(np.asarray, (state.params, state.ema_params, state.opt_state)))
+                if gather:
+                    assert specs(state.compute_params) == specs(state.params), msg
+            assert runs[True][0] == runs[False][0], (msg, runs[True][0], runs[False][0])
+            for a, b in zip(jax.tree.leaves(runs[True][1]), jax.tree.leaves(runs[False][1]), strict=True):
+                np.testing.assert_array_equal(a, b, err_msg=msg)
+        """
+    )
+
+
+@pytest.mark.timeout(900)
+def test_gather_in_first_microbatch_rejects_a_state_built_without_it():
+    # A step with gather_in_first_microbatch given a compute copy in the model's sharding would gather nothing in the
+    # first microbatch and quietly run as ZeRO-1; a step without it given a sharded compute copy would never gather it.
+    _run(
+        """
+        mesh = MESHES["replica4_expert2"]
+        optimizer = optax.adam(1e-2)
+        for state_gathers in (False, True):
+            state = zero1_state(mesh, optimizer, zero1=True, gather=state_gathers)
+            train_step = zero1_step(optimizer, zero1=True, gather=not state_gathers)
+            with jax.set_mesh(mesh):
+                try:
+                    train_step(state, BATCH)
+                except ValueError as e:
+                    assert "ZeRO-1 shard" in str(e), e
+                else:
+                    raise AssertionError(f"no error for a state built with gather={state_gathers}")
         """
     )
 

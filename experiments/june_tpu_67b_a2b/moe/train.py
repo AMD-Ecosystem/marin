@@ -430,7 +430,7 @@ def initial_state(
     the replicas (``GrugTrainerConfig.zero1``) and the compute copy keeps the model's sharding, or, with
     ``gather_in_first_microbatch``, theirs."""
     if zero1 and not carry_compute_params:
-        raise ValueError("zero1 needs carry_compute_params: the end-of-step all-gather writes the compute copy")
+        raise ValueError("zero1 needs carry_compute_params: the step writes the updated weights to the compute copy")
     if gather_in_first_microbatch and not zero1:
         raise ValueError("gather_in_first_microbatch needs zero1: it gathers the compute copy's ZeRO-1 shard")
     if gather_in_first_microbatch and not model_config.use_array_stacked_blocks:
@@ -493,7 +493,8 @@ def rebuilt_compute_params(state: GrugTrainState, mp: jmp.Policy) -> GrugTrainSt
     """``state`` with its compute copy recast from its parameters, in the compute copy's own sharding.
 
     For a restored state, whose compute copy is rebuilt rather than trusted from the checkpoint. With ``zero1`` this
-    all-gathers the expert weights the parameters shard over the replicas.
+    all-gathers the expert weights the parameters shard over the replicas to the model's sharding, unless
+    ``gather_in_first_microbatch`` keeps the compute copy in the ZeRO-1 shard, where it only casts.
     """
     if state.compute_params is None:
         return state
@@ -584,6 +585,14 @@ def _make_train_step(
         qb_params = _apply_qb_betas(state.params, state.pending_qb_betas)
         if zero1 and state.compute_params is None:
             raise ValueError("zero1 needs carry_compute_params")
+        if zero1 and _carries_zero1_compute_copy(state.compute_params) != gather_in_first_microbatch:
+            # Otherwise the step would run without the flag's effect: no gathers in the first microbatch, or none at all.
+            raise ValueError(
+                "the state's compute copy is "
+                + ("" if gather_in_first_microbatch else "not ")
+                + "expected in the ZeRO-1 shard: build it with initial_state(gather_in_first_microbatch="
+                + f"{gather_in_first_microbatch})"
+            )
         if ema_beta is not None:
             qb_ema_params = _apply_qb_betas(state.ema_params, state.pending_qb_betas)
         else:
@@ -844,6 +853,8 @@ def _microbatched_loss_and_grads(
     first_router_metrics = None
     if gather_first_microbatch:
         gathered = _gathered_in_first_microbatch(params)
+        if not any(jax.tree.leaves(gathered)):
+            raise ValueError("gather_first_microbatch needs the expert weights in their ZeRO-1 shard; none are")
         first_microbatch, first_share = jax.tree.map(lambda x: x[0], head)
         head = jax.tree.map(lambda x: x[1:], head)
         # The shards stay unmarked: their slices are marked as they are gathered.
@@ -962,18 +973,25 @@ def _microbatched_loss_and_grads(
     return loss, summarize_loss_metrics(router_metrics, cross_entropy_loss, aux_loss), grads
 
 
+def _is_zero1_shard(x) -> bool:
+    """Whether ``x`` is an array with a dimension sharded over ``expert`` and ``replica_dcn``: a ZeRO-1 shard."""
+    if not isinstance(x, jax.Array):
+        return False
+    return any(isinstance(e, tuple) and _EXPERT_AXIS in e and _REPLICA_AXIS in e for e in jax.typeof(x).sharding.spec)
+
+
+def _carries_zero1_compute_copy(compute_params: Transformer) -> bool:
+    """Whether the compute copy keeps expert weights in their ZeRO-1 shard, as ``gather_in_first_microbatch`` does."""
+    return any(_is_zero1_shard(x) for x in jax.tree.leaves(compute_params))
+
+
 def _gathered_in_first_microbatch(params: Transformer) -> Transformer:
     """True for the stacked block weights whose dimension sharded over ``expert`` is also over ``replica_dcn``: the
     ZeRO-1 shards of the expert weights (``_zero1_spec``), which ``gather_in_first_microbatch`` carries sharded."""
-
-    def flag(x):
-        if not isinstance(x, jax.Array):
-            return False
-        spec = jax.typeof(x).sharding.spec
-        return any(isinstance(e, tuple) and _EXPERT_AXIS in e and _REPLICA_AXIS in e for e in spec)
-
     flags = jax.tree.map(lambda _: False, params)
-    return eqx.tree_at(lambda t: t.stacked_blocks.stacked, flags, jax.tree.map(flag, params.stacked_blocks.stacked))
+    return eqx.tree_at(
+        lambda t: t.stacked_blocks.stacked, flags, jax.tree.map(_is_zero1_shard, params.stacked_blocks.stacked)
+    )
 
 
 def _per_layer_reduced(params: Transformer) -> Transformer:
@@ -1088,6 +1106,14 @@ def _model_shardings(model_config: GrugModelConfig, key: PRNGKeyArray) -> Transf
     """The shardings ``Transformer.init`` gives the model's weights, before any ZeRO-1 sharding: those the eval hooks
     gather a ZeRO-1 model to. Not the compute copy's, which ``gather_in_first_microbatch`` keeps sharded."""
     return jax.tree.map(lambda x: x.sharding, jax.eval_shape(lambda k: Transformer.init(model_config, key=k), key))
+
+
+def _eval_model_shardings(
+    trainer: GrugTrainerConfig, model_config: GrugModelConfig, key: PRNGKeyArray
+) -> Transformer | None:
+    """The shardings the eval hooks gather the models to: with ``zero1`` the model's own (``_model_shardings``), never
+    the compute copy's, which ``gather_in_first_microbatch`` keeps sharded; without it none, as nothing is sharded."""
+    return _model_shardings(model_config, key) if trainer.zero1 else None
 
 
 def _eval_hooks(
@@ -1314,9 +1340,7 @@ def _run_grug_local(config: GrugRunConfig, *, step_hooks: Sequence[Callable[[cal
             interval = eval_cfg.steps_per_eval
             eval_ema = eval_cfg.eval_ema and config.trainer.ema_beta is not None
             if interval is not None and interval > 0 and (eval_cfg.eval_current or eval_ema):
-                model_shardings = None
-                if config.trainer.zero1:
-                    model_shardings = _model_shardings(config.model, model_key)
+                model_shardings = _eval_model_shardings(config.trainer, config.model, model_key)
                 for eval_hook in _eval_hooks(
                     evaluator,
                     prefix=eval_cfg.prefix,
