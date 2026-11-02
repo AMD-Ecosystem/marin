@@ -912,12 +912,32 @@ def _flydsl_grouped_gemm_ops():
         raise ImportError('ragged_dot(implementation="flydsl") needs Pallas Triton to zero the rows past the groups')
     try:
         # jax_flydsl.ops re-exports the differentiable op under the module's own name.
-        return importlib.import_module("jax_flydsl.ops.grouped_gemm_bf16")
+        ops = importlib.import_module("jax_flydsl.ops.grouped_gemm_bf16")
     except ImportError as exc:
         raise ImportError(
             'ragged_dot(implementation="flydsl") needs the optional jax-flydsl package (with FlyDSL and torch), '
             "which runs on AMD Instinct GPUs"
         ) from exc
+    _check_flydsl_arch()
+    return ops
+
+
+@functools.cache
+def _check_flydsl_arch() -> None:
+    """Fail before compiling if FlyDSL would target another arch than the GPU JAX runs on.
+
+    FlyDSL reads the arch from ``FLYDSL_GPU_ARCH`` or ``rocm_agent_enumerator`` and silently assumes gfx942 when
+    neither is available. Kernels compiled for the wrong arch abort the process inside LLVM instead of raising.
+    """
+    device_arch = str(getattr(jax.devices()[0], "compute_capability", "")).split(":")[0]
+    if not device_arch.startswith("gfx"):
+        return
+    flydsl_arch = importlib.import_module("jax_flydsl").get_rocm_arch_str()
+    if flydsl_arch != device_arch:
+        raise RuntimeError(
+            f'ragged_dot(implementation="flydsl"): FlyDSL targets {flydsl_arch} but the GPU is {device_arch}; '
+            f"set FLYDSL_GPU_ARCH={device_arch} (FlyDSL falls back to gfx942 without rocm_agent_enumerator on PATH)"
+        )
 
 
 def _check_flydsl_operands(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array) -> None:
@@ -1077,12 +1097,15 @@ def ragged_dot(
 
     out = None
 
-    for impl in _preferred_implementations(implementation):
+    implementations = _preferred_implementations(implementation)
+    for impl in implementations:
         try:
             out = _run_impl(impl, lhs_, rhs_, group_sizes_)
             break
         except _AUTO_FALLBACK_EXCEPTIONS as exc:
-            if implementation == "auto" and impl != "xla":
+            # Fall back only to a next candidate. A single one, such as a RAGGED_DOT_IMPL override with the
+            # call sites' default "auto", re-raises its own error instead of a bare "nothing was selected".
+            if implementation == "auto" and impl != implementations[-1]:
                 global _HAS_WARNED_AUTO_FALLBACK
                 if not _HAS_WARNED_AUTO_FALLBACK:
                     warnings.warn(
