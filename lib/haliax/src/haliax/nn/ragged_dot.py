@@ -402,10 +402,11 @@ _TILE_MAP_GENERIC_CONFIG = TritonBlockConfig(
 )
 _TILE_MAP_CONFIGS: dict[_GpuFamily, dict[RaggedLayout, TritonBlockConfig]] = {
     # Swept on MI350X (gfx950) at the June (G=32, K and N of 1280-2560) and Mixtral-like (G=8, 4096x14336)
-    # expert shapes; see lib/levanter/scripts/bench/bench_ragged_dot_triton.py.
+    # expert shapes; see lib/levanter/scripts/bench/bench_ragged_dot_triton.py. The forward was re-swept on
+    # MI355X with JAX 0.12: 256x256/8 warps/2 stages now beats 128x256/4 warps/1 stage by 4-13% at the June shapes.
     _GpuFamily.AMD_INSTINCT: {
         RaggedLayout.FWD: TritonBlockConfig(
-            block_m=128, block_n=256, block_k=64, num_warps=4, num_stages=1, num_xcds=1, group_m=8
+            block_m=256, block_n=256, block_k=64, num_warps=8, num_stages=2, num_xcds=1, group_m=8
         ),
         RaggedLayout.DLHS: TritonBlockConfig(
             block_m=256, block_n=256, block_k=64, num_warps=8, num_stages=2, num_xcds=1, group_m=4
