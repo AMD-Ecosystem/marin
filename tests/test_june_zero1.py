@@ -517,8 +517,9 @@ def test_gather_in_first_microbatch_matches_zero1(layout, optimizer):
 def test_gather_in_first_microbatch_keeps_the_gathered_stack_in_the_carried_compute_copy():
     # The first microbatch's layer scan writes the gathered expert weights into the compute copy it carries, which the
     # state donates, rather than returning them as a separate stacked output that would stay live through the other
-    # microbatches. So the step's arguments are those of ZeRO-1 without it, and its temporaries are too, up to a few
-    # KiB that do not grow with the weights (3.3 KiB here): returning the gathered stack instead adds about the whole
+    # microbatches. So the step's temporaries are those of ZeRO-1 without it, up to a few KiB that do not grow with the
+    # weights (3.3 KiB here); that bound is the real check. The arguments are equal by construction (both build the
+    # same state) and are kept as a regression pin: returning the gathered stack instead adds about the whole
     # stack to the temporaries (577 of 576 KiB on replica4_expert2), and carrying the compute copy in the ZeRO-1 shard
     # takes the gathered stack's bytes less one shard off the arguments. The first microbatch's backward still reads
     # its layers' gathered weights from its own residuals, but it runs without the accumulators the later microbatches

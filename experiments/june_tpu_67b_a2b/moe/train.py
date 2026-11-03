@@ -167,14 +167,18 @@ class GrugTrainerConfig:
     collective pipeliner prefetches the next layer's gather during the current layer's forward, so the gather overlaps
     compute rather than following the update. The scan writes each gathered layer into the compute copy's expert
     weights, which it carries: that full-size copy, donated with the state, is the gathered weights' buffer, which the
-    later microbatches read, so the gathered stack needs no memory of its own after the first microbatch, whose
-    backward keeps its layers' gathered weights as residuals. Each expert weight is gathered once per step, and never
-    in a backward. The first microbatch's expert gradients leave unreduced
-    and are reduced once per step with the others, as without it. The numbers are those of ``zero1`` without it.
+    later microbatches read, so the gathered stack needs no memory of its own after the first microbatch. Within the
+    first microbatch it still has a second copy: the layer scan stacks each layer's gathered weights as residuals for
+    that microbatch's backward, a stack the size of the gathered expert weights that is freed when that backward ends.
+    Each expert weight is gathered once per step, and never in a backward. The first microbatch's expert gradients
+    leave unreduced and are reduced once per step with the others, as without it. The numbers are those of ``zero1``
+    without it.
 
     The state keeps ``zero1``'s layout, but the expert weights of the compute copy a step returns are those the step
     ran with, not the updated ones: only a step with this flag, which overwrites them before reading them, or
-    ``rebuilt_compute_params`` may take that state.
+    ``rebuilt_compute_params`` may take that state. Nothing checks this at run time, since the layout is the same
+    either way: a step without the flag, an eval or an export that reads such a state's compute copy gets expert
+    weights one step old. The same holds for the compute copy a checkpoint saves, which is why a restore rebuilds it.
 
     Needs the stacked layer layout (``GrugModelConfig.use_array_stacked_blocks``). On GPU the prefetch needs the
     all-gather combiner to combine one layer's expert weight gathers into one
@@ -380,7 +384,9 @@ class GrugTrainState:
     opt_state: optax.OptState
     ema_params: Transformer | None
     pending_qb_betas: jax.Array
-    compute_params: Transformer | None = None  # mp.cast_to_compute(params), see carry_compute_params
+    # mp.cast_to_compute(params), see carry_compute_params; not authoritative (stale expert weights) after a step with
+    # gather_in_first_microbatch, see rebuilt_compute_params.
+    compute_params: Transformer | None = None
 
 
 def _apply_qb_betas(model: Transformer, qb_betas: jax.Array) -> Transformer:
@@ -475,8 +481,10 @@ def _resharded_like(tree, like):
 def rebuilt_compute_params(state: GrugTrainState, mp: jmp.Policy) -> GrugTrainState:
     """``state`` with its compute copy recast from its parameters, in the compute copy's own sharding.
 
-    For a restored state, whose compute copy is rebuilt rather than trusted from the checkpoint. With ``zero1`` this
-    all-gathers the expert weights the parameters shard over the replicas.
+    For a restored state, whose compute copy is rebuilt rather than trusted from the checkpoint, and for a state a
+    step with ``gather_in_first_microbatch`` returned, whose compute copy holds the expert weights that step ran with,
+    before any consumer other than such a step reads it. With ``zero1`` this all-gathers the expert weights the
+    parameters shard over the replicas.
     """
     if state.compute_params is None:
         return state
@@ -1284,7 +1292,8 @@ def _run_grug_local(config: GrugRunConfig, *, step_hooks: Sequence[Callable[[cal
                 initialize_from=trainer.initialize_from,
             )
 
-        # Rebuilt from the (possibly restored) parameters, so it never comes from a checkpoint.
+        # Rebuilt from the (possibly restored) parameters, so it never comes from a checkpoint: one saved by a run with
+        # gather_in_first_microbatch holds expert weights one step older than its parameters.
         state = rebuilt_compute_params(state, trainer.mp)
         levanter.tracker.log_summary({"parameter_count": parameter_count(state.params)})
 
