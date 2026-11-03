@@ -451,6 +451,44 @@ def test_overlapping_the_last_microbatch_reduces_the_expert_gradients_per_layer(
     )
 
 
+@pytest.mark.timeout(900)
+def test_overlapping_the_last_microbatch_keeps_no_copy_of_the_expert_weights():
+    # The last microbatch's layer scan routes each layer's expert weights through their reductions inside the layer's
+    # checkpoint, so its backward reads the slices of the weights the scan was given. Routed before the checkpoint, the
+    # checkpoint's inputs would be the reductions' outputs, which the scan stacks for its backward: a second copy of
+    # the expert weights, one more per expert weight in the forward scan's loop state (6 rather than 3 here). With one
+    # data shard, so that marking the weights moves no data; wide experts give the expert weights shapes of their own.
+    _run(
+        r"""
+        policy = jmp.get_policy("p=f32,c=bfloat16")
+        cfg = dataclasses.replace(BASE, intermediate_dim=24)
+        mesh = MESHES["replica4_expert2"]
+        last_forward = 'op_name="jit(train_step)/jvp(Transformer)/while/body/'
+        with jax.set_mesh(mesh):
+            params = june_train.initial_state(
+                cfg, optimizer=optax.adam(1e-2), mp=policy, key=jax.random.key(0), ema_beta=None
+            ).params
+            compute = jax.eval_shape(policy.cast_to_compute, params)
+            per_layer = june_train._per_layer_reduced(params)
+        expert_shapes = collections.Counter(
+            "bf16[" + ",".join(map(str, x.sharding.shard_shape(x.shape))) + "]"
+            for x, is_expert in zip(jax.tree.leaves(compute), jax.tree.leaves(per_layer), strict=True)
+            if is_expert
+        )
+        assert sum(expert_shapes.values()) == 3, expert_shapes
+        for k in (2, 4):
+            hlo = compiled_step_hlo(cfg, mesh, policy, microbatches=k, overlap_last_microbatch=True)
+            computations = dict(re.findall(r"(?m)^%?([\w.\-]+) .*\{$\n((?:[ ].*\n?)*)", hlo))
+            held = [
+                sum(state.count(shape) for shape in expert_shapes)
+                for state, body in re.findall(r"= (\(.*?\)) while\(.*?body=%?([\w.\-]+)", hlo)
+                if last_forward in computations.get(body, "")
+            ]
+            assert held == [3], (k, held)
+        """
+    )
+
+
 def test_overlapping_the_last_microbatch_needs_two_microbatches():
     with pytest.raises(ValueError, match="at least 2 microbatches"):
         june_train._make_train_step(

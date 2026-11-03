@@ -824,6 +824,11 @@ def _apply_gathers(layer: "Block", sinks: "Block") -> tuple["Block", "Block"]:
     return layer, gathered
 
 
+def _block_with_grad_offsets(layer: "Block", offsets: "Block", sinks: "Block | None", *args):
+    """``layer`` applied to ``args`` with its weights routed through ``_apply_grad_offsets``."""
+    return _apply_grad_offsets(layer, offsets, sinks)(*args)
+
+
 class Block(eqx.Module):
     rms_attn: RMSNorm
     attn_gated_norm: GatedNorm
@@ -1049,11 +1054,17 @@ class Transformer(eqx.Module):
                 gathered = None
                 if layer_gather_sinks is not None:
                     layer, gathered = _apply_gathers(layer, layer_gather_sinks)
-                if layer_grad_offsets is not None:
-                    layer = _apply_grad_offsets(layer, layer_grad_offsets, layer_grad_sinks)
-                hidden_out, stats = eqx.filter_checkpoint(layer, policy=remat_policy)(
-                    carry_hidden, short_mask, long_mask, layer_use_long_mask, False, cfg.disable_long_rope, position_ids
-                )
+                layer_args = (carry_hidden, short_mask, long_mask, layer_use_long_mask, False, cfg.disable_long_rope)
+                if layer_grad_offsets is None:
+                    hidden_out, stats = eqx.filter_checkpoint(layer, policy=remat_policy)(*layer_args, position_ids)
+                else:
+                    # The reductions inside the checkpoint: its inputs are then the layer's own slices, which the
+                    # backward reads in place, rather than the marked weights, which the scan would stack as a copy.
+                    # A weight also sharded over ``data`` (FSDP) is gathered again in the backward, like the rest of
+                    # what the checkpoint recomputes.
+                    hidden_out, stats = eqx.filter_checkpoint(_block_with_grad_offsets, policy=remat_policy)(
+                        layer, layer_grad_offsets, layer_grad_sinks, *layer_args, position_ids
+                    )
                 return hidden_out, (stats, gathered)
 
             stacked = self.stacked_blocks.stacked
