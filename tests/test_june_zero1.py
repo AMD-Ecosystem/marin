@@ -9,8 +9,9 @@ parameters back to the model's sharding after the update. On the meshes of the g
 (replica_dcn=4 x expert=2, replica_dcn=2 x data=2 x expert=2), with AdamW and with the production MuonH, the losses and
 parameters match the replicated update; the state is 1/replica_dcn per device; the expert weights cross the replicas
 once per step each way, after the microbatch loop; and a checkpoint saved with ZeRO-1 restores with it off and on.
-With ``gather_in_first_microbatch`` the compute copy stays in the ZeRO-1 shard and each expert weight is all-gathered
-once per step, layer by layer in the first microbatch's forward layer scan, with the same numbers as without it.
+With ``gather_in_first_microbatch`` each expert weight is all-gathered once per step, layer by layer in the first
+microbatch's forward layer scan, into the compute copy the scan carries, with the same numbers as without it and no
+memory for the gathered stack beyond that copy.
 
 On CPU XLA lowers the reduce-scatter to an all-reduce and a slice, so the HLO test counts the elements each
 reduction covers rather than requiring a reduce-scatter.
@@ -59,12 +60,12 @@ EMA_BETA = 0.9
 GATHERS = ("all-gather", "all-gather-start")
 
 
-def zero1_state(mesh, optimizer, *, zero1, cfg=ZERO1_CFG, gather=False):
+def zero1_state(mesh, optimizer, *, zero1, cfg=ZERO1_CFG):
     with jax.set_mesh(mesh):
         return jax.jit(
             lambda key: june_train.initial_state(
                 cfg, optimizer=optimizer, mp=POLICY, key=key, ema_beta=EMA_BETA, carry_compute_params=True,
-                zero1=zero1, gather_in_first_microbatch=gather,
+                zero1=zero1,
             )
         )(jax.random.key(0))
 
@@ -76,7 +77,7 @@ def zero1_step(optimizer, *, zero1, microbatches=4, overlap=False, gather=False)
     )
 
 
-# (zero1, gather_in_first_microbatch) of the three ways to run the step.
+# (zero1, gather_in_first_microbatch) of the three ways to run the step; the last two share the state's layout.
 MODES = {"replicated": (False, False), "zero1": (True, False), "gather_in_first_microbatch": (True, True)}
 
 
@@ -263,7 +264,8 @@ def test_zero1_crosses_the_replicas_once_per_step_after_the_microbatch_loop():
 def test_zero1_checkpoint_restores_with_zero1_off_and_on(saved_with):
     # The checkpoint keeps the tree and the global shapes, so the exemplar's sharding decides what each device reads:
     # a run can turn ZeRO-1 or gather_in_first_microbatch on or off when it resumes. The compute copy rebuilt from the
-    # restored parameters has the exemplar's sharding: the model's, or the ZeRO-1 shard with gather_in_first_microbatch.
+    # restored parameters has the exemplar's sharding, the model's, and the parameters' values, even when the saved
+    # copy held the weights a gather_in_first_microbatch step ran with.
     _run(
         f"""
         mesh = MESHES["replica4_expert2"]
@@ -271,7 +273,7 @@ def test_zero1_checkpoint_restores_with_zero1_off_and_on(saved_with):
         saved_zero1, saved_gather = MODES[{saved_with!r}]
         with jax.set_mesh(mesh):
             state, _, _ = zero1_step(optimizer, zero1=saved_zero1, gather=saved_gather)(
-                zero1_state(mesh, optimizer, zero1=saved_zero1, gather=saved_gather), BATCH
+                zero1_state(mesh, optimizer, zero1=saved_zero1), BATCH
             )
         saved = jax.tree.map(np.asarray, state)
         next_losses = {{}}
@@ -279,7 +281,7 @@ def test_zero1_checkpoint_restores_with_zero1_off_and_on(saved_with):
             with jax.set_mesh(mesh):
                 save_checkpoint(state, step=1, checkpoint_path=tmpdir)
             for mode, (zero1, gather) in MODES.items():
-                exemplar = zero1_state(mesh, optimizer, zero1=zero1, gather=gather)
+                exemplar = zero1_state(mesh, optimizer, zero1=zero1)
                 with jax.set_mesh(mesh):
                     restored = load_checkpoint(exemplar, tmpdir, mesh=mesh)
                     rebuilt = june_train.rebuilt_compute_params(restored, POLICY)
@@ -304,8 +306,7 @@ def test_zero1_checkpoint_restores_with_zero1_off_and_on(saved_with):
 def test_zero1_eval_hooks_gather_each_model_once_per_step():
     # With ZeRO-1 the eval hooks evaluate float32 models in the model's own sharding, one model per hook, so a sharded
     # master never reaches the evaluator (which would gather it in every layer of every eval batch) and only one
-    # gathered model is live at a time. A step evaluated already gathers nothing. The model's sharding is not the
-    # compute copy's, which gather_in_first_microbatch keeps in the ZeRO-1 shard.
+    # gathered model is live at a time. A step evaluated already gathers nothing.
     _run(
         """
         import levanter.eval
@@ -320,7 +321,7 @@ def test_zero1_eval_hooks_gather_each_model_once_per_step():
 
         levanter.eval.eval_model = fake_eval_model
         mesh = MESHES["replica4_expert2"]
-        state = zero1_state(mesh, optax.adam(1e-2), zero1=True, gather=True)
+        state = zero1_state(mesh, optax.adam(1e-2), zero1=True)
         model_specs = specs(zero1_state(mesh, optax.adam(1e-2), zero1=False).compute_params)
         trainer = june_train.GrugTrainerConfig(carry_compute_params=True, zero1=True, gather_in_first_microbatch=True)
         with jax.set_mesh(mesh):
@@ -332,7 +333,7 @@ def test_zero1_eval_hooks_gather_each_model_once_per_step():
             jax.tree_util.keystr(path): s.spec for path, s in jax.tree_util.tree_leaves_with_path(model_shardings)
         }
         assert sharding_specs == model_specs
-        assert specs(state.params) != model_specs and specs(state.compute_params) == specs(state.params)
+        assert specs(state.params) != model_specs
         for current, ema in ((True, True), (True, False), (False, True)):
             hooks = june_train._eval_hooks(
                 None, prefix="eval", eval_current=current, eval_ema=ema, model_shardings=model_shardings
@@ -466,7 +467,9 @@ def test_gather_in_first_microbatch_matches_zero1(layout, optimizer):
     # arithmetic in the same order: three steps match ZeRO-1 without it bit for bit, with and without the overlapped
     # last microbatch, and with K=2, where no microbatch loop runs between the first and the overlapped last
     # microbatch. Also with padding, and with a first microbatch without loss weight, whose gradients start the
-    # accumulators. The compute copy stays in the parameters' ZeRO-1 sharding from step to step.
+    # accumulators. The step gathers into the compute copy it carries, in the model's sharding: afterwards its expert
+    # weights are those the step ran with, the cast of the parameters it started from, bit for bit, and its other
+    # weights the cast of the updated parameters, as without it.
     _run(
         f"""
         cases = [(name, k, overlap, "BATCH") for name in MESHES for k, overlap in ((4, False), (4, True), (2, True))]
@@ -479,18 +482,30 @@ def test_gather_in_first_microbatch_matches_zero1(layout, optimizer):
             msg = f"{{name}} K={{k}} overlap={{overlap}} {{batch_name}}"
             optimizer = OPTIMIZERS[{optimizer!r}]()
             cfg = LAYOUTS[{layout!r}]
-            runs = {{}}
+            runs, specs_by_mode = {{}}, {{}}
             for gather in (False, True):
-                state = zero1_state(mesh, optimizer, zero1=True, cfg=cfg, gather=gather)
+                state = zero1_state(mesh, optimizer, zero1=True, cfg=cfg)
                 train_step = zero1_step(optimizer, zero1=True, microbatches=k, overlap=overlap, gather=gather)
                 losses = []
                 with jax.set_mesh(mesh):
                     for _ in range(3):
+                        started_from = POLICY.cast_to_compute(jax.tree.map(np.asarray, state.params))
                         state, metrics, _ = train_step(state, batch)
                         losses.append(float(metrics["train/loss"]))
+                        updated = POLICY.cast_to_compute(jax.tree.map(np.asarray, state.params))
+                        for (path, copy), before, after in zip(
+                            jax.tree_util.tree_leaves_with_path(state.compute_params),
+                            jax.tree.leaves(started_from),
+                            jax.tree.leaves(updated),
+                            strict=True,
+                        ):
+                            expected = before if gather and is_expert(path) else after
+                            np.testing.assert_array_equal(
+                                np.asarray(copy), np.asarray(expected), err_msg=f"{{msg}} {{jax.tree_util.keystr(path)}}"
+                            )
                 runs[gather] = (losses, jax.tree.map(np.asarray, (state.params, state.ema_params, state.opt_state)))
-                if gather:
-                    assert specs(state.compute_params) == specs(state.params), msg
+                specs_by_mode[gather] = specs(state.compute_params)
+            assert specs_by_mode[True] == specs_by_mode[False], msg
             assert runs[True][0] == runs[False][0], (msg, runs[True][0], runs[False][0])
             for a, b in zip(jax.tree.leaves(runs[True][1]), jax.tree.leaves(runs[False][1]), strict=True):
                 np.testing.assert_array_equal(a, b, err_msg=msg)
@@ -499,23 +514,38 @@ def test_gather_in_first_microbatch_matches_zero1(layout, optimizer):
 
 
 @pytest.mark.timeout(900)
-def test_gather_in_first_microbatch_rejects_a_state_built_without_it():
-    # A step with gather_in_first_microbatch given a compute copy in the model's sharding would gather nothing in the
-    # first microbatch and quietly run as ZeRO-1; a step without it given a sharded compute copy would never gather it.
+def test_gather_in_first_microbatch_keeps_the_gathered_stack_in_the_carried_compute_copy():
+    # The first microbatch's layer scan writes the gathered expert weights into the compute copy it carries, which the
+    # state donates, rather than returning them as a separate stacked output that would stay live through the other
+    # microbatches. So the step's arguments are those of ZeRO-1 without it, and its temporaries are too, up to a few
+    # KiB that do not grow with the weights (3.3 KiB here): returning the gathered stack instead adds about the whole
+    # stack to the temporaries (577 of 576 KiB on replica4_expert2), and carrying the compute copy in the ZeRO-1 shard
+    # takes the gathered stack's bytes less one shard off the arguments. The first microbatch's backward still reads
+    # its layers' gathered weights from its own residuals, but it runs without the accumulators the later microbatches
+    # hold. Wide experts make the expert weights most of the memory.
     _run(
         """
-        mesh = MESHES["replica4_expert2"]
+        cfg = dataclasses.replace(ZERO1_CFG, intermediate_dim=512)
         optimizer = optax.adam(1e-2)
-        for state_gathers in (False, True):
-            state = zero1_state(mesh, optimizer, zero1=True, gather=state_gathers)
-            train_step = zero1_step(optimizer, zero1=True, gather=not state_gathers)
-            with jax.set_mesh(mesh):
-                try:
-                    train_step(state, BATCH)
-                except ValueError as e:
-                    assert "ZeRO-1 shard" in str(e), e
-                else:
-                    raise AssertionError(f"no error for a state built with gather={state_gathers}")
+        for name, mesh in MESHES.items():
+            stack = sum(
+                int(np.prod(x.sharding.shard_shape(x.shape))) * x.dtype.itemsize
+                for path, x in jax.tree_util.tree_leaves_with_path(
+                    zero1_state(mesh, optimizer, zero1=True, cfg=cfg).compute_params
+                )
+                if is_expert(path)
+            )
+            for k, overlap in ((4, False), (4, True), (2, True)):
+                msg = f"{name} K={k} overlap={overlap}"
+                memory = {}
+                for gather in (False, True):
+                    train_step = zero1_step(optimizer, zero1=True, microbatches=k, overlap=overlap, gather=gather)
+                    with jax.set_mesh(mesh):
+                        state, _, _ = train_step(zero1_state(mesh, optimizer, zero1=True, cfg=cfg), BATCH)
+                        memory[gather] = train_step.lower(state, BATCH).compile().memory_analysis()
+                assert memory[True].argument_size_in_bytes == memory[False].argument_size_in_bytes, msg
+                added = memory[True].temp_size_in_bytes - memory[False].temp_size_in_bytes
+                assert added < stack // 16, (msg, added, stack)
         """
     )
 
@@ -554,7 +584,7 @@ def test_gather_in_first_microbatch_gathers_each_expert_weight_once_in_the_first
                 for gather in (False, True):
                     train_step = zero1_step(optimizer, zero1=True, microbatches=k, overlap=overlap, gather=gather)
                     with jax.set_mesh(mesh):
-                        state, _, _ = train_step(zero1_state(mesh, optimizer, zero1=True, gather=gather), BATCH)
+                        state, _, _ = train_step(zero1_state(mesh, optimizer, zero1=True), BATCH)
                         hlos[gather] = train_step.lower(state, BATCH).compile(compiler_options=options).as_text()
                     states[gather] = state
                 # The expert weights' compute shards, which ZeRO-1 gathers after the loops.
