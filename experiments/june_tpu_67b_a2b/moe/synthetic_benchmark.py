@@ -222,8 +222,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gather-in-first-microbatch",
         action="store_true",
-        help="With --zero1, carry the compute copy's expert weights sharded and all-gather them layer by layer in the "
-        "first microbatch's forward instead of at the end of the step.",
+        help="With --zero1, all-gather the expert weights layer by layer in the first microbatch's forward, into the "
+        "compute copy, instead of at the end of the step.",
     )
     parser.add_argument(
         "--watch-interval", type=int, default=10, help="Steps between gradient watch steps (0 disables)."

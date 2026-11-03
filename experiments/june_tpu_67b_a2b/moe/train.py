@@ -161,15 +161,20 @@ class GrugTrainerConfig:
     costs the per-layer all-reduce. Without them the per-layer reductions run synchronously and hide nothing."""
 
     gather_in_first_microbatch: bool = False
-    """With ``zero1``: carry the compute copy of the expert weights in its ZeRO-1 shard, like their parameters, and
-    all-gather it in the next step's first microbatch, one layer at a time inside its forward layer scan, instead of
-    all-gathering the updated weights at the end of the step. XLA's collective pipeliner prefetches the next layer's
-    gather during the current layer's forward, so the gather overlaps compute rather than following the update. The
-    layer scan returns the gathered weights, which the later microbatches and every backward use: each expert weight
-    is gathered once per step, and never in a backward. The first microbatch's expert gradients leave unreduced and are
-    reduced once per step with the others, as without it. The numbers are those of ``zero1`` without it. Between steps
-    each device keeps only its shard of the compute copy; during the step the gathered weights take the place of the
-    full copy ``zero1`` carries.
+    """With ``zero1``: all-gather the expert weights in the next step's first microbatch, one layer at a time inside its
+    forward layer scan, instead of all-gathering the updated weights at the end of the step. Each layer's slice of the
+    float32 ZeRO-1 parameter shard is cast to the compute dtype and gathered just before the layer uses it; XLA's
+    collective pipeliner prefetches the next layer's gather during the current layer's forward, so the gather overlaps
+    compute rather than following the update. The scan writes each gathered layer into the compute copy's expert
+    weights, which it carries: that full-size copy, donated with the state, is the gathered weights' buffer, which the
+    later microbatches read, so the gathered stack needs no memory of its own after the first microbatch, whose
+    backward keeps its layers' gathered weights as residuals. Each expert weight is gathered once per step, and never
+    in a backward. The first microbatch's expert gradients leave unreduced
+    and are reduced once per step with the others, as without it. The numbers are those of ``zero1`` without it.
+
+    The state keeps ``zero1``'s layout, but the expert weights of the compute copy a step returns are those the step
+    ran with, not the updated ones: only a step with this flag, which overwrites them before reading them, or
+    ``rebuilt_compute_params`` may take that state.
 
     Needs the stacked layer layout (``GrugModelConfig.use_array_stacked_blocks``). On GPU the prefetch needs the
     all-gather combiner to combine one layer's expert weight gathers into one
@@ -424,17 +429,11 @@ def initial_state(
     ema_beta: float | None,
     carry_compute_params: bool = False,
     zero1: bool = False,
-    gather_in_first_microbatch: bool = False,
 ) -> GrugTrainState:
     """The step-0 train state; with ``zero1`` the expert weights' parameters, optimizer state and EMA are sharded over
-    the replicas (``GrugTrainerConfig.zero1``) and the compute copy keeps the model's sharding, or, with
-    ``gather_in_first_microbatch``, theirs."""
+    the replicas (``GrugTrainerConfig.zero1``) and the compute copy keeps the model's sharding."""
     if zero1 and not carry_compute_params:
-        raise ValueError("zero1 needs carry_compute_params: the step writes the updated weights to the compute copy")
-    if gather_in_first_microbatch and not zero1:
-        raise ValueError("gather_in_first_microbatch needs zero1: it gathers the compute copy's ZeRO-1 shard")
-    if gather_in_first_microbatch and not model_config.use_array_stacked_blocks:
-        raise ValueError("gather_in_first_microbatch needs the stacked layer layout (use_array_stacked_blocks)")
+        raise ValueError("zero1 needs carry_compute_params: the step writes the gathered weights to the compute copy")
     params = mp.cast_to_param(Transformer.init(model_config, key=key))
     if params.blocks is not None:
         num_moe_layers = sum(1 for b in params.blocks if b.mlp is not None)
@@ -443,8 +442,6 @@ def initial_state(
     compute_params = mp.cast_to_compute(params) if carry_compute_params else None
     if zero1:
         params = _zero1_sharded(params)
-        if gather_in_first_microbatch:
-            compute_params = mp.cast_to_compute(params)
     return GrugTrainState(
         step=jnp.array(0, dtype=jnp.int32),
         params=params,
@@ -493,8 +490,7 @@ def rebuilt_compute_params(state: GrugTrainState, mp: jmp.Policy) -> GrugTrainSt
     """``state`` with its compute copy recast from its parameters, in the compute copy's own sharding.
 
     For a restored state, whose compute copy is rebuilt rather than trusted from the checkpoint. With ``zero1`` this
-    all-gathers the expert weights the parameters shard over the replicas to the model's sharding, unless
-    ``gather_in_first_microbatch`` keeps the compute copy in the ZeRO-1 shard, where it only casts.
+    all-gathers the expert weights the parameters shard over the replicas.
     """
     if state.compute_params is None:
         return state
@@ -585,14 +581,6 @@ def _make_train_step(
         qb_params = _apply_qb_betas(state.params, state.pending_qb_betas)
         if zero1 and state.compute_params is None:
             raise ValueError("zero1 needs carry_compute_params")
-        if zero1 and _carries_zero1_compute_copy(state.compute_params) != gather_in_first_microbatch:
-            # Otherwise the step would run without the flag's effect: no gathers in the first microbatch, or none at all.
-            raise ValueError(
-                "the state's compute copy is "
-                + ("" if gather_in_first_microbatch else "not ")
-                + "expected in the ZeRO-1 shard: build it with initial_state(gather_in_first_microbatch="
-                + f"{gather_in_first_microbatch})"
-            )
         if ema_beta is not None:
             qb_ema_params = _apply_qb_betas(state.ema_params, state.pending_qb_betas)
         else:
@@ -609,7 +597,12 @@ def _make_train_step(
             )
 
         def loss_terms_fn(
-            compute_params, microbatch, block_grad_offsets=None, block_grad_sinks=None, block_gather_sinks=None
+            compute_params,
+            microbatch,
+            block_grad_offsets=None,
+            block_grad_sinks=None,
+            block_gather_sinks=None,
+            block_gather_buffers=None,
         ):
             return compute_params.next_token_loss_terms(
                 microbatch.tokens,
@@ -620,21 +613,23 @@ def _make_train_step(
                 block_grad_offsets=block_grad_offsets,
                 block_grad_sinks=block_grad_sinks,
                 block_gather_sinks=block_gather_sinks,
+                block_gather_buffers=block_gather_buffers,
             )
 
+        gathered_blocks = None
         if microbatches > 1:
             if state.compute_params is None:
                 qb_compute_params = mp.cast_to_compute(qb_params)
             else:
                 qb_compute_params = _apply_qb_betas(state.compute_params, state.pending_qb_betas)
-            loss, summarized_metrics, accumulated_grads = _microbatched_loss_and_grads(
+            loss, summarized_metrics, accumulated_grads, gathered_blocks = _microbatched_loss_and_grads(
                 loss_terms_fn,
                 qb_compute_params,
                 batch,
                 microbatches,
                 overlap_last_microbatch,
                 grad_shardings=qb_params,
-                gather_first_microbatch=gather_in_first_microbatch,
+                gather_sources=qb_params if gather_in_first_microbatch else None,
             )
             grads = mp.cast_to_param(accumulated_grads)
         elif state.compute_params is None:
@@ -698,8 +693,18 @@ def _make_train_step(
             compute_params = mp.cast_to_compute(params)
             if not zero1:
                 return compute_params
-            # Back to the compute copy's sharding: the all-gather of the updated expert weights to the model's
-            # sharding, or nothing with gather_in_first_microbatch, whose compute copy stays in the ZeRO-1 shard.
+            if gathered_blocks is not None:
+                # The buffers the first microbatch gathered into: the next step casts and gathers the updated expert
+                # weights from their ZeRO-1 shard into them again, so none are gathered here.
+                stacked = jax.tree.map(
+                    lambda c, g: c if g is None else g,
+                    compute_params.stacked_blocks.stacked,
+                    gathered_blocks,
+                    is_leaf=lambda x: x is None,
+                )
+                compute_params = eqx.tree_at(lambda t: t.stacked_blocks.stacked, compute_params, stacked)
+            # Back to the compute copy's sharding: the all-gather of the updated expert weights to the model's sharding,
+            # unless their buffers took their place above.
             return _resharded_like(compute_params, state.compute_params)
 
         next_state = dataclasses.replace(
@@ -767,9 +772,10 @@ def _microbatched_loss_and_grads(
     overlap_last_microbatch: bool = False,
     *,
     grad_shardings: Transformer,
-    gather_first_microbatch: bool = False,
-) -> tuple[jax.Array, dict, Transformer]:
-    """Loss, summarized metrics and gradients of the whole ``batch``, one microbatch at a time.
+    gather_sources: Transformer | None = None,
+) -> tuple[jax.Array, dict, Transformer, Block | None]:
+    """Loss, summarized metrics and gradients of the whole ``batch``, one microbatch at a time, and the buffers the
+    first microbatch gathered into (None without ``gather_sources``).
 
     ``loss_terms_fn(params, microbatch)`` returns the microbatch's ``LossTerms``: its summed (``reduction="sum"``)
     cross-entropy, its weighted router aux loss and its raw per-layer router metrics. The loss each microbatch
@@ -797,11 +803,14 @@ def _microbatched_loss_and_grads(
     (ZeRO-1) is reduce-scattered there, per layer: its gradient leaves the layer scan through a zero "sink" input with
     that sharding (``block_grad_sinks``), since the weight's own gradient must keep the weight's sharding.
 
-    With ``gather_first_microbatch`` the stacked expert weights of ``params`` are ZeRO-1 shards
-    (``_gathered_in_first_microbatch``), and the first microbatch runs before the loop. Its layer scan all-gathers each
-    layer's slice of them through a zero sink of the gathered, ``reduced``-marked type (``block_gather_sinks``) and
-    returns the gathered stack, which replaces the shards in ``params`` for the other microbatches. The sinks'
-    gradients, unreduced like the loop's, start the accumulators; the shards' own are zero.
+    ``gather_sources``, a tree like ``params`` (the float32 parameters), holds the weights to gather: the stacked expert
+    weights it keeps in their ZeRO-1 shard (``_gathered_in_first_microbatch``). The first microbatch then runs before
+    the loop, with those shards in place of the weights. Its layer scan casts each layer's slice of them to the dtype of
+    ``params`` and all-gathers it through a zero sink of the gathered, ``reduced``-marked type (``block_gather_sinks``),
+    and writes the gathered slice into the full-size weight of ``params``, which it carries (``block_gather_buffers``):
+    the other microbatches read the gathered weights from there, with no separate gathered stack, and the caller gets
+    the filled buffers back. The sinks' gradients, unreduced like the loop's, start the accumulators; the shards' own
+    are zero.
     """
     batch_size = batch.tokens.shape[0]
     batch_shards = _batch_shards(get_abstract_mesh())
@@ -851,31 +860,39 @@ def _microbatched_loss_and_grads(
     if overlap_last_microbatch:
         head = jax.tree.map(lambda x: x[:looped], head)
     first_router_metrics = None
-    if gather_first_microbatch:
-        gathered = _gathered_in_first_microbatch(params)
+    gathered_blocks = None
+    if gather_sources is not None:
+        if gather_sources.stacked_blocks is None:
+            raise ValueError("gather_sources needs the stacked layer layout (use_array_stacked_blocks)")
+        gathered = _gathered_in_first_microbatch(gather_sources).stacked_blocks.stacked
         if not any(jax.tree.leaves(gathered)):
-            raise ValueError("gather_first_microbatch needs the expert weights in their ZeRO-1 shard; none are")
+            raise ValueError("gather_sources needs the expert weights in their ZeRO-1 shard; none are")
         first_microbatch, first_share = jax.tree.map(lambda x: x[0], head)
         head = jax.tree.map(lambda x: x[1:], head)
+        buffers = jax.tree.map(lambda p, g: p if g else None, params.stacked_blocks.stacked, gathered)
         # The shards stay unmarked: their slices are marked as they are gathered.
-        first_params = jax.tree.map(lambda p, m, g: p if g else m, params, marked_params, gathered)
+        first_stacked = jax.tree.map(
+            lambda m, s, g: s if g else m,
+            marked_params.stacked_blocks.stacked,
+            gather_sources.stacked_blocks.stacked,
+            gathered,
+        )
+        first_params = eqx.tree_at(lambda t: t.stacked_blocks.stacked, marked_params, first_stacked)
         gather_sinks = jax.tree.map(
-            # The shard gathered and marked as _mark_batch_reduced marks the model's expert weights.
-            lambda p, g: (
-                jnp.zeros(p.shape, p.dtype, out_sharding=_batch_reduced_spec(jax.typeof(p).sharding.spec)) if g else None
-            ),
-            params.stacked_blocks.stacked,
-            gathered.stacked_blocks.stacked,
+            # The buffer marked as _mark_batch_reduced marks the model's expert weights.
+            lambda b: jnp.zeros(b.shape, b.dtype, out_sharding=_batch_reduced_spec(jax.typeof(b).sharding.spec)),
+            buffers,
         )
 
         def first_loss_and_terms(p, sinks, microbatch, token_share):
-            terms = loss_terms_fn(p, microbatch, block_gather_sinks=sinks)
+            # The buffers are written, not differentiated: the gathered weights' gradients leave through the sinks.
+            terms = loss_terms_fn(p, microbatch, block_gather_sinks=sinks, block_gather_buffers=buffers)
             cross_entropy_loss = terms.cross_entropy_loss / loss_denominator
             aux_loss = token_share * terms.aux_loss
             metrics = (cross_entropy_loss, aux_loss, terms.router_metrics, terms.gathered_blocks)
             return cross_entropy_loss + aux_loss, metrics
 
-        (first_loss, (first_ce, first_aux, first_router_metrics, gathered_stack)), (first_grads, sink_grads) = (
+        (first_loss, (first_ce, first_aux, first_router_metrics, gathered_blocks)), (first_grads, sink_grads) = (
             jax.value_and_grad(first_loss_and_terms, argnums=(0, 1), has_aux=True)(
                 first_params, gather_sinks, first_microbatch, first_share
             )
@@ -887,11 +904,10 @@ def _microbatched_loss_and_grads(
             is_leaf=lambda x: x is None,
         )
         first_grads = eqx.tree_at(lambda t: t.stacked_blocks.stacked, first_grads, stacked_grads)
-        # Unmarked, the model's own sharding: dropping ``reduced`` moves no data.
         stacked = jax.tree.map(
-            lambda p, g: p if g is None else reshard(g, P(*jax.typeof(g).sharding.spec.partitions)),
+            lambda p, b: p if b is None else b,
             params.stacked_blocks.stacked,
-            gathered_stack,
+            gathered_blocks,
             is_leaf=lambda x: x is None,
         )
         params = eqx.tree_at(lambda t: t.stacked_blocks.stacked, params, stacked)
@@ -911,7 +927,7 @@ def _microbatched_loss_and_grads(
     if not overlap_last_microbatch:
         router_metrics = _combine_microbatch_router_metrics(stacked_router_metrics, token_shares)
         grads = jax.tree.map(_finalize_accumulated_grad, grad_sum, params, grad_shardings)
-        return loss, summarize_loss_metrics(router_metrics, cross_entropy_loss, aux_loss), grads
+        return loss, summarize_loss_metrics(router_metrics, cross_entropy_loss, aux_loss), grads, gathered_blocks
 
     # The last microbatch, outside the loop: its expert weights stay unmarked, and each layer's gradient plus the
     # earlier microbatches' sum is reduced inside the backward of the layer scan, as soon as that layer is done.
@@ -970,7 +986,7 @@ def _microbatched_loss_and_grads(
 
     grads = jax.tree.map(finalize, grad_sum, last_grads, params, grad_shardings, per_layer)
     loss, cross_entropy_loss, aux_loss = loss + last_loss, cross_entropy_loss + last_ce, aux_loss + last_aux
-    return loss, summarize_loss_metrics(router_metrics, cross_entropy_loss, aux_loss), grads
+    return loss, summarize_loss_metrics(router_metrics, cross_entropy_loss, aux_loss), grads, gathered_blocks
 
 
 def _is_zero1_shard(x) -> bool:
@@ -980,14 +996,9 @@ def _is_zero1_shard(x) -> bool:
     return any(isinstance(e, tuple) and _EXPERT_AXIS in e and _REPLICA_AXIS in e for e in jax.typeof(x).sharding.spec)
 
 
-def _carries_zero1_compute_copy(compute_params: Transformer) -> bool:
-    """Whether the compute copy keeps expert weights in their ZeRO-1 shard, as ``gather_in_first_microbatch`` does."""
-    return any(_is_zero1_shard(x) for x in jax.tree.leaves(compute_params))
-
-
 def _gathered_in_first_microbatch(params: Transformer) -> Transformer:
     """True for the stacked block weights whose dimension sharded over ``expert`` is also over ``replica_dcn``: the
-    ZeRO-1 shards of the expert weights (``_zero1_spec``), which ``gather_in_first_microbatch`` carries sharded."""
+    ZeRO-1 shards of the expert weights (``_zero1_spec``), which ``gather_in_first_microbatch`` gathers."""
     flags = jax.tree.map(lambda _: False, params)
     return eqx.tree_at(
         lambda t: t.stacked_blocks.stacked, flags, jax.tree.map(_is_zero1_shard, params.stacked_blocks.stacked)
@@ -1104,15 +1115,15 @@ def _check_step_numerics(metrics: dict, step: int, diagnose_numerics: bool) -> N
 
 def _model_shardings(model_config: GrugModelConfig, key: PRNGKeyArray) -> Transformer:
     """The shardings ``Transformer.init`` gives the model's weights, before any ZeRO-1 sharding: those the eval hooks
-    gather a ZeRO-1 model to. Not the compute copy's, which ``gather_in_first_microbatch`` keeps sharded."""
+    gather a ZeRO-1 model to."""
     return jax.tree.map(lambda x: x.sharding, jax.eval_shape(lambda k: Transformer.init(model_config, key=k), key))
 
 
 def _eval_model_shardings(
     trainer: GrugTrainerConfig, model_config: GrugModelConfig, key: PRNGKeyArray
 ) -> Transformer | None:
-    """The shardings the eval hooks gather the models to: with ``zero1`` the model's own (``_model_shardings``), never
-    the compute copy's, which ``gather_in_first_microbatch`` keeps sharded; without it none, as nothing is sharded."""
+    """The shardings the eval hooks gather the models to: with ``zero1`` the model's own (``_model_shardings``); without
+    it none, as nothing is sharded."""
     return _model_shardings(model_config, key) if trainer.zero1 else None
 
 
@@ -1253,7 +1264,6 @@ def _run_grug_local(config: GrugRunConfig, *, step_hooks: Sequence[Callable[[cal
                 ema_beta=config.trainer.ema_beta,
                 carry_compute_params=config.trainer.carry_compute_params,
                 zero1=config.trainer.zero1,
-                gather_in_first_microbatch=config.trainer.gather_in_first_microbatch,
             )
 
         state = _init_state(model_key)
