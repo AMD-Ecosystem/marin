@@ -11,8 +11,8 @@ unequal valid tokens, and with a microbatch that carries no loss weight at all. 
 mean of those of the microbatches. Every weight's gradient is reduced across the replicas once per step, after the
 microbatch loop. With ``overlap_last_microbatch`` the step gives the same loss, metrics and gradients, bit for bit, and
 the expert weights' gradients are reduced instead one layer at a time in the last microbatch's backward layer scan.
-Checkpointing the blocks without ``prevent_cse`` drops the optimization barriers around the saved residuals and gives
-the same step.
+Checkpointing the blocks without ``prevent_cse`` (the default) drops the optimization barriers around the saved
+residuals and gives the same step as with it.
 
 Each case runs in a subprocess so XLA can configure the CPU device count before JAX initializes.
 """
@@ -527,8 +527,9 @@ def test_checkpointing_without_prevent_cse_gives_the_same_step(remat_mode):
                     )
                     barriers[prevent_cse] = train_step.lower(state, BATCH).as_text().count("optimization_barrier")
             assert barriers[False] < barriers[True], (msg, barriers)
-            kept, kept_metrics = step(cfg, mesh, policy, microbatches=2)
-            dropped, metrics = step(dataclasses.replace(cfg, remat_prevent_cse=False), mesh, policy, microbatches=2)
+            assert not cfg.remat_prevent_cse, msg
+            kept, kept_metrics = step(dataclasses.replace(cfg, remat_prevent_cse=True), mesh, policy, microbatches=2)
+            dropped, metrics = step(cfg, mesh, policy, microbatches=2)
             assert metrics.keys() == kept_metrics.keys(), msg
             for key in ("train/loss", "train/cross_entropy_loss", "train/router/aux_loss_weighted"):
                 np.testing.assert_allclose(metrics[key], kept_metrics[key], rtol=1e-6, err_msg=f"{{msg}} {{key}}")
