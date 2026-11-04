@@ -140,13 +140,13 @@ class GrugModelConfig:
     backward skips re-running expert dispatch and its EP collectives; "save_moe_attn" also keeps the
     attention residuals the attention backend names (jax-aiter's ``gpu_aiter_flash``), so backward
     does not re-run the attention forward either."""
-    remat_prevent_cse: bool = False
-    """``prevent_cse`` of the per-block gradient checkpoints. False (the default here) checkpoints the blocks
-    without optimization barriers around the saved residuals, so XLA fuses the backward's slices of them; inside the
-    stacked-blocks ``lax.scan`` the scan already keeps the backward from reusing forward values (JAX's guidance for
-    ``jax.checkpoint`` under ``scan``). With unstacked blocks XLA may then CSE the recomputation with the forward,
-    keeping its activations alive. True (JAX's default) wraps the saved residuals in optimization barriers, which XLA
-    removes only after fusion, so the backward's slices of them stay unfused copies."""
+    remat_prevent_cse: bool | None = None
+    """``prevent_cse`` of the per-block gradient checkpoints. True (JAX's default) wraps the saved residuals in
+    optimization barriers, which XLA removes only after fusion, so the backward's slices of them stay unfused copies.
+    False drops the barriers, so XLA fuses those slices; inside the stacked-blocks ``lax.scan`` the scan already keeps
+    the backward from reusing forward values (JAX's guidance for ``jax.checkpoint`` under ``scan``), but with unstacked
+    blocks XLA may CSE the recomputation with the forward, keeping its activations alive. None (the default) picks
+    False for the stacked blocks and True for the unstacked ones."""
     replicate_attn_weights: bool = False
     """If True, store w_q/w_k/w_v/w_o fully replicated (P(None, None)) instead
     of FSDP-sharded across the data axis. Attention weights are small (~128 KB
@@ -1042,7 +1042,8 @@ class Transformer(eqx.Module):
             )
         else:
             remat_policy = None
-        checkpoint = functools.partial(eqx.filter_checkpoint, policy=remat_policy, prevent_cse=cfg.remat_prevent_cse)
+        prevent_cse = self.blocks is not None if cfg.remat_prevent_cse is None else cfg.remat_prevent_cse
+        checkpoint = functools.partial(eqx.filter_checkpoint, policy=remat_policy, prevent_cse=prevent_cse)
 
         gathered_blocks = None
         if self.blocks is not None:

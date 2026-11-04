@@ -177,9 +177,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--remat-prevent-cse",
         action="store_true",
+        default=None,
         help="Checkpoint the blocks with prevent_cse=True (JAX's default): optimization barriers around the saved "
-        "residuals, which keep the backward's slices of them unfused. Without it the blocks are checkpointed with "
-        "prevent_cse=False (GrugModelConfig.remat_prevent_cse).",
+        "residuals, which keep the backward's slices of them unfused. Without it the stacked blocks are checkpointed "
+        "with prevent_cse=False and the unstacked ones with True (GrugModelConfig.remat_prevent_cse).",
     )
     parser.add_argument(
         "--scan-unroll", type=int, default=1, help="Layers per iteration of the layer scan (lax.scan unroll)."

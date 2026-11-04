@@ -11,7 +11,7 @@ unequal valid tokens, and with a microbatch that carries no loss weight at all. 
 mean of those of the microbatches. Every weight's gradient is reduced across the replicas once per step, after the
 microbatch loop. With ``overlap_last_microbatch`` the step gives the same loss, metrics and gradients, bit for bit, and
 the expert weights' gradients are reduced instead one layer at a time in the last microbatch's backward layer scan.
-Checkpointing the blocks without ``prevent_cse`` (the default) drops the optimization barriers around the saved
+Checkpointing the stacked blocks without ``prevent_cse`` (the default) drops the optimization barriers around the saved
 residuals and gives the same step as with it.
 
 Each case runs in a subprocess so XLA can configure the CPU device count before JAX initializes.
@@ -515,7 +515,7 @@ def test_checkpointing_without_prevent_cse_gives_the_same_step(remat_mode):
         for name, mesh in MESHES.items():
             msg = f"{{name}} K=2"
             barriers = {{}}
-            for prevent_cse in (True, False):
+            for prevent_cse in (True, False, None):
                 optimizer = optax.adam(1e-2)
                 with jax.set_mesh(mesh):
                     state = june_train.initial_state(
@@ -526,8 +526,28 @@ def test_checkpointing_without_prevent_cse_gives_the_same_step(remat_mode):
                         optimizer, policy, z_loss_weight=0.0, ema_beta=None, microbatches=2
                     )
                     barriers[prevent_cse] = train_step.lower(state, BATCH).as_text().count("optimization_barrier")
-            assert barriers[False] < barriers[True], (msg, barriers)
-            assert not cfg.remat_prevent_cse, msg
+            # The default (None) drops them in the stacked blocks' layer scan, and keeps them for unstacked blocks,
+            # where nothing else stops XLA from CSE-ing the recomputation with the forward.
+            assert barriers[None] == barriers[False] < barriers[True], (msg, barriers)
+            assert cfg.use_array_stacked_blocks and cfg.remat_prevent_cse is None, msg
+            unstacked = dataclasses.replace(
+                cfg, use_array_stacked_blocks=False, replicated_grad_reduction="per_layer",
+                router_stats_reduction="per_layer",
+            )
+            for prevent_cse in (True, None):
+                optimizer = optax.adam(1e-2)
+                with jax.set_mesh(mesh):
+                    state = june_train.initial_state(
+                        dataclasses.replace(unstacked, remat_prevent_cse=prevent_cse), optimizer=optimizer, mp=policy,
+                        key=jax.random.key(0), ema_beta=None,
+                    )
+                    train_step = june_train._make_train_step(
+                        optimizer, policy, z_loss_weight=0.0, ema_beta=None, microbatches=2
+                    )
+                    barriers["unstacked", prevent_cse] = train_step.lower(state, BATCH).as_text().count(
+                        "optimization_barrier"
+                    )
+            assert barriers["unstacked", None] == barriers["unstacked", True], (msg, barriers)
             kept, kept_metrics = step(dataclasses.replace(cfg, remat_prevent_cse=True), mesh, policy, microbatches=2)
             dropped, metrics = step(cfg, mesh, policy, microbatches=2)
             assert metrics.keys() == kept_metrics.keys(), msg
