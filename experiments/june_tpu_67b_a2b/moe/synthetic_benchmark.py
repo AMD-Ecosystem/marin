@@ -175,10 +175,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compilation-cache-dir", help="Persistent JAX compilation cache directory.")
     parser.add_argument("--remat-mode", choices=get_args(RematMode), default="recompute_all")
     parser.add_argument(
-        "--remat-allow-cse",
+        "--remat-prevent-cse",
         action="store_true",
-        help="Checkpoint the blocks with prevent_cse=False: no optimization barriers around the saved residuals, so "
-        "XLA can fuse the backward's slices of them (GrugModelConfig.remat_prevent_cse).",
+        help="Checkpoint the blocks with prevent_cse=True (JAX's default): optimization barriers around the saved "
+        "residuals, which keep the backward's slices of them unfused. Without it the blocks are checkpointed with "
+        "prevent_cse=False (GrugModelConfig.remat_prevent_cse).",
     )
     parser.add_argument(
         "--scan-unroll", type=int, default=1, help="Layers per iteration of the layer scan (lax.scan unroll)."
@@ -306,7 +307,7 @@ def main() -> None:
         attention_implementation=args.attention,
         moe_implementation=args.moe_impl,
         remat_mode=args.remat_mode,
-        remat_prevent_cse=not args.remat_allow_cse,
+        remat_prevent_cse=args.remat_prevent_cse,
         pooled_transport_capacity_factor=args.pooled_transport_capacity_factor,
         num_expert_waves=args.num_expert_waves,
         moe_token_blocks=args.moe_token_blocks,
