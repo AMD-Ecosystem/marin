@@ -9,7 +9,9 @@ kernels (reference or ``xla_flash`` attention, XLA ``ragged_dot``), so the two c
 hardware that has no CUDA or TPU kernels. Every step sees fresh uniform-random tokens with no repeats, so the
 loss cannot fall below ln(vocab_size) and a lower value means something leaks the targets. No checkpoint is
 written. Like the Snowball harness, it logs the model FLOPs per example up front and ends with the median step
-time from step 2 on, tokens/s, model TFLOP/s and MFU, then each device's peak memory.
+time from step 2 on, tokens/s, model TFLOP/s and MFU, then each device's peak memory. It also logs each step's wall
+period (``throughput/wall_step_s``: the time between consecutive steps' hooks, which includes the host work between
+steps that ``throughput/duration`` leaves out) and their median from step 2 on.
 
 Example, 8 GPUs, full 67B shape, expert parallelism over all 8, profile of steps 10-12::
 
@@ -32,6 +34,7 @@ from typing import get_args
 
 import jax
 import jmp
+import levanter.tracker
 import numpy as np
 from fray.cluster import ResourceConfig
 from levanter.callbacks import StepInfo
@@ -245,6 +248,12 @@ def parse_args() -> argparse.Namespace:
         "--watch-interval", type=int, default=10, help="Steps between gradient watch steps (0 disables)."
     )
     parser.add_argument(
+        "--pipelined-step-logging",
+        action="store_true",
+        help="Dispatch step N+1 before fetching, checking and logging step N "
+        "(GrugTrainerConfig.pipelined_step_logging).",
+    )
+    parser.add_argument(
         "--step-timeout",
         type=float,
         default=300.0,
@@ -401,6 +410,7 @@ def main() -> None:
             zero1=args.zero1,
             overlap_last_microbatch=args.overlap_last_microbatch,
             gather_in_first_microbatch=args.gather_in_first_microbatch,
+            pipelined_step_logging=args.pipelined_step_logging,
         ),
         eval=None,
     )
@@ -411,7 +421,7 @@ def main() -> None:
         "window=%d mp=%s expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d "
         "token_blocks=%d remat=%s remat_prevent_cse=%s rms_norm_impl=%s "
         "replicated_grads=%s router_stats=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
-        "zero1=%s gather_in_first_microbatch=%s watch_interval=%d flops_per_example=%.4e",
+        "zero1=%s gather_in_first_microbatch=%s watch_interval=%d pipelined_step_logging=%s flops_per_example=%.4e",
         args.size,
         model.num_layers,
         model.hidden_dim,
@@ -444,19 +454,37 @@ def main() -> None:
         args.zero1,
         args.gather_in_first_microbatch,
         args.watch_interval,
+        args.pipelined_step_logging,
         flops_per_example,
     )
     log_model_flops(flops_per_example, flops_summary)
     step_durations: list[float] = []
+    wall_steps: list[float] = []
+    last_hook_time: float | None = None
 
     def record_step(info: StepInfo, force: bool = False) -> None:
+        nonlocal last_hook_time
         # The loop re-runs every hook with force=True after the last step; that call would duplicate the sample.
-        if not force and info.step >= FIRST_TIMED_STEP:
+        if force:
+            return
+        now = time.perf_counter()
+        if last_hook_time is not None:
+            # One loop period: what the devices see, host work between steps included.
+            wall_step = now - last_hook_time
+            levanter.tracker.log({"throughput/wall_step_s": wall_step}, step=info.step)
+            if info.step >= FIRST_TIMED_STEP:
+                wall_steps.append(wall_step)
+        last_hook_time = now
+        if info.step >= FIRST_TIMED_STEP:
             step_durations.append(info.step_duration)
 
     _run_grug_local(config, step_hooks=[record_step])
     if step_durations:
         log_throughput_summary(step_durations, batch_size, model.max_seq_len, flops_per_example, args.steps)
+    if wall_steps:
+        logger.info(
+            "median wall step over steps %d-%d: %.3f s", FIRST_TIMED_STEP, args.steps - 1, statistics.median(wall_steps)
+        )
     report_memory()
 
 
