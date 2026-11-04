@@ -162,9 +162,16 @@ def test_pipelined_loop_matches_the_synchronous_loop():
         r"""
         sync = train(pipelined=False)
         pipelined = train(pipelined=True)
+        # Without a checkpointer no step is fetched before the next dispatch except those whose hooks read the state.
+        unchecked = train(pipelined=True, checkpoint=False)
 
-        for a, b in zip(pipelined["final"], sync["final"], strict=True):
-            np.testing.assert_array_equal(a, b)
+        for run in (pipelined, unchecked):
+            for a, b in zip(run["final"], sync["final"], strict=True):
+                np.testing.assert_array_equal(a, b)
+            assert run["logged"] == sync["logged"]
+            assert run["hooks"] == sync["hooks"]
+            assert run["state_hooks"] == sync["state_hooks"]
+            assert run["dispatched"] == NUM_STEPS
         assert sorted(pipelined["logged"]) == sorted(sync["logged"]) == list(range(NUM_STEPS))
         assert pipelined["logged"] == sync["logged"]
         # The learning rate from the optimizer state, the router metrics, and the watch stats of steps 0 and 3.
