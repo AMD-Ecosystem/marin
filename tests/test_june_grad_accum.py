@@ -12,7 +12,8 @@ mean of those of the microbatches. Every weight's gradient is reduced across the
 microbatch loop. With ``overlap_last_microbatch`` the step gives the same loss, metrics and gradients, bit for bit, and
 the expert weights' gradients are reduced instead one layer at a time in the last microbatch's backward layer scan.
 Checkpointing the blocks without ``prevent_cse`` (the default) drops the optimization barriers around the saved
-residuals and gives the same step as with it.
+residuals and gives the same step as with it. The custom-VJP RMS norm (``rms_norm_impl="custom_vjp"``) gives the same
+step as the optimization-barrier one, up to float32 rounding, and bfloat16 rounding with bfloat16 compute.
 
 Each case runs in a subprocess so XLA can configure the CPU device count before JAX initializes.
 """
@@ -539,5 +540,61 @@ def test_checkpointing_without_prevent_cse_gives_the_same_step(remat_mode):
                 err_msg=msg,
             )
             assert max(grad_errors(dropped, kept)) <= 1e-5, msg
+        """
+    )
+
+
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize("remat_mode", ["recompute_all", "save_moe_attn"])
+def test_custom_vjp_rms_norm_gives_the_same_step(remat_mode):
+    # rms_norm_impl="custom_vjp" drops the optimization barriers on the RMS norms' variance and differentiates the
+    # norms with a custom VJP. In float32 the losses and routing match exactly here and the gradients to float32
+    # rounding (the backward's rsqrt^3 and its own reductions; measured relative L2 up to 3e-7). With bfloat16 compute
+    # the gradients differ by bfloat16 rounding (up to 8e-3, in the norm weights, whose gradient sums many terms), so
+    # require every gradient leaf to be no further from its float32 counterpart than the barrier path's, with a margin
+    # and a floor of one bfloat16 rounding (2**-8), as in test_microbatches_match_the_whole_batch_with_bfloat16_compute.
+    _run(
+        f"""
+        cfg = dataclasses.replace(BASE, remat_mode="{remat_mode}")
+        custom = dataclasses.replace(cfg, rms_norm_impl="custom_vjp")
+        f32, bf16 = jmp.get_policy("f32"), jmp.get_policy("p=f32,c=bfloat16")
+        for name, mesh in MESHES.items():
+            optimizer = optax.adam(1e-2)
+            barriers = {{}}
+            for impl_cfg in (cfg, custom):
+                with jax.set_mesh(mesh):
+                    state = june_train.initial_state(
+                        impl_cfg, optimizer=optimizer, mp=f32, key=jax.random.key(0), ema_beta=None
+                    )
+                    train_step = june_train._make_train_step(
+                        optimizer, f32, z_loss_weight=0.0, ema_beta=None, microbatches=2
+                    )
+                    barriers[impl_cfg.rms_norm_impl] = train_step.lower(state, BATCH).as_text().count(
+                        "optimization_barrier"
+                    )
+            assert barriers["custom_vjp"] < barriers["barrier"], (name, barriers)
+            for k in (1, 2):
+                msg = f"{{name}} K={{k}}"
+                kept, kept_metrics = step(cfg, mesh, f32, microbatches=k)
+                new, metrics = step(custom, mesh, f32, microbatches=k)
+                assert metrics.keys() == kept_metrics.keys(), msg
+                for key in ("train/loss", "train/cross_entropy_loss", "train/router/aux_loss_weighted"):
+                    np.testing.assert_allclose(metrics[key], kept_metrics[key], rtol=1e-6, err_msg=f"{{msg}} {{key}}")
+                np.testing.assert_array_equal(
+                    metrics["train/router/routing_counts_per_layer"],
+                    kept_metrics["train/router/routing_counts_per_layer"],
+                    err_msg=msg,
+                )
+                assert max(grad_errors(new, kept)) <= 1e-5, msg
+
+                kept_bf16, kept_bf16_metrics = step(cfg, mesh, bf16, microbatches=k)
+                new_bf16, bf16_metrics = step(custom, mesh, bf16, microbatches=k)
+                for key in ("train/loss", "train/cross_entropy_loss"):
+                    np.testing.assert_allclose(
+                        bf16_metrics[key], kept_bf16_metrics[key], rtol=1e-5, err_msg=f"{{msg}} bf16 {{key}}"
+                    )
+                bounds = 1.5 * np.asarray(grad_errors(kept_bf16, kept)) + 2**-8
+                errors = np.asarray(grad_errors(new_bf16, kept))
+                assert np.all(errors <= bounds), (msg, errors, bounds)
         """
     )

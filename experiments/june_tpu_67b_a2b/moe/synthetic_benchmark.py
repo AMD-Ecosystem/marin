@@ -51,7 +51,7 @@ from levanter.utils.jax_utils import multihost_broadcast_sync
 from rigging.log_setup import configure_logging
 
 from experiments.june_tpu_67b_a2b.moe.heuristic_muonh import MoeMuonHHeuristic
-from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig, QbBalance, RematMode, ScanReduction
+from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig, QbBalance, RematMode, RmsNormImpl, ScanReduction
 from experiments.june_tpu_67b_a2b.moe.train import (
     ATTENTION_FLOPS_PER_EXAMPLE_KEY,
     CAUSAL_ATTENTION_FLOPS_PER_EXAMPLE_KEY,
@@ -182,6 +182,14 @@ def parse_args() -> argparse.Namespace:
         "prevent_cse=False (GrugModelConfig.remat_prevent_cse).",
     )
     parser.add_argument(
+        "--rms-norm-impl",
+        choices=get_args(RmsNormImpl),
+        default="barrier",
+        help="How the RMS norms pin their float32 statistics: an optimization barrier on the variance (barrier), or a "
+        "custom VJP that saves the inverse RMS for the backward, letting XLA fuse the reduction with its users "
+        "(custom_vjp) (GrugModelConfig.rms_norm_impl).",
+    )
+    parser.add_argument(
         "--scan-unroll", type=int, default=1, help="Layers per iteration of the layer scan (lax.scan unroll)."
     )
     parser.add_argument(
@@ -308,6 +316,7 @@ def main() -> None:
         moe_implementation=args.moe_impl,
         remat_mode=args.remat_mode,
         remat_prevent_cse=args.remat_prevent_cse,
+        rms_norm_impl=args.rms_norm_impl,
         pooled_transport_capacity_factor=args.pooled_transport_capacity_factor,
         num_expert_waves=args.num_expert_waves,
         moe_token_blocks=args.moe_token_blocks,
@@ -399,7 +408,7 @@ def main() -> None:
         "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d microbatches=%d "
         "overlap_last_microbatch=%s seq_len=%d "
         "window=%d mp=%s expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d "
-        "token_blocks=%d remat=%s remat_prevent_cse=%s "
+        "token_blocks=%d remat=%s remat_prevent_cse=%s rms_norm_impl=%s "
         "replicated_grads=%s router_stats=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
         "zero1=%s gather_in_first_microbatch=%s watch_interval=%d flops_per_example=%.4e",
         args.size,
@@ -425,6 +434,7 @@ def main() -> None:
         model.moe_token_blocks,
         args.remat_mode,
         model.remat_prevent_cse,
+        model.rms_norm_impl,
         args.replicated_grads,
         args.router_stats,
         args.qb_balance,
