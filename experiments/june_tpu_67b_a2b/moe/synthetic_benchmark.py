@@ -54,7 +54,14 @@ from levanter.utils.jax_utils import multihost_broadcast_sync
 from rigging.log_setup import configure_logging
 
 from experiments.june_tpu_67b_a2b.moe.heuristic_muonh import MoeMuonHHeuristic
-from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig, QbBalance, RematMode, RmsNormImpl, ScanReduction
+from experiments.june_tpu_67b_a2b.moe.model import (
+    GrugModelConfig,
+    QbBalance,
+    QkvProjection,
+    RematMode,
+    RmsNormImpl,
+    ScanReduction,
+)
 from experiments.june_tpu_67b_a2b.moe.train import (
     ATTENTION_FLOPS_PER_EXAMPLE_KEY,
     CAUSAL_ATTENTION_FLOPS_PER_EXAMPLE_KEY,
@@ -194,6 +201,14 @@ def parse_args() -> argparse.Namespace:
         "(custom_vjp) (GrugModelConfig.rms_norm_impl).",
     )
     parser.add_argument(
+        "--qkv-projection",
+        choices=get_args(QkvProjection),
+        default="separate",
+        help="Project the attention input onto q, k and v with one einsum per weight (separate), or with one einsum "
+        "over the three weights concatenated in the forward (fused), plus the head gate (fused_with_gate) "
+        "(GrugModelConfig.qkv_projection).",
+    )
+    parser.add_argument(
         "--scan-unroll", type=int, default=1, help="Layers per iteration of the layer scan (lax.scan unroll)."
     )
     parser.add_argument(
@@ -327,6 +342,7 @@ def main() -> None:
         remat_mode=args.remat_mode,
         remat_prevent_cse=args.remat_prevent_cse,
         rms_norm_impl=args.rms_norm_impl,
+        qkv_projection=args.qkv_projection,
         pooled_transport_capacity_factor=args.pooled_transport_capacity_factor,
         num_expert_waves=args.num_expert_waves,
         moe_token_blocks=args.moe_token_blocks,
@@ -419,7 +435,7 @@ def main() -> None:
         "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d microbatches=%d "
         "overlap_last_microbatch=%s seq_len=%d "
         "window=%d mp=%s expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d "
-        "token_blocks=%d remat=%s remat_prevent_cse=%s rms_norm_impl=%s "
+        "token_blocks=%d remat=%s remat_prevent_cse=%s rms_norm_impl=%s qkv_projection=%s "
         "replicated_grads=%s router_stats=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
         "zero1=%s gather_in_first_microbatch=%s watch_interval=%d pipelined_step_logging=%s flops_per_example=%.4e",
         args.size,
@@ -446,6 +462,7 @@ def main() -> None:
         args.remat_mode,
         model.remat_prevent_cse,
         model.rms_norm_impl,
+        model.qkv_projection,
         args.replicated_grads,
         args.router_stats,
         args.qb_balance,

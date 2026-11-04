@@ -9,9 +9,10 @@ No load-balancing loss; router z-loss only. All layers are MoE (no dense layers)
 
 import dataclasses
 import functools
+import itertools
 import math
 from dataclasses import dataclass
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, get_args
 
 import equinox as eqx
 import jax
@@ -65,6 +66,7 @@ ATTENTION_REMAT_SAVE_NAME = "context"
 ScanReduction = Literal["per_layer", "after_scan"]
 QbBalance = Literal["global", "per_node"]
 RmsNormImpl = Literal["barrier", "custom_vjp"]
+QkvProjection = Literal["separate", "fused", "fused_with_gate"]
 
 
 def _batch_spec() -> P:
@@ -158,6 +160,16 @@ class GrugModelConfig:
     gradients differ at float32 rounding level, and a scoring forward, which does not output the saved statistic, may
     be fused differently from the differentiated one (one bfloat16 ulp in a few elements): keep "barrier" where
     scores must match the trained forward exactly."""
+    qkv_projection: QkvProjection = "separate"
+    """How the attention projects its input onto q, k and v. "separate" runs one einsum per weight. "fused"
+    concatenates ``w_q``, ``w_k`` and ``w_v`` in the forward and runs one einsum, then slices q, k and v out of its
+    output: the backward then computes the input gradient as one GEMM over the three weights and the three weight
+    gradients as one GEMM into one buffer, where XLA would otherwise run three input-gradient GEMMs and sum them.
+    "fused_with_gate" also appends the head gate ``attn_gate`` to that weight. The parameters stay separate (MuonH
+    orthogonalizes each one on its own); only the forward concatenates them, which costs one copy of the weights per
+    layer. Forward values match "separate" up to the GEMM's accumulation order. Under
+    ``replicated_grad_reduction="after_scan"`` the fused weights are marked ``reduced`` together or not at all
+    (``replicated_grad_max_bytes`` applies to their sum), since one GEMM computes their gradients."""
     replicate_attn_weights: bool = False
     """If True, store w_q/w_k/w_v/w_o fully replicated (P(None, None)) instead
     of FSDP-sharded across the data axis. Attention weights are small (~128 KB
@@ -227,6 +239,8 @@ class GrugModelConfig:
                 raise ValueError(f'{name}="after_scan" needs use_array_stacked_blocks=True')
         if self.qb_balance == "per_node" and self.router_stats_reduction != "after_scan":
             raise ValueError('qb_balance="per_node" needs router_stats_reduction="after_scan"')
+        if self.qkv_projection not in get_args(QkvProjection):
+            raise ValueError(f"qkv_projection must be one of {get_args(QkvProjection)}, got {self.qkv_projection!r}")
 
     @property
     def inferred_head_dim(self) -> int:
@@ -343,6 +357,23 @@ class CausalSelfAttention(eqx.Module):
             cfg=cfg,
         )
 
+    def _project(self, x: Float[Array, "B S D"]) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """``x`` projected onto q, k, v (flat head dims) and the head-gate logits (``cfg.qkv_projection``)."""
+        projection = self.cfg.qkv_projection
+        if projection == "separate":
+            return (
+                jnp.einsum("bsh,hd->bsd", x, self.w_q),
+                jnp.einsum("bsh,hd->bsd", x, self.w_k),
+                jnp.einsum("bsh,hd->bsd", x, self.w_v),
+                jnp.einsum("bsd,dn->bsn", x, self.attn_gate),
+            )
+        names = fused_projection_weights(self.cfg)
+        fused = jnp.einsum("bsh,hd->bsd", x, _concatenate_weights([getattr(self, n) for n in names]))
+        bounds = list(itertools.accumulate(getattr(self, n).shape[1] for n in names))
+        q, k, v, *gate = jnp.split(fused, bounds[:-1], axis=-1)
+        gate_logits = gate[0] if gate else jnp.einsum("bsd,dn->bsn", x, self.attn_gate)
+        return q, k, v, gate_logits
+
     @named_call
     def __call__(
         self,
@@ -363,15 +394,10 @@ class CausalSelfAttention(eqx.Module):
         # that sharding on a split -> pass out_sharding explicitly (model on the head axis,
         # head_dim replicated). At model_axis==1 this is byte-identical to the old einops rearrange.
         _qkv_head_spec = P(_BATCH_AXES, None, "model", None)
-        q = jnp.einsum("bsh,hd->bsd", x, self.w_q).reshape(
-            (x.shape[0], seq_len, -1, head_dim), out_sharding=_qkv_head_spec
-        )
-        k = jnp.einsum("bsh,hd->bsd", x, self.w_k).reshape(
-            (x.shape[0], seq_len, -1, head_dim), out_sharding=_qkv_head_spec
-        )
-        v = jnp.einsum("bsh,hd->bsd", x, self.w_v).reshape(
-            (x.shape[0], seq_len, -1, head_dim), out_sharding=_qkv_head_spec
-        )
+        q, k, v, gate_logits = self._project(x)
+        q = q.reshape((x.shape[0], seq_len, -1, head_dim), out_sharding=_qkv_head_spec)
+        k = k.reshape((x.shape[0], seq_len, -1, head_dim), out_sharding=_qkv_head_spec)
+        v = v.reshape((x.shape[0], seq_len, -1, head_dim), out_sharding=_qkv_head_spec)
 
         # Shift the second half of K's head_dim back by one position so the
         # query at position i sees K[i] on head_dim[:half] but K[i-1] on
@@ -421,7 +447,7 @@ class CausalSelfAttention(eqx.Module):
         v_norm_sq = jnp.sum(aligned_v * aligned_v, axis=-1, keepdims=True)
         attn_out = attn_out - (dot / (v_norm_sq + 1e-6)) * aligned_v
         # Headwise gating: sigmoid(x @ attn_gate) produces one scalar per head.
-        gate = 2 * jax.nn.sigmoid(jnp.einsum("bsd,dn->bsn", x, self.attn_gate))[..., None]
+        gate = 2 * jax.nn.sigmoid(gate_logits)[..., None]
         attn_out = gate * attn_out
         # Merge (heads, head_dim) back to a flat head dim. The head axis is sharded over ``model``
         # (tensor parallel), so pin the merged dim's sharding explicitly rather than relying on
@@ -430,6 +456,26 @@ class CausalSelfAttention(eqx.Module):
             (attn_out.shape[0], attn_out.shape[1], -1), out_sharding=P(_BATCH_AXES, None, "model")
         )
         return jnp.einsum("bsh,hd->bsd", attn_out, self.w_o, out_sharding=batch_spec)
+
+
+def fused_projection_weights(cfg: GrugModelConfig) -> tuple[str, ...]:
+    """The ``CausalSelfAttention`` weights its forward concatenates into one projection (``qkv_projection``)."""
+    if cfg.qkv_projection == "separate":
+        return ()
+    return ("w_q", "w_k", "w_v", "attn_gate") if cfg.qkv_projection == "fused_with_gate" else ("w_q", "w_k", "w_v")
+
+
+def _concatenate_weights(weights: list[jax.Array]) -> jax.Array:
+    """``[D, N_i]`` weights concatenated along N, replicated (keeping the ``reduced`` axes they share).
+
+    Unsharding first keeps the concatenation local: each weight is all-gathered over the axes it is sharded over
+    (``data`` for FSDP, ``model`` for tensor parallelism), and the fused output dim is left unsharded; the caller's
+    reshape to heads reshards q, k and v back onto ``model``."""
+    reduced = {jax.typeof(w).sharding.spec.reduced for w in weights}
+    if len(reduced) != 1:
+        raise ValueError(f"fused projection weights must be reduced over the same mesh axes, got {reduced}")
+    spec = P(None, None, reduced=reduced.pop())
+    return jnp.concatenate([reshard(w, spec) for w in weights], axis=1)
 
 
 class RMSNorm(eqx.Module):
@@ -715,7 +761,18 @@ def _mark_reduced(blocks: "Block", max_bytes: int) -> "Block":
         spec = after_scan_reduced_spec(path, x, max_bytes)
         return x if spec is None else reshard(x, spec)
 
-    return jax.tree_util.tree_map_with_path(mark, blocks)
+    marked = jax.tree_util.tree_map_with_path(mark, blocks)
+    names = fused_projection_weights(blocks.attn.cfg)
+    if not names:
+        return marked
+    # The fused projection's weights get their gradients from one GEMM and are concatenated in the forward, so they
+    # must be marked alike: all of them when each could be and they fit max_bytes together, else none.
+    weights = [getattr(blocks.attn, n) for n in names]
+    together = sum(w.size * w.dtype.itemsize // w.shape[0] for w in weights) <= max_bytes and all(
+        after_scan_reduced_spec((), w, max_bytes) is not None for w in weights
+    )
+    chosen = [getattr(marked.attn, n) for n in names] if together else weights
+    return eqx.tree_at(lambda b: [getattr(b.attn, n) for n in names], marked, chosen)
 
 
 def after_scan_reduced_spec(path, x, max_bytes: int) -> P | None:

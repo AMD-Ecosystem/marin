@@ -14,6 +14,8 @@ the expert weights' gradients are reduced instead one layer at a time in the las
 Checkpointing the stacked blocks without ``prevent_cse`` (the default) drops the optimization barriers around the
 saved residuals and gives the same step as with it. The custom-VJP RMS norm (``rms_norm_impl="custom_vjp"``) gives
 the same step as the optimization-barrier one, up to float32 rounding, and bfloat16 rounding with bfloat16 compute.
+So do the fused q/k/v projections (``qkv_projection="fused"`` and ``"fused_with_gate"``), with their weights marked
+``reduced`` together or not at all.
 
 Each case runs in a subprocess so XLA can configure the CPU device count before JAX initializes.
 """
@@ -616,5 +618,49 @@ def test_custom_vjp_rms_norm_gives_the_same_step(remat_mode):
                 bounds = 1.5 * np.asarray(grad_errors(kept_bf16, kept)) + 2**-8
                 errors = np.asarray(grad_errors(new_bf16, kept))
                 assert np.all(errors <= bounds), (msg, errors, bounds)
+        """
+    )
+
+
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize("projection", ["fused", "fused_with_gate"])
+def test_fused_qkv_projection_gives_the_same_step(projection):
+    # One einsum over the concatenated w_q|w_k|w_v(|attn_gate): the same dot products in another GEMM shape. K=1 marks
+    # the fused weights reduced after the layer scan when they fit replicated_grad_max_bytes together, and leaves them
+    # all per layer below that (2 KiB: w_k, w_v and attn_gate alone would fit, w_q would not); K=2 marks every weight
+    # reduced in the microbatch loop. In float32 the gradients match to float32 rounding; with bfloat16 compute each
+    # gradient is as close to the float32 one as the separate projection's, up to one bfloat16 rounding.
+    _run(
+        f"""
+        f32, bf16 = jmp.get_policy("f32"), jmp.get_policy("p=f32,c=bfloat16")
+        for max_bytes in (BASE.replicated_grad_max_bytes, 2 << 10):
+            cfg = dataclasses.replace(BASE, replicated_grad_max_bytes=max_bytes)
+            fused = dataclasses.replace(cfg, qkv_projection="{projection}")
+            for name, mesh in MESHES.items():
+                for k in (1, 2):
+                    msg = f"{{name}} K={{k}} max_bytes={{max_bytes}}"
+                    kept, kept_metrics = step(cfg, mesh, f32, microbatches=k)
+                    new, metrics = step(fused, mesh, f32, microbatches=k)
+                    assert metrics.keys() == kept_metrics.keys(), msg
+                    for key in ("train/loss", "train/cross_entropy_loss", "train/router/aux_loss_weighted"):
+                        np.testing.assert_allclose(
+                            metrics[key], kept_metrics[key], rtol=1e-6, err_msg=f"{{msg}} {{key}}"
+                        )
+                    np.testing.assert_array_equal(
+                        metrics["train/router/routing_counts_per_layer"],
+                        kept_metrics["train/router/routing_counts_per_layer"],
+                        err_msg=msg,
+                    )
+                    assert max(grad_errors(new, kept)) <= 1e-5, msg
+
+                    kept_bf16, kept_bf16_metrics = step(cfg, mesh, bf16, microbatches=k)
+                    new_bf16, bf16_metrics = step(fused, mesh, bf16, microbatches=k)
+                    for key in ("train/loss", "train/cross_entropy_loss"):
+                        np.testing.assert_allclose(
+                            bf16_metrics[key], kept_bf16_metrics[key], rtol=1e-5, err_msg=f"{{msg}} bf16 {{key}}"
+                        )
+                    bounds = 1.5 * np.asarray(grad_errors(kept_bf16, kept)) + 2**-8
+                    errors = np.asarray(grad_errors(new_bf16, kept))
+                    assert np.all(errors <= bounds), (msg, errors, bounds)
         """
     )
