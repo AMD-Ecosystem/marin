@@ -46,7 +46,8 @@ from levanter.grug.grug_moe import (
     validate_moe_implementation,
 )
 from levanter.grug.loss import fused_linear_softmax_cross_entropy_loss
-from levanter.grug.sharding import Pembed_vocab, Plm_head, _mesh_axis_size, unshard
+from levanter.grug.sharding import Pembed_vocab, Plm_head, _mesh_axis_size, keep_reduced, unshard
+from levanter.kernels.pallas.add_rms_norm import AddRmsNormImpl, add_rms_norm_bwd, add_rms_norm_fwd
 from levanter.kernels.pallas.fused_cross_entropy_loss import BlockSizes
 from levanter.layers.stacked import ArrayStacked
 from levanter.tracker.histogram import Histogram, SummaryStats
@@ -69,6 +70,7 @@ ATTENTION_REMAT_SAVE_NAME = "context"
 ScanReduction = Literal["per_layer", "after_scan"]
 QbBalance = Literal["global", "per_node"]
 RmsNormImpl = Literal["barrier", "custom_vjp", "custom_vjp_recompute"]
+FusedNormImpl = Literal["off", "xla", "pallas"]
 
 
 def _batch_spec() -> P:
@@ -184,6 +186,17 @@ class GrugModelConfig:
     scores must match the trained forward exactly. "custom_vjp_recompute" is "custom_vjp" with a forward that saves
     only ``x`` and a backward that recomputes the inverse RMS (``rms_normalize_recompute``), so under remat the
     recomputed forward's reduction feeds only the normalization and can fuse with it."""
+    fused_norm_impl: FusedNormImpl = "off"
+    """How each ``RMSNorm`` followed by its ``GatedNorm`` runs (the two per block, and the embedding and final norms),
+    together with the residual add before the block's MLP norm. "off": the separate modules (``rms_norm_impl``
+    applies) and a plain add. "xla" and "pallas": ``fused_norm_and_gate``, one ``jax.custom_vjp`` per norm whose
+    forward returns the residual sum ``h`` and the gated output and whose backward hands the GatedNorm's two
+    cotangent terms and the residual's cotangent to a single RMS-norm backward, written in JAX ops ("xla") or as
+    Pallas-Triton kernels, one per direction ("pallas", ``levanter.kernels.pallas.add_rms_norm``). Both compute the
+    norm in float32 from the unrounded residual sum and round its outputs once, so they differ from "off" at
+    bfloat16 rounding level (measured at [8, 4096, 2560] against a float32 run: the same error in ``h``, ``dx`` and
+    the norm weight's gradient as "off", within 1.4x of it in the GatedNorm output and weight gradients). Ignores
+    ``rms_norm_impl``; the q/k norms keep it."""
     replicate_attn_weights: bool = False
     """If True, store w_q/w_k/w_v/w_o fully replicated (P(None, None)) instead
     of FSDP-sharded across the data axis. Attention weights are small (~128 KB
@@ -574,12 +587,119 @@ class GatedNorm(eqx.Module):
 
     @named_call
     def __call__(self, x: Float[Array, "... D"]) -> Float[Array, "... D"]:
-        gate_hidden = jnp.einsum("...d,dr->...r", x, self.w_down)
-        # TODO: silu activation here isn't explored, just cargo-culted from Qwen. Likely low-hanging ablation fruit
-        # (e.g. compare no activation, relu, etc.).
-        gate_hidden = jax.nn.silu(gate_hidden)
-        gate = jax.nn.sigmoid(jnp.einsum("...r,rd->...d", gate_hidden, self.w_up))
-        return x * gate.astype(x.dtype)
+        return x * _gated_norm_gate(x, self.w_down, self.w_up).astype(x.dtype)
+
+
+def _gated_norm_gate(x: jax.Array, w_down: jax.Array, w_up: jax.Array) -> jax.Array:
+    """``GatedNorm``'s gate ``sigmoid(silu(x w_down) w_up)``."""
+    # TODO: silu activation here isn't explored, just cargo-culted from Qwen. Likely low-hanging ablation fruit
+    # (e.g. compare no activation, relu, etc.).
+    gate_hidden = jax.nn.silu(jnp.einsum("...d,dr->...r", x, w_down))
+    return jax.nn.sigmoid(jnp.einsum("...r,rd->...d", gate_hidden, w_up))
+
+
+def _per_device(fn, *args, out_specs):
+    """``fn`` on each device's rows: ``args`` are activations [B, S, D] (batch-sharded; None passes through) or
+    replicated vectors and matrices; ``fn`` sees activations as rows [b * s, D] and returns rows (or [n, D] partial
+    sums, ``out_specs`` "partials", one per device in the result's leading dimension)."""
+    mesh = get_abstract_mesh()
+    first = next(a for a in args if a is not None and a.ndim == 3)
+    act_spec = jax.typeof(first).sharding.spec
+    s = first.shape[1]
+    if len(act_spec) > 2 and act_spec[2] is not None:
+        raise ValueError(f"the fused norm needs an unsharded hidden dimension, got {act_spec}")
+
+    def local(*xs):
+        rows = [x.reshape(-1, x.shape[-1]) if x is not None and x.ndim == 3 else x for x in xs]
+        outs = fn(*rows)
+        return tuple(
+            o.reshape(-1, s, o.shape[-1]) if spec == "rows" else o[None] for o, spec in zip(outs, out_specs, strict=True)
+        )
+
+    if mesh.empty:
+        outs = local(*args)
+        return tuple(o if spec == "rows" else o[0] for o, spec in zip(outs, out_specs, strict=True))
+    batch = act_spec[0] if len(act_spec) else None
+    in_specs = tuple(
+        None if a is None else act_spec if a.ndim == 3 else keep_reduced(P(*(None,) * a.ndim), a) for a in args
+    )
+    specs = tuple(act_spec if spec == "rows" else P(batch, None) for spec in out_specs)
+    return jax.shard_map(local, in_specs=in_specs, out_specs=specs, check_vma=False)(*args)
+
+
+def _weight_gradient(partials: jax.Array, weight: jax.Array) -> jax.Array:
+    """The weight gradient from per-device partial sums [n, D]: ``unreduced`` over the batch axes for a weight marked
+    ``reduced`` (its reduction waits for the caller), otherwise summed here."""
+    partials = partials.astype(jnp.float32)
+    if partials.ndim == 1:  # no mesh
+        return partials.astype(weight.dtype)
+    if jax.typeof(weight).sharding.spec.reduced:
+        return _local_to_unreduced(partials.astype(weight.dtype))
+    return reshard(jnp.sum(partials, axis=0).astype(weight.dtype), jax.typeof(weight).sharding.spec)
+
+
+def _norm_and_gate_fwd(x, residual, weight, w_down, w_up, eps, impl, return_h):
+    def kernel(x, residual, weight):
+        h, n, inv_rms = add_rms_norm_fwd(x, residual, weight, eps=eps, impl=impl)
+        return (n, inv_rms[:, None]) if residual is None else (h, n, inv_rms[:, None])
+
+    if residual is None:
+        h = x
+        n, inv_rms = _per_device(kernel, x, None, weight, out_specs=("rows", "rows"))
+    else:
+        h, n, inv_rms = _per_device(kernel, x, residual, weight, out_specs=("rows", "rows", "rows"))
+    gate, gate_vjp = jax.vjp(_gated_norm_gate, n, w_down, w_up)
+    out = n * gate.astype(n.dtype)
+    return (h, out) if return_h else out, (h, inv_rms, weight, n, gate, gate_vjp)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7))
+def _norm_and_gate(x, residual, weight, w_down, w_up, eps: float, impl: AddRmsNormImpl, return_h: bool):
+    """``fused_norm_and_gate``'s custom VJP."""
+    return _norm_and_gate_fwd(x, residual, weight, w_down, w_up, eps, impl, return_h)[0]
+
+
+def _norm_and_gate_bwd(eps, impl, return_h, residuals, cotangents):
+    del eps
+    h, inv_rms, weight, n, gate, gate_vjp = residuals
+    d_h, d_out = cotangents if return_h else (None, cotangents)
+    # out = n * gate: the gate's cotangent goes back through GatedNorm's matmuls (its d_n term), n's own term is
+    # d_out * gate; the RMS-norm backward adds both, and the residual's cotangent, in one pass.
+    d_n_from_gate, d_w_down, d_w_up = gate_vjp((d_out * n).astype(gate.dtype))
+
+    def kernel(h, inv_rms, weight, d_out, gate, d_n_from_gate, d_h):
+        return add_rms_norm_bwd(h, inv_rms[:, 0], weight, d_out, gate=gate, d_n_extra=d_n_from_gate, d_h=d_h, impl=impl)
+
+    dx, dw = _per_device(
+        kernel, h, inv_rms, weight, d_out, gate.astype(n.dtype), d_n_from_gate, d_h, out_specs=("rows", "partials")
+    )
+    # h = x + residual: both get h's cotangent (``None`` stands for the absent residual's).
+    return dx, dx, _weight_gradient(dw, weight), d_w_down, d_w_up
+
+
+_norm_and_gate.defvjp(_norm_and_gate_fwd, _norm_and_gate_bwd)
+
+
+def fused_norm_and_gate(
+    x: Float[Array, "B S D"],
+    residual: Float[Array, "B S D"] | None,
+    norm: RMSNorm,
+    gated: GatedNorm,
+    impl: AddRmsNormImpl,
+    *,
+    return_h: bool,
+):
+    """``out = gated(norm(h))`` with ``h = x + residual`` (``h = x`` without a residual); ``(h, out)`` if
+    ``return_h``, else ``out``.
+
+    One ``jax.custom_vjp`` over the add, the RMS norm and the GatedNorm (``GrugModelConfig.fused_norm_impl``). Its
+    backward adds ``h``'s own cotangent (from the caller's later uses of ``h``) inside the norm's backward kernel, so
+    callers that use ``x`` again should use the returned ``h`` instead. The norm's two kernels run per device under a
+    ``shard_map`` over the activations' batch sharding; the GatedNorm's matmuls stay global, as in ``GatedNorm``. A
+    norm weight marked ``reduced`` gets an ``unreduced`` gradient, as without the fusion."""
+    reduced = bool(jax.typeof(norm.weight).sharding.spec.reduced)
+    weight = norm.weight if reduced else unshard(norm.weight)
+    return _norm_and_gate(x, residual, weight, gated.w_down, gated.w_up, norm.eps, impl, return_h)
 
 
 class DenseMLP(eqx.Module):
@@ -1032,7 +1152,12 @@ class Block(eqx.Module):
         disable_long_rope: bool = False,
         position_ids: jax.Array | None = None,
     ) -> tuple[Float[Array, "B S D"], dict[str, jax.Array]]:
-        attn_in = self.attn_gated_norm(self.rms_attn(x))
+        fused = self.attn.cfg.fused_norm_impl
+        if fused == "off":
+            attn_in = self.attn_gated_norm(self.rms_attn(x))
+        else:
+            # x comes back as h, so its cotangent from the residual path joins the norm's backward kernel.
+            x, attn_in = fused_norm_and_gate(x, None, self.rms_attn, self.attn_gated_norm, fused, return_h=True)
         # lax.cond so the body has a uniform shape across scan iterations:
         # long layers use the full causal mask (and may PKO / drop RoPE); short
         # layers use the sliding-window mask, never PKO, and always RoPE.
@@ -1051,8 +1176,11 @@ class Block(eqx.Module):
             ),
             operand=None,
         )
-        x = x + attn_out
-        mlp_in = self.mlp_gated_norm(self.rms_mlp(x))
+        if fused == "off":
+            x = x + attn_out
+            mlp_in = self.mlp_gated_norm(self.rms_mlp(x))
+        else:
+            x, mlp_in = fused_norm_and_gate(x, attn_out, self.rms_mlp, self.mlp_gated_norm, fused, return_h=True)
         token_valid = token_validity_from_attention_mask(
             short_mask,
             batch_size=x.shape[0],
@@ -1173,8 +1301,7 @@ class Transformer(eqx.Module):
         hidden = self.token_embed.at[token_ids].get(out_sharding=batch_spec)
         # Keep gather fusion from changing normalization rounding between scoring and AD.
         hidden = jax.lax.optimization_barrier(hidden)
-        hidden = self.embed_norm(hidden)
-        hidden = self.embed_gated_norm(hidden)
+        hidden = self._norm_and_gate(hidden, self.embed_norm, self.embed_gated_norm)
 
         # Short layers: sliding window. Long layers (every 4th + last): full causal.
         segment_ids = mask.segment_ids if isinstance(mask, AttentionMask) else None
@@ -1261,8 +1388,13 @@ class Transformer(eqx.Module):
                 for name in _ROUTER_METRICS
                 if name in stacked_router_stats
             }
-        hidden = self.final_gated_norm(self.final_norm(hidden))
+        hidden = self._norm_and_gate(hidden, self.final_norm, self.final_gated_norm)
         return hidden, router_metrics, gathered_blocks
+
+    def _norm_and_gate(self, x: jax.Array, norm: RMSNorm, gated: GatedNorm) -> jax.Array:
+        if self.config.fused_norm_impl == "off":
+            return gated(norm(x))
+        return fused_norm_and_gate(x, None, norm, gated, self.config.fused_norm_impl, return_h=False)
 
     @named_call
     def logits(

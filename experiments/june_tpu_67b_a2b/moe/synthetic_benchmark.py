@@ -57,7 +57,14 @@ from levanter.utils.jax_utils import multihost_broadcast_sync
 from rigging.log_setup import configure_logging
 
 from experiments.june_tpu_67b_a2b.moe.heuristic_muonh import MoeMuonHHeuristic
-from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig, QbBalance, RematMode, RmsNormImpl, ScanReduction
+from experiments.june_tpu_67b_a2b.moe.model import (
+    FusedNormImpl,
+    GrugModelConfig,
+    QbBalance,
+    RematMode,
+    RmsNormImpl,
+    ScanReduction,
+)
 from experiments.june_tpu_67b_a2b.moe.train import (
     ATTENTION_FLOPS_PER_EXAMPLE_KEY,
     CAUSAL_ATTENTION_FLOPS_PER_EXAMPLE_KEY,
@@ -210,6 +217,14 @@ def parse_args() -> argparse.Namespace:
         "custom VJP that saves the inverse RMS for the backward, letting XLA fuse the reduction with its users "
         "(custom_vjp), or a custom VJP whose backward recomputes the inverse RMS from x (custom_vjp_recompute) "
         "(GrugModelConfig.rms_norm_impl).",
+    )
+    parser.add_argument(
+        "--fused-norm-impl",
+        choices=get_args(FusedNormImpl),
+        default="off",
+        help="Run each RMS norm with its GatedNorm (and the residual add before the MLP norm) as one custom VJP whose "
+        "backward does the whole RMS-norm backward in one pass, in JAX ops (xla) or Pallas-Triton kernels (pallas); "
+        "off keeps the separate modules (GrugModelConfig.fused_norm_impl).",
     )
     parser.add_argument(
         "--scan-unroll", type=int, default=1, help="Layers per iteration of the layer scan (lax.scan unroll)."
@@ -371,6 +386,7 @@ def main() -> None:
         remat_mode=args.remat_mode,
         remat_prevent_cse=args.remat_prevent_cse,
         rms_norm_impl=args.rms_norm_impl,
+        fused_norm_impl=args.fused_norm_impl,
         pooled_transport_capacity_factor=args.pooled_transport_capacity_factor,
         num_expert_waves=args.num_expert_waves,
         moe_token_blocks=args.moe_token_blocks,
@@ -469,7 +485,7 @@ def main() -> None:
         "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d microbatches=%d "
         "overlap_last_microbatch=%s seq_len=%d "
         "window=%d mp=%s expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d "
-        "token_blocks=%d gather_sum=%s ce_v_block=%s remat=%s remat_prevent_cse=%s rms_norm_impl=%s "
+        "token_blocks=%d gather_sum=%s ce_v_block=%s remat=%s remat_prevent_cse=%s rms_norm_impl=%s fused_norm_impl=%s "
         "replicated_grads=%s router_stats=%s capacity_drops=%s qb_threshold=%s router_diagnostics=%s "
         "skip_zero_router_z_loss=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
         "zero1=%s gather_in_first_microbatch=%s watch_interval=%d pipelined_step_logging=%s flops_per_example=%.4e",
@@ -499,6 +515,7 @@ def main() -> None:
         args.remat_mode,
         model.remat_prevent_cse,
         model.rms_norm_impl,
+        model.fused_norm_impl,
         args.replicated_grads,
         args.router_stats,
         model.capacity_drop_reduction,
