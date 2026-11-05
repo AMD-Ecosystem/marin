@@ -45,6 +45,7 @@ from levanter.grug.grug_moe import (
 )
 from levanter.grug.loss import fused_linear_softmax_cross_entropy_loss
 from levanter.grug.sharding import Pembed_vocab, Plm_head, _mesh_axis_size, unshard
+from levanter.kernels.pallas.fused_cross_entropy_loss import BlockSizes
 from levanter.tracker.histogram import Histogram, SummaryStats
 from levanter.utils.activation import ActivationFunctionEnum
 
@@ -135,6 +136,11 @@ class GrugModelConfig:
     backend default (GPU: full-logits ``xla`` path). Set ``"batched_xla"`` to use the blocked-vocab
     (cut) CE that avoids materializing the [tokens, vocab] logits tile -- large HBM saving at long
     context. None is byte-identical to the prior behaviour."""
+    ce_v_block_size: int | None = None
+    """Vocabulary block of the fused cross-entropy, passed as explicit ``BlockSizes(v_block_size=...)`` with the
+    default batch and hidden blocks (1024, 512). None lets the backend choose (``batched_xla`` autotunes its forward at
+    startup; on MI355X it picks 1024). Explicit block sizes skip that autotune. On MI355X ``batched_xla``'s backward
+    keeps its tuned 8192 block either way, so this sets only the forward there; elsewhere it sets both."""
     remat_mode: RematMode = "recompute_all"
     """Per-block gradient checkpointing. "recompute_all" reruns the whole block in
     backward (lowest memory); "save_moe" keeps the tagged MoE dispatch tensors so
@@ -220,6 +226,8 @@ class GrugModelConfig:
         if self.shared_expert_intermediate_dim < 0:
             raise ValueError("shared_expert_intermediate_dim must be non-negative")
         validate_moe_implementation(self.moe_implementation)
+        if self.ce_v_block_size is not None and self.ce_v_block_size <= 0:
+            raise ValueError("ce_v_block_size must be positive")
         stacked_only = {
             "replicated_grad_reduction": self.replicated_grad_reduction,
             "router_stats_reduction": self.router_stats_reduction,
@@ -1282,6 +1290,9 @@ class Transformer(eqx.Module):
             logsumexp_weight=logsumexp_weight,
             dtype=loss_dtype,
             implementation=self.config.ce_implementation,
+            block_sizes=(
+                None if self.config.ce_v_block_size is None else BlockSizes(v_block_size=self.config.ce_v_block_size)
+            ),
         )
         # No load-balancing loss; router z-loss only.
         num_moe_layers = router_metrics["router_z_loss_per_layer"].shape[0]

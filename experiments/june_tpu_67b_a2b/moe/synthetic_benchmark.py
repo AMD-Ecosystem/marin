@@ -171,6 +171,13 @@ def parse_args() -> argparse.Namespace:
         help="ring_dedup only: split each shard's tokens into this many blocks, each with its own all-to-alls, "
         "so one block's exchange can overlap another's expert matmuls.",
     )
+    parser.add_argument(
+        "--ce-v-block-size",
+        type=int,
+        help="Vocabulary block of the fused cross-entropy (explicit block sizes, which skip batched_xla's forward "
+        "autotune; on MI355X its backward keeps its 8192 block). Default: the backend's choice "
+        "(GrugModelConfig.ce_v_block_size).",
+    )
     parser.add_argument("--profile-steps", type=int, default=0, help="Profile this many steps (0 disables).")
     parser.add_argument("--profile-start", type=int, default=10, help="First profiled step.")
     parser.add_argument("--log-dir", type=Path, default=Path("logs/june-synthetic"))
@@ -331,6 +338,7 @@ def main() -> None:
         pooled_transport_capacity_factor=args.pooled_transport_capacity_factor,
         num_expert_waves=args.num_expert_waves,
         moe_token_blocks=args.moe_token_blocks,
+        ce_v_block_size=args.ce_v_block_size,
         scan_unroll=args.scan_unroll,
         replicated_grad_reduction=args.replicated_grads,
         replicated_grad_max_bytes=int(args.replicated_grads_max_mib * (1 << 20)),
@@ -420,7 +428,7 @@ def main() -> None:
         "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d microbatches=%d "
         "overlap_last_microbatch=%s seq_len=%d "
         "window=%d mp=%s expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d "
-        "token_blocks=%d remat=%s remat_prevent_cse=%s rms_norm_impl=%s "
+        "token_blocks=%d ce_v_block=%s remat=%s remat_prevent_cse=%s rms_norm_impl=%s "
         "replicated_grads=%s router_stats=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
         "zero1=%s gather_in_first_microbatch=%s watch_interval=%d pipelined_step_logging=%s flops_per_example=%.4e",
         args.size,
@@ -444,6 +452,7 @@ def main() -> None:
         model.pooled_transport_capacity_factor,
         model.num_expert_waves,
         model.moe_token_blocks,
+        model.ce_v_block_size,
         args.remat_mode,
         model.remat_prevent_cse,
         model.rms_norm_impl,
