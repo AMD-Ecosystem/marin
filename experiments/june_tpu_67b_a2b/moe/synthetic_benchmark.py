@@ -191,7 +191,8 @@ def parse_args() -> argparse.Namespace:
         default="barrier",
         help="How the RMS norms pin their float32 statistics: an optimization barrier on the variance (barrier), or a "
         "custom VJP that saves the inverse RMS for the backward, letting XLA fuse the reduction with its users "
-        "(custom_vjp) (GrugModelConfig.rms_norm_impl).",
+        "(custom_vjp), or a custom VJP whose backward recomputes the inverse RMS from x (custom_vjp_recompute) "
+        "(GrugModelConfig.rms_norm_impl).",
     )
     parser.add_argument(
         "--scan-unroll", type=int, default=1, help="Layers per iteration of the layer scan (lax.scan unroll)."
