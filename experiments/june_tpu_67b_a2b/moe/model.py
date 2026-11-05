@@ -24,6 +24,7 @@ from jax.sharding import PartitionSpec as P
 from jax.sharding import get_abstract_mesh, reshard
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
+from levanter.grug._moe.scatter_epilogue import MoeScatterEpilogue
 from levanter.grug.attention import (
     AttentionMask,
     GrugAttentionImplementation,
@@ -149,6 +150,12 @@ class GrugModelConfig:
     """How ``ring_dedup`` runs the backward's expert-side dispatch gather-sum and sender-side combine gather: XLA
     fusions ("xla") or a Pallas-Triton row-gather kernel ("pallas"). Both give the same values bit for bit; off GPU the
     kernel runs in the Pallas interpreter. Needs ``moe_implementation="ring_dedup"``."""
+    moe_scatter_epilogue: MoeScatterEpilogue = "off"
+    """How ``ring_dedup`` runs the expert-side combine and dispatch backward: separate gathers ("off"), or row-scatter
+    epilogues of jax-flydsl's grouped GEMMs (the down projection writes single-slot received rows of the combine, the
+    up projection's data gradient those of the dispatch backward) plus a Pallas gather-sum of the other rows
+    ("flydsl"). Same values bit for bit. "flydsl" needs jax-flydsl on an AMD GPU; "reference" is the same data flow on
+    XLA GEMMs, for tests. Needs ``moe_implementation="ring_dedup"``."""
     ce_implementation: str | None = None
     """Fused cross-entropy backend selection (levanter fused_cross_entropy_loss). None keeps the
     backend default (GPU: full-logits ``xla`` path). Set ``"batched_xla"`` to use the blocked-vocab
@@ -720,6 +727,7 @@ class MoEMLP(eqx.Module):
                 num_expert_waves=cfg.num_expert_waves,
                 token_blocks=cfg.moe_token_blocks,
                 gather_sum=cfg.moe_gather_sum,
+                scatter_epilogue=cfg.moe_scatter_epilogue,
             ),
             routed_moe=QBRoutedMoE(
                 num_experts_per_token=cfg.num_experts_per_token,

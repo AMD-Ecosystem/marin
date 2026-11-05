@@ -41,6 +41,7 @@ from levanter.grug._moe.common import (
 from levanter.grug._moe.ep_common import _assignment_sources, _combine_gather_sum
 from levanter.grug._moe.ep_ring import _combine_rows, _dispatch_rows, _select_local_assignments
 from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
+from levanter.grug._moe.scatter_epilogue import MoeScatterEpilogue, dispatch_up, down_combine, scatter_plan
 
 
 def destination_hit_fraction(*, num_experts: int, local_experts: int, topk: int) -> float:
@@ -64,6 +65,7 @@ def _moe_mlp_ep_ring_dedup_local(
     token_blocks: int,
     reduce_drops: bool = True,
     gather_sum: MoeGatherSum = "xla",
+    scatter_epilogue: MoeScatterEpilogue = "off",
 ) -> tuple[Float[Array, "Tlocal H"], CapacityDrops]:
     """Deduplicated all-to-all dispatch, ring's grouped expert MLP, expert-side combine.
 
@@ -87,6 +89,10 @@ def _moe_mlp_ep_ring_dedup_local(
     ``gather_sum`` picks how the backward's expert-side dispatch gather-sum and sender-side combine gather run: XLA
     fusions ("xla") or the Pallas-Triton kernel of ``pallas_gather_sum`` ("pallas"), with the same results bit for bit.
     The token-side gathers stay on XLA, which fuses them with the residual stream.
+
+    ``scatter_epilogue`` other than "off" runs the expert-side combine and dispatch backward as row-scatter epilogues
+    of the expert GEMMs plus a gather-sum of the remaining rows (see ``scatter_epilogue``), with the same results bit
+    for bit. It replaces the expert-side dispatch gather-sum, so ``gather_sum`` then only affects the sender side.
     """
     tokens = x_local.shape[0]
     local_experts = moe_w13_local.shape[0]
@@ -106,6 +112,7 @@ def _moe_mlp_ep_ring_dedup_local(
         capacity_factor=capacity_factor,
         transport_capacity_factor=transport_capacity_factor,
         gather_sum=gather_sum,
+        scatter_epilogue=scatter_epilogue,
     )
     if token_blocks == 1:
         out_local, sender_dropped, receiver_dropped = block(
@@ -149,6 +156,7 @@ def _ring_dedup_block(
     capacity_factor: float,
     transport_capacity_factor: float,
     gather_sum: MoeGatherSum,
+    scatter_epilogue: MoeScatterEpilogue,
 ) -> tuple[Float[Array, "T H"], Int[Array, ""], Int[Array, ""]]:
     """One block of tokens through the exchange: its output and its local sender and receiver drops."""
     tokens, topk = selected_experts_local.shape
@@ -247,28 +255,65 @@ def _ring_dedup_block(
             (group_sizes, picked, dispatch_valid, dispatch_row, position), _CHECKPOINT_ROUTING
         )
 
-        x_dispatch = _dispatch_rows(
-            received_x, jnp.minimum(dispatch_row, send_rows - 1), dispatch_valid, position, gather_sum
-        )
-        x_dispatch = tree_checkpoint_name(x_dispatch, _CHECKPOINT_DISPATCH_INPUT)
+        if scatter_epilogue != "off":
+            scatter_rows, gather_rows = scatter_plan(position, picked, dispatch_valid)
+            scatter_rows, gather_rows = tree_checkpoint_name((scatter_rows, gather_rows), _CHECKPOINT_ROUTING)
+        else:
+            x_dispatch = _dispatch_rows(
+                received_x, jnp.minimum(dispatch_row, send_rows - 1), dispatch_valid, position, gather_sum
+            )
+            x_dispatch = tree_checkpoint_name(x_dispatch, _CHECKPOINT_DISPATCH_INPUT)
 
-    with jax.named_scope("moe_up_down"):
-        w13_out = tree_checkpoint_name(ragged_dot(x_dispatch, moe_w13_local, group_sizes), _CHECKPOINT_EXPERT_HIDDEN)
-        moe_dim = moe_w2_local.shape[1]
-        gate, up = jnp.split(w13_out, [moe_dim], axis=-1)
-        out_dispatch = tree_checkpoint_name(
-            ragged_dot(activation_fn(gate) * up, moe_w2_local, group_sizes),
-            _CHECKPOINT_DISPATCH_OUTPUT,
-        )
+    moe_dim = moe_w2_local.shape[1]
+    if scatter_epilogue != "off":
+        with jax.named_scope("moe_up_down"):
+            # The dispatch gather is saved inside dispatch_up under _CHECKPOINT_DISPATCH_INPUT, the down projection
+            # output inside down_combine under _CHECKPOINT_DISPATCH_OUTPUT.
+            w13_out = dispatch_up(
+                received_x,
+                jnp.minimum(dispatch_row, send_rows - 1),
+                dispatch_valid,
+                moe_w13_local,
+                group_sizes,
+                position,
+                scatter_rows,
+                gather_rows,
+                scatter_epilogue,
+            )
+            w13_out = tree_checkpoint_name(w13_out, _CHECKPOINT_EXPERT_HIDDEN)
+            gate, up = jnp.split(w13_out, [moe_dim], axis=-1)
+        with jax.named_scope("combine"):
+            expert_combined = down_combine(
+                activation_fn(gate) * up,
+                moe_w2_local,
+                group_sizes,
+                position,
+                picked,
+                received_weights,
+                scatter_rows,
+                gather_rows,
+                scatter_epilogue,
+            )
+    else:
+        with jax.named_scope("moe_up_down"):
+            w13_out = tree_checkpoint_name(
+                ragged_dot(x_dispatch, moe_w13_local, group_sizes), _CHECKPOINT_EXPERT_HIDDEN
+            )
+            gate, up = jnp.split(w13_out, [moe_dim], axis=-1)
+            out_dispatch = tree_checkpoint_name(
+                ragged_dot(activation_fn(gate) * up, moe_w2_local, group_sizes),
+                _CHECKPOINT_DISPATCH_OUTPUT,
+            )
+        with jax.named_scope("combine"):
+            expert_combined = _combine_gather_sum(
+                out_dispatch,
+                position.reshape(-1),
+                picked,
+                received_weights,
+                out_dispatch.dtype,
+            )
 
     with jax.named_scope("combine"):
-        expert_combined = _combine_gather_sum(
-            out_dispatch,
-            position.reshape(-1),
-            picked,
-            received_weights,
-            out_dispatch.dtype,
-        )
         returned = jax.lax.all_to_all(
             expert_combined.reshape(ep_size, pair_capacity, hidden_dim),
             "expert",

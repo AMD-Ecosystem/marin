@@ -127,3 +127,92 @@ def gather_valid_rows(
     """
     slots = jnp.where(valid, index.astype(jnp.int32), x.shape[0])[:, None]
     return _gather_rows(x, slots, accumulate=False, interpret=interpret)
+
+
+def _gather_rows_into_kernel(*refs, block_rows: int, block_cols: int, weighted: bool):
+    if weighted:
+        src_ref, slots_ref, weights_ref, write_ref, _dst_ref, out_ref = refs
+    else:
+        src_ref, slots_ref, write_ref, _dst_ref, out_ref = refs
+    num_src = src_ref.shape[0]
+    num_out = out_ref.shape[0]
+    row0 = pl.program_id(0) * block_rows
+    col0 = pl.program_id(1) * block_cols
+    in_bounds = row0 + jnp.arange(block_rows) < num_out
+    write = plgpu.load(write_ref.at[pl.ds(row0, block_rows)], mask=in_bounds, other=0)
+    live = in_bounds & (write != 0)
+    cols = col0 + jnp.arange(block_cols)
+    acc = None
+    for k in range(slots_ref.shape[1]):
+        slot = plgpu.load(slots_ref.at[pl.ds(row0, block_rows), jnp.int32(k)], mask=live, other=num_src)
+        keep = live & (slot >= 0) & (slot < num_src)
+        src_rows = jnp.clip(slot, 0, num_src - 1)
+        rows = plgpu.load(src_ref.at[src_rows[:, None], cols[None, :]], mask=keep[:, None], other=0).astype(
+            jnp.float32
+        )
+        if weighted:
+            weight = plgpu.load(weights_ref.at[pl.ds(row0, block_rows), jnp.int32(k)], mask=live, other=0.0)
+            rows = rows * weight.astype(jnp.float32)[:, None]
+        # Starting from the first term, not from zero: the XLA formulations' `zeros + term` simplifies to `term`.
+        acc = rows if acc is None else acc + rows
+    plgpu.store(
+        out_ref.at[pl.ds(row0, block_rows), pl.ds(col0, block_cols)],
+        acc.astype(out_ref.dtype),
+        mask=live[:, None],
+    )
+
+
+def gather_sum_rows_into(
+    dst: Float[Array, "T H"],
+    rows: Float[Array, "P H"],
+    slots: Int[Array, "T K"],
+    write: Bool[Array, "T"],
+    weights: Float[Array, "T K"] | None = None,
+    *,
+    interpret: bool | None = None,
+) -> Float[Array, "T H"]:
+    """``dst`` with each row ``t`` where ``write[t]`` replaced by ``sum_k rows[slots[t, k]] (* weights[t, k])``.
+
+    The sum runs in float32 in ``k`` order from the first term and is rounded once; out-of-range slots add zero
+    (times their weight). Unweighted it equals :func:`gather_sum_rows` on the written rows; weighted it equals the
+    XLA combine ``sum_k where(keep, rows[slot], 0).astype(f32) * weights[:, k]`` of ``ep_common``. Rows with
+    ``write[t]`` false are neither read nor written: ``dst`` is updated in place (aliased to the output), so only the
+    written rows cost memory traffic. ``interpret=None`` uses the Pallas interpreter off GPU.
+    """
+    num_out, hidden = dst.shape
+    if rows.shape[1] != hidden or slots.shape[0] != num_out or write.shape != (num_out,):
+        raise ValueError(
+            f"shape mismatch: dst {dst.shape}, rows {rows.shape}, slots {slots.shape}, write {write.shape}"
+        )
+    if rows.dtype != dst.dtype:
+        raise ValueError(f"rows and dst must share a dtype, got {rows.dtype} and {dst.dtype}")
+    topk = slots.shape[1]
+    weighted = weights is not None
+    if weighted and weights.shape != slots.shape:
+        raise ValueError(f"weights must match slots {slots.shape}, got {weights.shape}")
+    block_cols = _block_cols(hidden)
+    if block_cols is None:
+        raise ValueError(f"the Pallas gather needs a hidden width with a power-of-two divisor >= 16, got {hidden}")
+    if interpret is None:
+        interpret = jax.default_backend() != "gpu"
+    operands = [rows, slots.astype(jnp.int32)]
+    if weighted:
+        operands.append(weights.astype(jnp.float32))
+    operands += [write.astype(jnp.int32), dst]
+    itemsize = jnp.dtype(dst.dtype).itemsize
+    return pl.pallas_call(
+        functools.partial(_gather_rows_into_kernel, block_rows=_BLOCK_ROWS, block_cols=block_cols, weighted=weighted),
+        grid=(pl.cdiv(num_out, _BLOCK_ROWS), hidden // block_cols),
+        in_specs=[pl.no_block_spec] * len(operands),
+        out_specs=pl.no_block_spec,
+        out_shape=jax.ShapeDtypeStruct((num_out, hidden), dst.dtype),
+        input_output_aliases={len(operands) - 1: 0},
+        compiler_params=plgpu.CompilerParams(num_warps=_NUM_WARPS, num_stages=1),
+        cost_estimate=pl.CostEstimate(
+            flops=2 * num_out * topk * hidden,
+            transcendentals=0,
+            bytes_accessed=(topk + 1) * num_out * hidden * itemsize + num_out * (topk + 1) * 4,
+        ),
+        interpret=interpret,
+        name="grug_gather_sum_into_weighted" if weighted else "grug_gather_sum_into",
+    )(*operands)

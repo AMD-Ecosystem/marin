@@ -61,6 +61,7 @@ from levanter.grug._moe.ep_ring import (
 from levanter.grug._moe.ep_ring_dedup import _moe_mlp_ep_ring_dedup_local
 from levanter.grug._moe.local import _moe_mlp_local
 from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
+from levanter.grug._moe.scatter_epilogue import MoeScatterEpilogue
 from levanter.grug._moe.routing_top_k import routing_top_k
 from levanter.grug.sharding import (
     _axis_names,
@@ -536,6 +537,7 @@ class MoEExpertMlp(eqx.Module):
     num_expert_waves: int = eqx.field(static=True, default=1)
     token_blocks: int = eqx.field(static=True, default=1)
     gather_sum: MoeGatherSum = eqx.field(static=True, default="xla")
+    scatter_epilogue: MoeScatterEpilogue = eqx.field(static=True, default="off")
 
     @staticmethod
     def init(
@@ -554,6 +556,7 @@ class MoEExpertMlp(eqx.Module):
         num_expert_waves: int = 1,
         token_blocks: int = 1,
         gather_sum: MoeGatherSum = "xla",
+        scatter_epilogue: MoeScatterEpilogue = "off",
         pspecs: MoEExpertMlpPspecs = MoEExpertMlpPspecs(),
     ) -> "MoEExpertMlp":
         resolved_implementation = resolve_moe_implementation(implementation)
@@ -579,6 +582,7 @@ class MoEExpertMlp(eqx.Module):
             num_expert_waves=num_expert_waves,
             token_blocks=token_blocks,
             gather_sum=gather_sum,
+            scatter_epilogue=scatter_epilogue,
         )
 
     @named_call
@@ -612,6 +616,7 @@ class MoEExpertMlp(eqx.Module):
             num_expert_waves=self.num_expert_waves,
             token_blocks=self.token_blocks,
             gather_sum=self.gather_sum,
+            scatter_epilogue=self.scatter_epilogue,
         )
 
 
@@ -635,6 +640,7 @@ def moe_mlp(
     num_expert_waves: int = 1,
     token_blocks: int = 1,
     gather_sum: MoeGatherSum = "xla",
+    scatter_epilogue: MoeScatterEpilogue = "off",
 ) -> Float[Array, "T D"] | tuple[Float[Array, "T D"], MoeDispatchCounts]:
     """Functional routed MoE MLP core used by Grug modules and benchmarks.
 
@@ -679,6 +685,10 @@ def moe_mlp(
 
     `gather_sum="pallas"` runs `ring_dedup`'s expert-side dispatch backward and sender-side combine backward row
     gathers in a Pallas-Triton kernel instead of XLA fusions, with the same results bit for bit (`ring_dedup` only).
+
+    `scatter_epilogue="flydsl"` runs `ring_dedup`'s expert-side combine and dispatch backward as row-scatter epilogues
+    of jax-flydsl's grouped GEMMs plus a Pallas gather-sum of the remaining rows, with the same results bit for bit
+    (`ring_dedup` only; "reference" is the same data flow on XLA GEMMs, for tests).
     """
     resolved_implementation = resolve_moe_implementation(implementation)
     if token_blocks < 1:
@@ -691,6 +701,12 @@ def moe_mlp(
     if gather_sum != "xla" and resolved_implementation != "ring_dedup":
         raise ValueError(
             f"gather_sum={gather_sum!r} requires ring_dedup, got implementation={resolved_implementation!r}"
+        )
+    if scatter_epilogue not in get_args(MoeScatterEpilogue):
+        raise ValueError(f"scatter_epilogue must be one of {get_args(MoeScatterEpilogue)}, got {scatter_epilogue!r}")
+    if scatter_epilogue != "off" and resolved_implementation != "ring_dedup":
+        raise ValueError(
+            f"scatter_epilogue={scatter_epilogue!r} requires ring_dedup, got implementation={resolved_implementation!r}"
         )
 
     if mesh is None:
@@ -803,6 +819,7 @@ def moe_mlp(
                 token_blocks=token_blocks,
                 reduce_drops=not local_capacity_drops,
                 gather_sum=gather_sum,
+                scatter_epilogue=scatter_epilogue,
             )
         elif resolved_implementation == "ragged_all_to_all":
             shard_local_fn = _moe_mlp_ep_ragged_a2a_local
