@@ -171,3 +171,29 @@ def test_in_kernel_sums_need_ring_filtered():
             raise AssertionError("expected a NotImplementedError")
         """
     )
+
+
+@pytest.mark.timeout(900)
+def test_in_kernel_sums_with_token_blocks():
+    # Two token blocks fold two gradients into each layer of the sums: the backward's first one ("init") writes it and
+    # the second adds to it. XLA sums the blocks' bf16 gradients in bf16 first, so only the rounding differs.
+    _run(
+        """
+        cfg = dataclasses.replace(GA_CFG, moe_token_blocks=2)
+        mesh = MESHES["replica4_expert2"]
+        for kwargs in ({}, {"zero1": True, "gather": True}):
+            loss, grads = accumulated_grads(mesh, accumulation="xla", cfg=cfg, **kwargs)
+            k_loss, k_grads = accumulated_grads(mesh, accumulation="flydsl", cfg=cfg, **kwargs)
+            assert np.array_equal(loss, k_loss), (kwargs, loss, k_loss)
+            for (path, a), b in zip(jax.tree_util.tree_leaves_with_path(grads), jax.tree.leaves(k_grads), strict=True):
+                a, b = np.asarray(a, np.float32), np.asarray(b, np.float32)
+                scale = max(float(np.abs(a).max()), 1e-30)
+                assert float(np.abs(a - b).max()) <= 2e-2 * scale, (kwargs, jax.tree_util.keystr(path))
+        try:
+            accumulated_grads(mesh, accumulation="flydsl", cfg=cfg, zero1=True, gather=True, overlap=True)
+        except NotImplementedError as e:
+            assert "token_blocks" in str(e)
+        else:
+            raise AssertionError("expected a NotImplementedError")
+        """
+    )

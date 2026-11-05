@@ -39,6 +39,9 @@ class ExpertGradAccumulator(eqx.Module):
     def without_layer(self) -> "ExpertGradAccumulator":
         return ExpertGradAccumulator(self.w_gate, self.w_up, self.w_down, None, self.mode)
 
+    def with_mode(self, mode: GradAccumulation) -> "ExpertGradAccumulator":
+        return ExpertGradAccumulator(self.w_gate, self.w_up, self.w_down, self.layer, mode)
+
 
 def local_view(x: jax.Array) -> jax.Array:
     """One device's block of a sum inside a ``shard_map``, ``[L, 1, E_local, ...]``, as the kernel's ``[L, E_local, ...]``."""
