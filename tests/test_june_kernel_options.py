@@ -1,0 +1,67 @@
+# Copyright The Marin Authors
+# SPDX-License-Identifier: Apache-2.0
+
+"""The June model's ``ce_v_block_size``.
+
+An explicit fused cross-entropy vocabulary block changes only the summation order of the streamed logsumexp and of
+the gradient blocks, so the loss and the gradients match the backend's default block to float32 rounding."""
+
+import dataclasses
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from levanter.grug.sharding import compact_grug_mesh
+
+from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig, Transformer
+
+_SMALL = GrugModelConfig(
+    vocab_size=200,
+    hidden_dim=16,
+    intermediate_dim=8,
+    shared_expert_intermediate_dim=8,
+    num_experts=4,
+    num_experts_per_token=2,
+    num_layers=2,
+    num_heads=2,
+    num_kv_heads=1,
+    head_dim=8,
+    max_seq_len=16,
+    sliding_window=8,
+    capacity_factor=8.0,
+    attention_implementation="reference",
+    use_array_stacked_blocks=True,
+    disable_pko=True,
+    ce_implementation="xla",
+)
+
+
+def _loss_and_grads(cfg: GrugModelConfig):
+    tokens = jax.random.randint(jax.random.key(1), (4, cfg.max_seq_len), 0, cfg.vocab_size)
+    loss_weight = jnp.ones(tokens.shape, jnp.float32)
+    with jax.set_mesh(compact_grug_mesh(expert_axis_size=1)):
+        model = Transformer.init(cfg, key=jax.random.key(0))
+        params, static = eqx.partition(model, eqx.is_array)
+
+        def loss(p):
+            return eqx.combine(p, static).next_token_loss(tokens, loss_weight, logsumexp_weight=1e-3)
+
+        value, grads = jax.jit(jax.value_and_grad(loss))(params)
+    return value, jax.tree.leaves(grads)
+
+
+@pytest.mark.parametrize("v_block_size", [16, 64, 8192])
+def test_ce_v_block_size_keeps_loss_and_grads(v_block_size):
+    base_loss, base_grads = _loss_and_grads(_SMALL)
+    loss, grads = _loss_and_grads(dataclasses.replace(_SMALL, ce_v_block_size=v_block_size))
+    np.testing.assert_allclose(loss, base_loss, rtol=1e-6)
+    assert len(grads) == len(base_grads)
+    for g, base in zip(grads, base_grads, strict=True):
+        scale = max(float(jnp.max(jnp.abs(base))), 1e-30)
+        assert float(jnp.max(jnp.abs(g - base))) <= 1e-5 * scale
+    if v_block_size < _SMALL.vocab_size:
+        # Several vocabulary blocks: the block reached the loss, which now sums in a different order.
+        assert any(not np.array_equal(g, base) for g, base in zip(grads, base_grads, strict=True))
+
