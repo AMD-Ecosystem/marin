@@ -49,6 +49,7 @@ from levanter.distributed import DistributedConfig
 from levanter.grug._moe.common import _TRANSPORT_CAPACITY_MOE_IMPLEMENTATIONS
 from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
 from levanter.grug.attention import GrugAttentionImplementation
+from levanter.grug.grug_moe import QbThresholdImpl
 from levanter.optim.config import AdamConfig
 from levanter.tracker.json_logger import JsonLoggerConfig
 from levanter.trainer import TrainerConfig
@@ -231,6 +232,32 @@ def parse_args() -> argparse.Namespace:
         default="per_layer",
         help="Reduce routing statistics and QB thresholds in every layer or once after the layer scan.",
     )
+    parser.add_argument(
+        "--capacity-drops",
+        choices=get_args(ScanReduction),
+        default="per_layer",
+        help="Sum the MoE capacity drop counts across the token shards in every layer or once after the layer scan, "
+        "with the routing statistics (needs --router-stats after_scan) (GrugModelConfig.capacity_drop_reduction).",
+    )
+    parser.add_argument(
+        "--qb-threshold",
+        choices=get_args(QbThresholdImpl),
+        default="top_k",
+        help="Select the QB thresholds with lax.top_k (a full sort on GPUs) or an exact radix select in one Pallas "
+        "kernel (GrugModelConfig.qb_threshold_impl).",
+    )
+    parser.add_argument(
+        "--no-router-diagnostics",
+        action="store_true",
+        help="Skip the diagnostic routing statistics (expert counts, probability sums, entropy, load balancing, "
+        "z-loss unless weighted) in every layer (GrugModelConfig.router_diagnostics=False).",
+    )
+    parser.add_argument(
+        "--skip-zero-router-z-loss",
+        action="store_true",
+        help="Leave the router z-loss out of the loss when its coefficient is 0, so its backward does not run "
+        "(GrugModelConfig.skip_zero_router_z_loss).",
+    )
     parser.add_argument("--qb-balance", choices=get_args(QbBalance), default="global", help="QB load balancing groups.")
     parser.add_argument(
         "--qb-sync-interval",
@@ -353,6 +380,10 @@ def main() -> None:
         replicated_grad_reduction=args.replicated_grads,
         replicated_grad_max_bytes=int(args.replicated_grads_max_mib * (1 << 20)),
         router_stats_reduction=args.router_stats,
+        capacity_drop_reduction=args.capacity_drops,
+        qb_threshold_impl=args.qb_threshold,
+        router_diagnostics=not args.no_router_diagnostics,
+        skip_zero_router_z_loss=args.skip_zero_router_z_loss,
         qb_balance=args.qb_balance,
         use_array_stacked_blocks=not args.unstacked_blocks,
     )
@@ -439,7 +470,8 @@ def main() -> None:
         "overlap_last_microbatch=%s seq_len=%d "
         "window=%d mp=%s expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d "
         "token_blocks=%d gather_sum=%s ce_v_block=%s remat=%s remat_prevent_cse=%s rms_norm_impl=%s "
-        "replicated_grads=%s router_stats=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
+        "replicated_grads=%s router_stats=%s capacity_drops=%s qb_threshold=%s router_diagnostics=%s "
+        "skip_zero_router_z_loss=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
         "zero1=%s gather_in_first_microbatch=%s watch_interval=%d pipelined_step_logging=%s flops_per_example=%.4e",
         args.size,
         model.num_layers,
@@ -469,6 +501,10 @@ def main() -> None:
         model.rms_norm_impl,
         args.replicated_grads,
         args.router_stats,
+        model.capacity_drop_reduction,
+        model.qb_threshold_impl,
+        model.router_diagnostics,
+        model.skip_zero_router_z_loss,
         args.qb_balance,
         args.qb_sync_interval,
         args.carry_compute_params,

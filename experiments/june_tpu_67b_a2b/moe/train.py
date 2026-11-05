@@ -760,18 +760,21 @@ def _combine_microbatch_router_metrics(stacked: dict[str, jax.Array], token_shar
     def weighted_sum(x: jax.Array) -> jax.Array:
         return jnp.sum(token_shares.reshape(-1, *(1,) * (x.ndim - 1)) * x, axis=0)
 
-    counts = jnp.sum(stacked["routing_counts_per_layer"], axis=0)
-    fraction = counts / jnp.maximum(jnp.sum(counts, axis=-1, keepdims=True), 1.0)
     qb_betas = stacked["qb_beta_per_layer"]
-    return {
-        "routing_counts_per_layer": counts,
-        "routing_entropy_per_layer": -jnp.sum(fraction * jnp.log(fraction + 1e-6), axis=-1),
-        "load_balancing_loss_per_layer": weighted_sum(stacked["load_balancing_loss_per_layer"]),
-        "router_z_loss_per_layer": weighted_sum(stacked["router_z_loss_per_layer"]),
+    out = {
         "qb_beta_per_layer": reshard(weighted_sum(qb_betas), P(*jax.typeof(qb_betas).sharding.spec[1:])),
         "capacity_overflow_per_layer": jnp.sum(stacked["capacity_overflow_per_layer"], axis=0),
         "skipped_assignments_per_layer": jnp.sum(stacked["skipped_assignments_per_layer"], axis=0),
     }
+    if "router_z_loss_per_layer" in stacked:
+        out["router_z_loss_per_layer"] = weighted_sum(stacked["router_z_loss_per_layer"])
+    if "routing_counts_per_layer" in stacked:  # the diagnostics (GrugModelConfig.router_diagnostics)
+        counts = jnp.sum(stacked["routing_counts_per_layer"], axis=0)
+        fraction = counts / jnp.maximum(jnp.sum(counts, axis=-1, keepdims=True), 1.0)
+        out["routing_counts_per_layer"] = counts
+        out["routing_entropy_per_layer"] = -jnp.sum(fraction * jnp.log(fraction + 1e-6), axis=-1)
+        out["load_balancing_loss_per_layer"] = weighted_sum(stacked["load_balancing_loss_per_layer"])
+    return out
 
 
 def _microbatched_loss_and_grads(

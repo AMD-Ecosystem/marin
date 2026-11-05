@@ -148,6 +148,7 @@ def _moe_mlp_ep_ring_filtered_local(
     transport_capacity_factor: float,
     token_sharding_axes: tuple[str, ...],
     token_blocks: int,
+    reduce_drops: bool = True,
     gather_sum: MoeGatherSum = "xla",
 ) -> tuple[Float[Array, "Tlocal H"], CapacityDrops]:
     """Filtered all-to-all dispatch, ring's grouped expert MLP, expert-side combine.
@@ -165,6 +166,9 @@ def _moe_mlp_ep_ring_filtered_local(
     can drop on another. ``capacity_factor`` keeps ring's meaning: each expert shard
     runs at most ``capacity_factor * Tlocal * K`` assignments, allocated in local-expert order
     (receiver drops).
+
+    The drop counts are summed over ``token_sharding_axes`` (one small all-reduce per call), or, with
+    ``reduce_drops=False``, returned as this shard's own counts, shape [1], for the caller to reduce later.
 
     ``gather_sum`` picks how the backward's expert-side dispatch gather-sum and sender-side combine gather run: XLA
     fusions ("xla") or the Pallas-Triton kernel of ``pallas_gather_sum`` ("pallas"), with the same results bit for bit.
@@ -209,6 +213,10 @@ def _moe_mlp_ep_ring_filtered_local(
         sender_dropped = sum(sender_drops)
         receiver_dropped = sum(receiver_drops)
 
+    if not reduce_drops:
+        return out_local, CapacityDrops(
+            sender_dropped=jnp.reshape(sender_dropped, (1,)), receiver_dropped=jnp.reshape(receiver_dropped, (1,))
+        )
     with jax.named_scope("combine"):
         drops = jax.lax.psum(jnp.stack([sender_dropped, receiver_dropped]), token_sharding_axes)
     return out_local, CapacityDrops(sender_dropped=drops[0], receiver_dropped=drops[1])
