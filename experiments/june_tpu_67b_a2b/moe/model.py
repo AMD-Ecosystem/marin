@@ -23,6 +23,7 @@ from jax import random
 from jax.sharding import PartitionSpec as P
 from jax.sharding import get_abstract_mesh, reshard
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
+from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
 from levanter.grug.attention import (
     AttentionMask,
     GrugAttentionImplementation,
@@ -131,6 +132,10 @@ class GrugModelConfig:
     moe_token_blocks: int = 1
     """Token blocks per shard for ``ring_dedup``: each block has its own all-to-all exchange, so one
     block's collectives can overlap another's expert matmuls. Must divide the local token count."""
+    moe_gather_sum: MoeGatherSum = "xla"
+    """How ``ring_dedup`` runs the backward's expert-side dispatch gather-sum and sender-side combine gather: XLA
+    fusions ("xla") or a Pallas-Triton row-gather kernel ("pallas"). Both give the same values bit for bit; off GPU the
+    kernel runs in the Pallas interpreter. Needs ``moe_implementation="ring_dedup"``."""
     ce_implementation: str | None = None
     """Fused cross-entropy backend selection (levanter fused_cross_entropy_loss). None keeps the
     backend default (GPU: full-logits ``xla`` path). Set ``"batched_xla"`` to use the blocked-vocab
@@ -666,6 +671,7 @@ class MoEMLP(eqx.Module):
                 pooled_transport_capacity_factor=cfg.pooled_transport_capacity_factor,
                 num_expert_waves=cfg.num_expert_waves,
                 token_blocks=cfg.moe_token_blocks,
+                gather_sum=cfg.moe_gather_sum,
             ),
             routed_moe=QBRoutedMoE(
                 num_experts_per_token=cfg.num_experts_per_token,
