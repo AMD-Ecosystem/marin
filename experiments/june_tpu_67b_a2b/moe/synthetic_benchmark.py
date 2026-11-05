@@ -46,6 +46,7 @@ from levanter.data.dataset import ListAsyncDataset
 from levanter.data.text.datasets import DirectDatasetComponent, LmDataConfig
 from levanter.data.text.examples import GrugLmExample
 from levanter.distributed import DistributedConfig
+from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
 from levanter.grug.attention import GrugAttentionImplementation
 from levanter.grug.grug_moe import QbThresholdImpl
 from levanter.optim.config import AdamConfig
@@ -172,6 +173,21 @@ def parse_args() -> argparse.Namespace:
         help="ring_dedup only: split each shard's tokens into this many blocks, each with its own all-to-alls, "
         "so one block's exchange can overlap another's expert matmuls.",
     )
+    parser.add_argument(
+        "--moe-gather-sum",
+        choices=get_args(MoeGatherSum),
+        default="xla",
+        help="ring_dedup only: run the backward's expert-side dispatch gather-sum and sender-side combine gather as "
+        "XLA fusions (xla) or in a Pallas-Triton row-gather kernel (pallas), with the same results bit for bit "
+        "(GrugModelConfig.moe_gather_sum).",
+    )
+    parser.add_argument(
+        "--ce-v-block-size",
+        type=int,
+        help="Vocabulary block of the fused cross-entropy (explicit block sizes, which skip batched_xla's forward "
+        "autotune; on MI355X its backward keeps its 8192 block). Default: the backend's choice "
+        "(GrugModelConfig.ce_v_block_size).",
+    )
     parser.add_argument("--profile-steps", type=int, default=0, help="Profile this many steps (0 disables).")
     parser.add_argument("--profile-start", type=int, default=10, help="First profiled step.")
     parser.add_argument("--log-dir", type=Path, default=Path("logs/june-synthetic"))
@@ -192,7 +208,8 @@ def parse_args() -> argparse.Namespace:
         default="barrier",
         help="How the RMS norms pin their float32 statistics: an optimization barrier on the variance (barrier), or a "
         "custom VJP that saves the inverse RMS for the backward, letting XLA fuse the reduction with its users "
-        "(custom_vjp) (GrugModelConfig.rms_norm_impl).",
+        "(custom_vjp), or a custom VJP whose backward recomputes the inverse RMS from x (custom_vjp_recompute) "
+        "(GrugModelConfig.rms_norm_impl).",
     )
     parser.add_argument(
         "--scan-unroll", type=int, default=1, help="Layers per iteration of the layer scan (lax.scan unroll)."
@@ -357,6 +374,8 @@ def main() -> None:
         pooled_transport_capacity_factor=args.pooled_transport_capacity_factor,
         num_expert_waves=args.num_expert_waves,
         moe_token_blocks=args.moe_token_blocks,
+        moe_gather_sum=args.moe_gather_sum,
+        ce_v_block_size=args.ce_v_block_size,
         scan_unroll=args.scan_unroll,
         replicated_grad_reduction=args.replicated_grads,
         replicated_grad_max_bytes=int(args.replicated_grads_max_mib * (1 << 20)),
@@ -450,7 +469,7 @@ def main() -> None:
         "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d microbatches=%d "
         "overlap_last_microbatch=%s seq_len=%d "
         "window=%d mp=%s expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d "
-        "token_blocks=%d remat=%s remat_prevent_cse=%s rms_norm_impl=%s "
+        "token_blocks=%d gather_sum=%s ce_v_block=%s remat=%s remat_prevent_cse=%s rms_norm_impl=%s "
         "replicated_grads=%s router_stats=%s capacity_drops=%s qb_threshold=%s router_diagnostics=%s "
         "skip_zero_router_z_loss=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
         "zero1=%s gather_in_first_microbatch=%s watch_interval=%d pipelined_step_logging=%s flops_per_example=%.4e",
@@ -475,6 +494,8 @@ def main() -> None:
         model.pooled_transport_capacity_factor,
         model.num_expert_waves,
         model.moe_token_blocks,
+        model.moe_gather_sum,
+        model.ce_v_block_size,
         args.remat_mode,
         model.remat_prevent_cse,
         model.rms_norm_impl,

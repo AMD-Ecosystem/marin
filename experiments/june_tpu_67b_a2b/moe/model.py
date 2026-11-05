@@ -23,6 +23,7 @@ from jax import random
 from jax.sharding import PartitionSpec as P
 from jax.sharding import get_abstract_mesh, reshard
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
+from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
 from levanter.grug.attention import (
     AttentionMask,
     GrugAttentionImplementation,
@@ -47,6 +48,7 @@ from levanter.grug.grug_moe import (
 )
 from levanter.grug.loss import fused_linear_softmax_cross_entropy_loss
 from levanter.grug.sharding import Pembed_vocab, Plm_head, _mesh_axis_size, unshard
+from levanter.kernels.pallas.fused_cross_entropy_loss import BlockSizes
 from levanter.tracker.histogram import Histogram, SummaryStats
 from levanter.utils.activation import ActivationFunctionEnum
 
@@ -66,7 +68,7 @@ RematMode = Literal["recompute_all", "save_moe", "save_moe_attn"]
 ATTENTION_REMAT_SAVE_NAME = "context"
 ScanReduction = Literal["per_layer", "after_scan"]
 QbBalance = Literal["global", "per_node"]
-RmsNormImpl = Literal["barrier", "custom_vjp"]
+RmsNormImpl = Literal["barrier", "custom_vjp", "custom_vjp_recompute"]
 
 
 def _batch_spec() -> P:
@@ -143,11 +145,20 @@ class GrugModelConfig:
     moe_token_blocks: int = 1
     """Token blocks per shard for ``ring_dedup``: each block has its own all-to-all exchange, so one
     block's collectives can overlap another's expert matmuls. Must divide the local token count."""
+    moe_gather_sum: MoeGatherSum = "xla"
+    """How ``ring_dedup`` runs the backward's expert-side dispatch gather-sum and sender-side combine gather: XLA
+    fusions ("xla") or a Pallas-Triton row-gather kernel ("pallas"). Both give the same values bit for bit; off GPU the
+    kernel runs in the Pallas interpreter. Needs ``moe_implementation="ring_dedup"``."""
     ce_implementation: str | None = None
     """Fused cross-entropy backend selection (levanter fused_cross_entropy_loss). None keeps the
     backend default (GPU: full-logits ``xla`` path). Set ``"batched_xla"`` to use the blocked-vocab
     (cut) CE that avoids materializing the [tokens, vocab] logits tile -- large HBM saving at long
     context. None is byte-identical to the prior behaviour."""
+    ce_v_block_size: int | None = None
+    """Vocabulary block of the fused cross-entropy, passed as explicit ``BlockSizes(v_block_size=...)`` with the
+    default batch and hidden blocks (1024, 512). None lets the backend choose (``batched_xla`` autotunes its forward at
+    startup; on MI355X it picks 1024). Explicit block sizes skip that autotune. On MI355X ``batched_xla``'s backward
+    keeps its tuned 8192 block either way, so this sets only the forward there; elsewhere it sets both."""
     remat_mode: RematMode = "recompute_all"
     """Per-block gradient checkpointing. "recompute_all" reruns the whole block in
     backward (lowest memory); "save_moe" keeps the tagged MoE dispatch tensors so
@@ -170,7 +181,9 @@ class GrugModelConfig:
     users. The forward expression is the same, but the fusion rounds it differently (a few float32 ulps), the
     gradients differ at float32 rounding level, and a scoring forward, which does not output the saved statistic, may
     be fused differently from the differentiated one (one bfloat16 ulp in a few elements): keep "barrier" where
-    scores must match the trained forward exactly."""
+    scores must match the trained forward exactly. "custom_vjp_recompute" is "custom_vjp" with a forward that saves
+    only ``x`` and a backward that recomputes the inverse RMS (``rms_normalize_recompute``), so under remat the
+    recomputed forward's reduction feeds only the normalization and can fuse with it."""
     replicate_attn_weights: bool = False
     """If True, store w_q/w_k/w_v/w_o fully replicated (P(None, None)) instead
     of FSDP-sharded across the data axis. Attention weights are small (~128 KB
@@ -262,6 +275,8 @@ class GrugModelConfig:
         if self.shared_expert_intermediate_dim < 0:
             raise ValueError("shared_expert_intermediate_dim must be non-negative")
         validate_moe_implementation(self.moe_implementation)
+        if self.ce_v_block_size is not None and self.ce_v_block_size <= 0:
+            raise ValueError("ce_v_block_size must be positive")
         stacked_only = {
             "replicated_grad_reduction": self.replicated_grad_reduction,
             "router_stats_reduction": self.router_stats_reduction,
@@ -285,9 +300,22 @@ class GrugModelConfig:
         return self.hidden_dim // self.num_heads
 
 
+def _inverse_rms(x_f32: jax.Array, eps: float) -> jax.Array:
+    return jax.lax.rsqrt(jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True) + eps)
+
+
+def _rms_normalize_dx(x: jax.Array, inv_rms: jax.Array, g: jax.Array) -> jax.Array:
+    x_f32 = x.astype(jnp.float32)
+    g = g.astype(jnp.float32)
+    # d(x * r)/dx with r = rsqrt(mean(x^2) + eps), dr/dx = -r^3 x / D:  r * (g - x * r^2 * mean(g * x)).
+    projection = jnp.mean(g * x_f32, axis=-1, keepdims=True)
+    dx = inv_rms * (g - x_f32 * (inv_rms * inv_rms) * projection)
+    return dx.astype(x.dtype)
+
+
 def _rms_normalize_fwd(x: jax.Array, eps: float) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
     x_f32 = x.astype(jnp.float32)
-    inv_rms = jax.lax.rsqrt(jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True) + eps)
+    inv_rms = _inverse_rms(x_f32, eps)
     return x_f32 * inv_rms, (x, inv_rms)
 
 
@@ -304,21 +332,40 @@ def rms_normalize(x: jax.Array, eps: float) -> jax.Array:
 def _rms_normalize_bwd(eps: float, residuals: tuple[jax.Array, jax.Array], g: jax.Array) -> tuple[jax.Array]:
     del eps
     x, inv_rms = residuals
-    x_f32 = x.astype(jnp.float32)
-    g = g.astype(jnp.float32)
-    # d(x * r)/dx with r = rsqrt(mean(x^2) + eps), dr/dx = -r^3 x / D:  r * (g - x * r^2 * mean(g * x)).
-    projection = jnp.mean(g * x_f32, axis=-1, keepdims=True)
-    dx = inv_rms * (g - x_f32 * (inv_rms * inv_rms) * projection)
-    return (dx.astype(x.dtype),)
+    return (_rms_normalize_dx(x, inv_rms, g),)
 
 
 rms_normalize.defvjp(_rms_normalize_fwd, _rms_normalize_bwd)
 
 
+def _rms_normalize_recompute_fwd(x: jax.Array, eps: float) -> tuple[jax.Array, jax.Array]:
+    x_f32 = x.astype(jnp.float32)
+    return x_f32 * _inverse_rms(x_f32, eps), x
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(1,))
+def rms_normalize_recompute(x: jax.Array, eps: float) -> jax.Array:
+    """``rms_normalize`` whose forward saves only ``x``: the backward recomputes ``rsqrt(mean(x^2) + eps)``.
+
+    Nothing outside the normalization reads the forward's statistic, so under remat the recomputed forward's reduction
+    can fuse with the normalization alone. The backward's statistic is the same expression, so it rounds like the
+    forward's up to how XLA fuses each (``GrugModelConfig.rms_norm_impl="custom_vjp_recompute"``)."""
+    return _rms_normalize_recompute_fwd(x, eps)[0]
+
+
+def _rms_normalize_recompute_bwd(eps: float, x: jax.Array, g: jax.Array) -> tuple[jax.Array]:
+    return (_rms_normalize_dx(x, _inverse_rms(x.astype(jnp.float32), eps), g),)
+
+
+rms_normalize_recompute.defvjp(_rms_normalize_recompute_fwd, _rms_normalize_recompute_bwd)
+
+_RMS_NORMALIZE_VJP = {"custom_vjp": rms_normalize, "custom_vjp_recompute": rms_normalize_recompute}
+
+
 def rms_norm(x: jax.Array, eps: float = 1e-6, *, impl: RmsNormImpl = "barrier") -> jax.Array:
     """Non-parametric RMS norm over the last dimension."""
-    if impl == "custom_vjp":
-        return rms_normalize(x, eps).astype(x.dtype)
+    if impl in _RMS_NORMALIZE_VJP:
+        return _RMS_NORMALIZE_VJP[impl](x, eps).astype(x.dtype)
     variance = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
     # AD retains different intermediates; pin the reduction to preserve forward rounding.
     variance = jax.lax.optimization_barrier(variance)
@@ -493,8 +540,8 @@ class RMSNorm(eqx.Module):
         reduced = bool(jax.typeof(self.weight).sharding.spec.reduced)
         weight = self.weight if reduced else unshard(self.weight)
         dtype = x.dtype
-        if self.impl == "custom_vjp":
-            normed = rms_normalize(x, self.eps)
+        if self.impl in _RMS_NORMALIZE_VJP:
+            normed = _RMS_NORMALIZE_VJP[self.impl](x, self.eps)
         else:
             x = x.astype(jnp.float32)
             variance = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
@@ -672,6 +719,7 @@ class MoEMLP(eqx.Module):
                 pooled_transport_capacity_factor=cfg.pooled_transport_capacity_factor,
                 num_expert_waves=cfg.num_expert_waves,
                 token_blocks=cfg.moe_token_blocks,
+                gather_sum=cfg.moe_gather_sum,
             ),
             routed_moe=QBRoutedMoE(
                 num_experts_per_token=cfg.num_experts_per_token,
@@ -1291,6 +1339,9 @@ class Transformer(eqx.Module):
             logsumexp_weight=logsumexp_weight,
             dtype=loss_dtype,
             implementation=self.config.ce_implementation,
+            block_sizes=(
+                None if self.config.ce_v_block_size is None else BlockSizes(v_block_size=self.config.ce_v_block_size)
+            ),
         )
         # No load-balancing loss; router z-loss only.
         if self.config.uses_router_z_loss:
