@@ -149,6 +149,10 @@ class GrugModelConfig:
     """How ``ring_dedup`` runs the backward's expert-side dispatch gather-sum and sender-side combine gather: XLA
     fusions ("xla") or a Pallas-Triton row-gather kernel ("pallas"). Both give the same values bit for bit; off GPU the
     kernel runs in the Pallas interpreter. Needs ``moe_implementation="ring_dedup"``."""
+    moe_flydsl_gather_a: bool = False
+    """Let ``ring_dedup``'s up-projection GEMM (forward and weight gradient) gather the dispatch rows in its A loads
+    instead of building the expert-ordered copy (F3). Same values bit for bit; needs ``moe_implementation="ring_dedup"``
+    and ``RAGGED_DOT_IMPL=flydsl`` on GPU (off GPU it runs the explicit gather)."""
     ce_implementation: str | None = None
     """Fused cross-entropy backend selection (levanter fused_cross_entropy_loss). None keeps the
     backend default (GPU: full-logits ``xla`` path). Set ``"batched_xla"`` to use the blocked-vocab
@@ -720,6 +724,7 @@ class MoEMLP(eqx.Module):
                 num_expert_waves=cfg.num_expert_waves,
                 token_blocks=cfg.moe_token_blocks,
                 gather_sum=cfg.moe_gather_sum,
+                flydsl_gather_a=cfg.moe_flydsl_gather_a,
             ),
             routed_moe=QBRoutedMoE(
                 num_experts_per_token=cfg.num_experts_per_token,

@@ -40,6 +40,7 @@ from levanter.grug._moe.common import (
 )
 from levanter.grug._moe.ep_common import _assignment_sources, _combine_gather_sum
 from levanter.grug._moe.ep_ring import _combine_rows, _dispatch_rows, _select_local_assignments
+from levanter.grug._moe.flydsl_gather import gathered_up_projection
 from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
 
 
@@ -64,6 +65,7 @@ def _moe_mlp_ep_ring_dedup_local(
     token_blocks: int,
     reduce_drops: bool = True,
     gather_sum: MoeGatherSum = "xla",
+    flydsl_gather_a: bool = False,
 ) -> tuple[Float[Array, "Tlocal H"], CapacityDrops]:
     """Deduplicated all-to-all dispatch, ring's grouped expert MLP, expert-side combine.
 
@@ -87,6 +89,11 @@ def _moe_mlp_ep_ring_dedup_local(
     ``gather_sum`` picks how the backward's expert-side dispatch gather-sum and sender-side combine gather run: XLA
     fusions ("xla") or the Pallas-Triton kernel of ``pallas_gather_sum`` ("pallas"), with the same results bit for bit.
     The token-side gathers stay on XLA, which fuses them with the residual stream.
+
+    ``flydsl_gather_a`` runs the up projection on the received rows through ``flydsl_gather.gathered_up_projection``:
+    the jax-flydsl GEMM gathers its A rows itself, so the expert-ordered copy ``x_dispatch`` is never built and the
+    received rows are what the remat policy saves. Same values and gradients bit for bit; needs ``ragged_dot``'s flydsl
+    implementation on GPU.
     """
     tokens = x_local.shape[0]
     local_experts = moe_w13_local.shape[0]
@@ -106,6 +113,7 @@ def _moe_mlp_ep_ring_dedup_local(
         capacity_factor=capacity_factor,
         transport_capacity_factor=transport_capacity_factor,
         gather_sum=gather_sum,
+        flydsl_gather_a=flydsl_gather_a,
     )
     if token_blocks == 1:
         out_local, sender_dropped, receiver_dropped = block(
@@ -149,6 +157,7 @@ def _ring_dedup_block(
     capacity_factor: float,
     transport_capacity_factor: float,
     gather_sum: MoeGatherSum,
+    flydsl_gather_a: bool,
 ) -> tuple[Float[Array, "T H"], Int[Array, ""], Int[Array, ""]]:
     """One block of tokens through the exchange: its output and its local sender and receiver drops."""
     tokens, topk = selected_experts_local.shape
@@ -247,13 +256,24 @@ def _ring_dedup_block(
             (group_sizes, picked, dispatch_valid, dispatch_row, position), _CHECKPOINT_ROUTING
         )
 
-        x_dispatch = _dispatch_rows(
-            received_x, jnp.minimum(dispatch_row, send_rows - 1), dispatch_valid, position, gather_sum
-        )
-        x_dispatch = tree_checkpoint_name(x_dispatch, _CHECKPOINT_DISPATCH_INPUT)
+        if flydsl_gather_a:
+            # The up projection reads the received rows through dispatch_row (sentinel send_rows reads zeros), so
+            # they, not an expert-ordered copy, are the saved dispatch input.
+            received_x = tree_checkpoint_name(received_x, _CHECKPOINT_DISPATCH_INPUT)
+        else:
+            x_dispatch = _dispatch_rows(
+                received_x, jnp.minimum(dispatch_row, send_rows - 1), dispatch_valid, position, gather_sum
+            )
+            x_dispatch = tree_checkpoint_name(x_dispatch, _CHECKPOINT_DISPATCH_INPUT)
 
     with jax.named_scope("moe_up_down"):
-        w13_out = tree_checkpoint_name(ragged_dot(x_dispatch, moe_w13_local, group_sizes), _CHECKPOINT_EXPERT_HIDDEN)
+        if flydsl_gather_a:
+            w13_out = gathered_up_projection(
+                received_x, dispatch_row, position, moe_w13_local, group_sizes, gather_sum
+            )
+        else:
+            w13_out = ragged_dot(x_dispatch, moe_w13_local, group_sizes)
+        w13_out = tree_checkpoint_name(w13_out, _CHECKPOINT_EXPERT_HIDDEN)
         moe_dim = moe_w2_local.shape[1]
         gate, up = jnp.split(w13_out, [moe_dim], axis=-1)
         out_dispatch = tree_checkpoint_name(

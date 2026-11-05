@@ -182,6 +182,13 @@ def parse_args() -> argparse.Namespace:
         "(GrugModelConfig.moe_gather_sum).",
     )
     parser.add_argument(
+        "--moe-flydsl-gather-a",
+        action="store_true",
+        help="ring_dedup with RAGGED_DOT_IMPL=flydsl only: gather the dispatch rows inside the up-projection GEMM "
+        "(forward and weight gradient) instead of building the expert-ordered copy; same results bit for bit "
+        "(GrugModelConfig.moe_flydsl_gather_a).",
+    )
+    parser.add_argument(
         "--ce-v-block-size",
         type=int,
         help="Vocabulary block of the fused cross-entropy (explicit block sizes, which skip batched_xla's forward "
@@ -375,6 +382,7 @@ def main() -> None:
         num_expert_waves=args.num_expert_waves,
         moe_token_blocks=args.moe_token_blocks,
         moe_gather_sum=args.moe_gather_sum,
+        moe_flydsl_gather_a=args.moe_flydsl_gather_a,
         ce_v_block_size=args.ce_v_block_size,
         scan_unroll=args.scan_unroll,
         replicated_grad_reduction=args.replicated_grads,
@@ -469,7 +477,7 @@ def main() -> None:
         "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d microbatches=%d "
         "overlap_last_microbatch=%s seq_len=%d "
         "window=%d mp=%s expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d "
-        "token_blocks=%d gather_sum=%s ce_v_block=%s remat=%s remat_prevent_cse=%s rms_norm_impl=%s "
+        "token_blocks=%d gather_sum=%s flydsl_gather_a=%s ce_v_block=%s remat=%s remat_prevent_cse=%s rms_norm_impl=%s "
         "replicated_grads=%s router_stats=%s capacity_drops=%s qb_threshold=%s router_diagnostics=%s "
         "skip_zero_router_z_loss=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
         "zero1=%s gather_in_first_microbatch=%s watch_interval=%d pipelined_step_logging=%s flops_per_example=%.4e",
@@ -495,6 +503,7 @@ def main() -> None:
         model.num_expert_waves,
         model.moe_token_blocks,
         model.moe_gather_sum,
+        model.moe_flydsl_gather_a,
         model.ce_v_block_size,
         args.remat_mode,
         model.remat_prevent_cse,

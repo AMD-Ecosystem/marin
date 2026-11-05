@@ -536,6 +536,7 @@ class MoEExpertMlp(eqx.Module):
     num_expert_waves: int = eqx.field(static=True, default=1)
     token_blocks: int = eqx.field(static=True, default=1)
     gather_sum: MoeGatherSum = eqx.field(static=True, default="xla")
+    flydsl_gather_a: bool = eqx.field(static=True, default=False)
 
     @staticmethod
     def init(
@@ -554,6 +555,7 @@ class MoEExpertMlp(eqx.Module):
         num_expert_waves: int = 1,
         token_blocks: int = 1,
         gather_sum: MoeGatherSum = "xla",
+        flydsl_gather_a: bool = False,
         pspecs: MoEExpertMlpPspecs = MoEExpertMlpPspecs(),
     ) -> "MoEExpertMlp":
         resolved_implementation = resolve_moe_implementation(implementation)
@@ -579,6 +581,7 @@ class MoEExpertMlp(eqx.Module):
             num_expert_waves=num_expert_waves,
             token_blocks=token_blocks,
             gather_sum=gather_sum,
+            flydsl_gather_a=flydsl_gather_a,
         )
 
     @named_call
@@ -612,6 +615,7 @@ class MoEExpertMlp(eqx.Module):
             num_expert_waves=self.num_expert_waves,
             token_blocks=self.token_blocks,
             gather_sum=self.gather_sum,
+            flydsl_gather_a=self.flydsl_gather_a,
         )
 
 
@@ -635,6 +639,7 @@ def moe_mlp(
     num_expert_waves: int = 1,
     token_blocks: int = 1,
     gather_sum: MoeGatherSum = "xla",
+    flydsl_gather_a: bool = False,
 ) -> Float[Array, "T D"] | tuple[Float[Array, "T D"], MoeDispatchCounts]:
     """Functional routed MoE MLP core used by Grug modules and benchmarks.
 
@@ -679,6 +684,10 @@ def moe_mlp(
 
     `gather_sum="pallas"` runs `ring_dedup`'s expert-side dispatch backward and sender-side combine backward row
     gathers in a Pallas-Triton kernel instead of XLA fusions, with the same results bit for bit (`ring_dedup` only).
+
+    `flydsl_gather_a=True` lets the jax-flydsl up-projection GEMM gather `ring_dedup`'s dispatch rows in its A loads
+    (forward and weight gradient) instead of building the expert-ordered copy, with the same results bit for bit
+    (`ring_dedup` with `ragged_dot`'s flydsl implementation only).
     """
     resolved_implementation = resolve_moe_implementation(implementation)
     if token_blocks < 1:
@@ -692,6 +701,8 @@ def moe_mlp(
         raise ValueError(
             f"gather_sum={gather_sum!r} requires ring_dedup, got implementation={resolved_implementation!r}"
         )
+    if flydsl_gather_a and resolved_implementation != "ring_dedup":
+        raise ValueError(f"flydsl_gather_a requires ring_dedup, got implementation={resolved_implementation!r}")
 
     if mesh is None:
         mesh = _current_mesh()
@@ -803,6 +814,7 @@ def moe_mlp(
                 token_blocks=token_blocks,
                 reduce_drops=not local_capacity_drops,
                 gather_sum=gather_sum,
+                flydsl_gather_a=flydsl_gather_a,
             )
         elif resolved_implementation == "ragged_all_to_all":
             shard_local_fn = _moe_mlp_ep_ragged_a2a_local
