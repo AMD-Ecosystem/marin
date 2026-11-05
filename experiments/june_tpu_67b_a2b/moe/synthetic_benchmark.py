@@ -289,6 +289,14 @@ def parse_args() -> argparse.Namespace:
         "compute copy, instead of at the end of the step.",
     )
     parser.add_argument(
+        "--expert-grad-accumulation",
+        choices=("xla", "flydsl"),
+        default="xla",
+        help="With --microbatches > 1: sum the expert weight gradients with an XLA float32 add after each microbatch's "
+        "layer scan (xla), or inside jax-flydsl's weight-gradient kernel, layer by layer in place (flydsl; ring_dedup "
+        "on an expert axis of 2+, bit-identical) (GrugTrainerConfig.expert_grad_accumulation).",
+    )
+    parser.add_argument(
         "--watch-interval", type=int, default=10, help="Steps between gradient watch steps (0 disables)."
     )
     parser.add_argument(
@@ -460,6 +468,7 @@ def main() -> None:
             zero1=args.zero1,
             overlap_last_microbatch=args.overlap_last_microbatch,
             gather_in_first_microbatch=args.gather_in_first_microbatch,
+            expert_grad_accumulation=args.expert_grad_accumulation,
             pipelined_step_logging=args.pipelined_step_logging,
         ),
         eval=None,
@@ -472,7 +481,8 @@ def main() -> None:
         "token_blocks=%d gather_sum=%s ce_v_block=%s remat=%s remat_prevent_cse=%s rms_norm_impl=%s "
         "replicated_grads=%s router_stats=%s capacity_drops=%s qb_threshold=%s router_diagnostics=%s "
         "skip_zero_router_z_loss=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
-        "zero1=%s gather_in_first_microbatch=%s watch_interval=%d pipelined_step_logging=%s flops_per_example=%.4e",
+        "zero1=%s gather_in_first_microbatch=%s expert_grad_accumulation=%s watch_interval=%d pipelined_step_logging=%s "
+        "flops_per_example=%.4e",
         args.size,
         model.num_layers,
         model.hidden_dim,
@@ -510,6 +520,7 @@ def main() -> None:
         args.carry_compute_params,
         args.zero1,
         args.gather_in_first_microbatch,
+        args.expert_grad_accumulation,
         args.watch_interval,
         args.pipelined_step_logging,
         flops_per_example,
