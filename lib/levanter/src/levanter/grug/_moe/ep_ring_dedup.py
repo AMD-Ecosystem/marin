@@ -96,7 +96,8 @@ def _moe_mlp_ep_ring_dedup_local(
 
     With ``grad_acc`` (this shard's block of an ``ExpertGradAccumulator``) the expert matmuls fold their weight
     gradients into it (``ragged_dot_accumulating_grad``), one token block after another, and the accumulator comes
-    back as a third output.
+    back as a third output. With several token blocks the float32 sums take each block's bf16 gradient in turn, where
+    XLA first adds the blocks' gradients in bf16, so the rounding differs; mode "final" needs one block.
     """
     tokens = x_local.shape[0]
     local_experts = moe_w13_local.shape[0]
@@ -123,9 +124,18 @@ def _moe_mlp_ep_ring_dedup_local(
         )
     else:
         block_tokens = tokens // token_blocks
+        acc_mode = None if grad_acc is None else grad_acc.mode
+        if acc_mode == "final":
+            # "final" reads the sums the earlier microbatches left, not the other blocks' gradients, so every block
+            # would add them again.
+            raise NotImplementedError("grad_acc mode 'final' (the overlapped last microbatch) needs token_blocks == 1")
         outputs, sender_drops, receiver_drops = [], [], []
         for i in range(token_blocks):
             rows = slice(i * block_tokens, (i + 1) * block_tokens)
+            if acc_mode == "init":
+                # The backward runs the blocks last to first: the last block's gradient writes the layer of the sums
+                # and the others add to it.
+                grad_acc = grad_acc.with_mode("init" if i == token_blocks - 1 else "accum")
             with jax.named_scope(f"token_block_{i}"):
                 out, sender, receiver, grad_acc = block(
                     x_local[rows],
@@ -137,6 +147,8 @@ def _moe_mlp_ep_ring_dedup_local(
             outputs.append(out)
             sender_drops.append(sender)
             receiver_drops.append(receiver)
+        if acc_mode is not None:
+            grad_acc = grad_acc.with_mode(acc_mode)
         out_local = jnp.concatenate(outputs, axis=0)
         sender_dropped = sum(sender_drops)
         receiver_dropped = sum(receiver_drops)
