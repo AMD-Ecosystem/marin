@@ -16,7 +16,7 @@ Implementation overview:
 
 from collections.abc import Callable
 from functools import partial
-from typing import cast
+from typing import Literal, cast
 
 import equinox as eqx
 import jax
@@ -73,6 +73,7 @@ from levanter.grug.sharding import (
     _value_spec_or_default,
     keep_reduced,
 )
+from levanter.kernels.pallas.kth_largest import kth_largest
 from levanter.utils.activation import ActivationFunctionEnum
 
 MOE_DROPPED_ASSIGNMENTS_METRIC = "moe/dropped_assignments"
@@ -80,6 +81,15 @@ MOE_SENDER_DROPPED_ASSIGNMENTS_METRIC = "moe/sender_dropped_assignments"
 MOE_RECEIVER_DROPPED_ASSIGNMENTS_METRIC = "moe/receiver_dropped_assignments"
 MOE_SKIPPED_PADDING_ASSIGNMENTS_METRIC = "moe/skipped_padding_assignments"
 MOE_VALID_ASSIGNMENTS_METRIC = "moe/valid_assignments"
+
+QbThresholdImpl = Literal["top_k", "radix_select"]
+RouterStats = Literal["all", "z_loss", "none"]
+"""Which routing statistics a QB layer computes: all of them (expert counts, router probability sums, entropy,
+load-balancing loss, router z-loss), only the router z-loss (what an aux loss needs), or none. The QB thresholds and
+capacity counts are always computed."""
+# Largest assignment count whose drop counts sum exactly in float32 (any order): they can then ride along with the
+# float32 expert counts in one reduction.
+_MAX_FLOAT32_EXACT_COUNT = 1 << 24
 
 
 def moe_routing_stats(
@@ -90,11 +100,20 @@ def moe_routing_stats(
     *,
     num_experts: int,
     num_experts_per_token: int,
+    stats: RouterStats = "all",
 ) -> dict[str, jax.Array]:
-    """Compute padding-aware routing distributions and auxiliary losses."""
-    router_probs_f = router_probs.astype(jnp.float32)
+    """Compute padding-aware routing distributions and auxiliary losses (only ``router_z_loss`` for ``stats="z_loss"``,
+    nothing for ``"none"``)."""
+    if stats == "none":
+        return {}
     router_logits_f = router_logits.astype(jnp.float32)
     valid_f = token_valid.astype(jnp.float32)
+    valid_tokens = jnp.maximum(jnp.sum(valid_f), 1.0)
+    log_partition = jsp.special.logsumexp(router_logits_f, axis=-1)
+    router_z_loss = jnp.sum(log_partition**2 * valid_f) / valid_tokens
+    if stats == "z_loss":
+        return {"router_z_loss": router_z_loss}
+    router_probs_f = router_probs.astype(jnp.float32)
     expert_counts = jnp.sum(
         jax.nn.one_hot(selected_experts, num_experts, dtype=jnp.float32) * valid_f[:, None, None],
         axis=(0, 1),
@@ -103,11 +122,8 @@ def moe_routing_stats(
     assignment_fraction = expert_counts / total_assignments
     routing_entropy = -jnp.sum(assignment_fraction * jnp.log(assignment_fraction + 1e-6))
     token_fraction = assignment_fraction * num_experts_per_token
-    valid_tokens = jnp.maximum(jnp.sum(valid_f), 1.0)
     mean_router_probability = jnp.sum(router_probs_f * valid_f[:, None], axis=0) / valid_tokens
     load_balancing_loss = num_experts * jnp.sum(token_fraction * mean_router_probability)
-    log_partition = jsp.special.logsumexp(router_logits_f, axis=-1)
-    router_z_loss = jnp.sum(log_partition**2 * valid_f) / valid_tokens
     return {
         "routing_counts": expert_counts,
         "routing_entropy": routing_entropy,
@@ -125,34 +141,37 @@ def moe_routing_stats_local(
     *,
     batch_axes: tuple[str, ...],
     num_experts: int,
+    stats: RouterStats = "all",
 ) -> dict[str, jax.Array]:
-    """Return shard-local routing metric sufficient statistics.
+    """Return shard-local routing metric sufficient statistics (see :data:`RouterStats` for ``stats``).
 
     Call :func:`reduce_moe_routing_stats` after stacking these outputs over
     layers to combine their cross-device reductions into one collective.
     """
+    if stats == "none":
+        return {}
 
     def _local(sel: jax.Array, probs: jax.Array, logits: jax.Array, valid: jax.Array) -> dict[str, jax.Array]:
         valid_f = valid.astype(jnp.float32)
-        counts = jnp.sum(jax.nn.one_hot(sel, num_experts, dtype=jnp.float32) * valid_f[:, None, None], axis=(0, 1))
         log_partition = jsp.special.logsumexp(logits.astype(jnp.float32), axis=-1)
-        return {
-            "routing_counts_local": counts[None, :],
-            "router_prob_sum_local": jnp.sum(probs.astype(jnp.float32) * valid_f[:, None], axis=0)[None, :],
+        out = {
             "router_z_sq_sum_local": jnp.sum(log_partition**2 * valid_f)[None],
             "valid_tokens_local": jnp.sum(valid_f)[None],
         }
+        if stats == "all":
+            counts = jnp.sum(jax.nn.one_hot(sel, num_experts, dtype=jnp.float32) * valid_f[:, None, None], axis=(0, 1))
+            out["routing_counts_local"] = counts[None, :]
+            out["router_prob_sum_local"] = jnp.sum(probs.astype(jnp.float32) * valid_f[:, None], axis=0)[None, :]
+        return out
 
+    out_specs = {"router_z_sq_sum_local": P(batch_axes), "valid_tokens_local": P(batch_axes)}
+    if stats == "all":
+        out_specs |= {"routing_counts_local": P(batch_axes, None), "router_prob_sum_local": P(batch_axes, None)}
     return shard_map(
         _local,
         mesh=mesh,
         in_specs=(P(batch_axes, None), P(batch_axes, None), P(batch_axes, None), P(batch_axes)),
-        out_specs={
-            "routing_counts_local": P(batch_axes, None),
-            "router_prob_sum_local": P(batch_axes, None),
-            "router_z_sq_sum_local": P(batch_axes),
-            "valid_tokens_local": P(batch_axes),
-        },
+        out_specs=out_specs,
     )(selected_experts, router_probs, router_logits, token_valid)
 
 
@@ -164,26 +183,46 @@ def reduce_moe_routing_stats(
 ) -> dict[str, jax.Array]:
     """Reduce scan-stacked routing metric partials after the layer scan.
 
-    ``qb_beta_local`` and ``qb_beta_weight_local`` are optionally reduced as
-    valid-token-weighted QB thresholds; histogram QB callers instead provide
-    an already-reduced ``qb_beta``.
+    Reduces whichever statistics the layers computed (:data:`RouterStats`). ``qb_beta_local`` and
+    ``qb_beta_weight_local`` are optionally reduced as valid-token-weighted QB thresholds; histogram QB callers
+    instead provide an already-reduced ``qb_beta``. ``capacity_drops_local`` ([L, S, 2] sender and receiver drops per
+    shard, from ``QBRoutedMoE(local_capacity_drops=True)``) becomes ``capacity_overflow`` and the two drop counts; in
+    float32 they are summed together with the expert counts, in one reduction, exactly.
     """
-    counts = jnp.sum(stacked["routing_counts_local"], axis=1)
-    prob_sum = jnp.sum(stacked["router_prob_sum_local"], axis=1)
-    z_sq_sum = jnp.sum(stacked["router_z_sq_sum_local"], axis=1)
-    valid_tokens = jnp.maximum(jnp.sum(stacked["valid_tokens_local"], axis=1), 1.0)
-    total_assignments = jnp.maximum(jnp.sum(counts, axis=-1, keepdims=True), 1.0)
-    assignment_fraction = counts / total_assignments
-    routing_entropy = -jnp.sum(assignment_fraction * jnp.log(assignment_fraction + 1e-6), axis=-1)
-    load_balancing_loss = num_experts * jnp.sum(
-        assignment_fraction * num_experts_per_token * (prob_sum / valid_tokens[:, None]), axis=-1
-    )
-    out = {
-        "routing_counts": counts,
-        "routing_entropy": routing_entropy,
-        "load_balancing_loss": load_balancing_loss,
-        "router_z_loss": z_sq_sum / valid_tokens,
-    }
+    out = {}
+    counts_local = stacked.get("routing_counts_local")
+    drops_local = stacked.get("capacity_drops_local")
+    drops = None
+    if drops_local is not None:
+        if (
+            counts_local is not None
+            and drops_local.dtype == jnp.float32
+            and drops_local.shape[:2] == counts_local.shape[:2]
+            and jax.typeof(drops_local).sharding.spec[:2] == jax.typeof(counts_local).sharding.spec[:2]
+        ):
+            both = jnp.sum(jnp.concatenate([counts_local, drops_local], axis=-1), axis=1)
+            counts, drops = both[..., :num_experts], both[..., num_experts:]
+            counts_local = None
+        else:
+            drops = jnp.sum(drops_local, axis=1)
+        drops = drops.astype(jnp.int32)
+        out["routing_sender_drops"] = drops[..., 0]
+        out["routing_receiver_drops"] = drops[..., 1]
+        out["capacity_overflow"] = (drops[..., 0] + drops[..., 1]).astype(jnp.float32)
+    if "valid_tokens_local" in stacked:
+        valid_tokens = jnp.maximum(jnp.sum(stacked["valid_tokens_local"], axis=1), 1.0)
+        out["router_z_loss"] = jnp.sum(stacked["router_z_sq_sum_local"], axis=1) / valid_tokens
+    if "router_prob_sum_local" in stacked:
+        if counts_local is not None:
+            counts = jnp.sum(counts_local, axis=1)
+        prob_sum = jnp.sum(stacked["router_prob_sum_local"], axis=1)
+        total_assignments = jnp.maximum(jnp.sum(counts, axis=-1, keepdims=True), 1.0)
+        assignment_fraction = counts / total_assignments
+        out["routing_counts"] = counts
+        out["routing_entropy"] = -jnp.sum(assignment_fraction * jnp.log(assignment_fraction + 1e-6), axis=-1)
+        out["load_balancing_loss"] = num_experts * jnp.sum(
+            assignment_fraction * num_experts_per_token * (prob_sum / valid_tokens[:, None]), axis=-1
+        )
     if "qb_beta_local" in stacked:
         qb_weights = stacked["qb_beta_weight_local"].astype(jnp.float32)
         out["qb_beta"] = jnp.sum(stacked["qb_beta_local"] * qb_weights[:, :, None], axis=1) / jnp.maximum(
@@ -206,12 +245,25 @@ def qb_beta_topk_shard(
     physical_count: int,
     num_experts_per_token: int,
     num_experts: int,
+    threshold_impl: QbThresholdImpl = "top_k",
 ) -> tuple[Float[Array, "E"], Int[Array, ""]]:
-    """Per-shard QB threshold over valid tokens plus the valid count that weights it."""
+    """Per-shard QB threshold over valid tokens plus the valid count that weights it.
+
+    Each expert's threshold is the ``logical_count``-th largest of its valid scores. ``threshold_impl="top_k"`` takes
+    it from ``jax.lax.top_k`` over ``physical_count`` values, which GPUs lower to a full sort of every row;
+    ``"radix_select"`` selects it with counting passes in one Pallas kernel (:func:`kth_largest`), the same float32
+    value (the sort orders -0.0 and +0.0 as equal, so where both occur at that rank it may return either zero).
+    """
     valid_count = jnp.sum(valid_local, dtype=jnp.int32)
-    topk_values, _ = jax.lax.top_k(jnp.where(valid_local[None, :], s_local.T, -jnp.inf), physical_count)
+    scores = jnp.where(valid_local[None, :], s_local.T, -jnp.inf)
     logical_count = jnp.clip(valid_count * num_experts_per_token // num_experts, 1, physical_count)
-    beta = jnp.take(topk_values, logical_count - 1, axis=1)
+    if threshold_impl == "top_k":
+        topk_values, _ = jax.lax.top_k(scores, physical_count)
+        beta = jnp.take(topk_values, logical_count - 1, axis=1)
+    elif threshold_impl == "radix_select":
+        beta = kth_largest(scores, logical_count)
+    else:
+        raise ValueError(f"unknown QB threshold_impl {threshold_impl!r}")
     return jnp.where(valid_count > 0, beta, 0), valid_count
 
 
@@ -223,6 +275,7 @@ def qb_beta_topk_local(
     batch_axes: tuple[str, ...],
     num_experts_per_token: int,
     num_experts: int,
+    threshold_impl: QbThresholdImpl = "top_k",
 ) -> tuple[Float[Array, "S E"], Int[Array, "S"]]:
     """Per-shard QB thresholds and their valid-token weights, one row per batch shard.
 
@@ -240,6 +293,7 @@ def qb_beta_topk_local(
             physical_count=physical_count,
             num_experts_per_token=num_experts_per_token,
             num_experts=num_experts,
+            threshold_impl=threshold_impl,
         )
         return beta[None, :], valid_count[None]
 
@@ -269,6 +323,7 @@ def estimate_qb_beta_topk(
     batch_axes: tuple[str, ...],
     num_experts_per_token: int,
     num_experts: int,
+    threshold_impl: QbThresholdImpl = "top_k",
 ) -> Float[Array, "E"]:
     """Estimate QB thresholds from valid tokens on each batch shard."""
     num_devices = 1
@@ -286,6 +341,7 @@ def estimate_qb_beta_topk(
             physical_count=physical_count,
             num_experts_per_token=num_experts_per_token,
             num_experts=num_experts,
+            threshold_impl=threshold_impl,
         )
         weighted_beta = jax.lax.psum(beta * valid_count, axis_name=batch_axes)
         global_valid_count = jax.lax.psum(valid_count, axis_name=batch_axes)
@@ -320,6 +376,15 @@ class QBRoutedMoE(eqx.Module):
     # Leading batch axes that index ``router_bias`` rows when it is [G, E]: per-group QB balancing, G the product of
     # these axes' sizes. Tokens are sharded over ``batch_axes`` in order, so these must be its first axes.
     bias_group_axes: tuple[str, ...] = eqx.field(static=True, default=())
+    # How the per-shard QB thresholds are selected (``qb_beta_topk_shard``): a full top_k sort, or an exact radix
+    # select. Both give the same thresholds.
+    qb_threshold_impl: QbThresholdImpl = eqx.field(static=True, default="top_k")
+    # Which routing statistics to compute (``RouterStats``); the QB thresholds and capacity counts are always computed.
+    router_stats: RouterStats = eqx.field(static=True, default="all")
+    # With ``local_stats``: return the capacity drops as per-shard counts (``capacity_drops_local``, [S, 2] sender and
+    # receiver drops) for ``reduce_moe_routing_stats`` to sum after the layer scan, instead of an all-reduce in every
+    # layer. Then ``capacity_overflow`` and the ``routing_*_drops`` counts come only from that reduction.
+    local_capacity_drops: bool = eqx.field(static=True, default=False)
 
     @named_call
     def __call__(
@@ -362,8 +427,14 @@ class QBRoutedMoE(eqx.Module):
             combine_weights *= self.routing_renorm_sum / (jnp.sum(combine_weights, axis=-1, keepdims=True) + 1e-9)
             combine_weights = combine_weights.astype(x.dtype)
 
+        if self.local_capacity_drops and not self.local_stats:
+            raise ValueError(
+                "local_capacity_drops needs local_stats (the drops are reduced with the other statistics)"
+            )
         with jax.named_scope("moe_router_stats"):
-            if self.local_stats:
+            if self.router_stats == "none":
+                router_stats = {}
+            elif self.local_stats:
                 token_spec = P(self.batch_axes, None)
                 router_stats = moe_routing_stats_local(
                     reshard(selected_experts, token_spec),
@@ -373,6 +444,7 @@ class QBRoutedMoE(eqx.Module):
                     mesh,
                     batch_axes=self.batch_axes,
                     num_experts=router.shape[1],
+                    stats=self.router_stats,
                 )
             else:
                 router_stats = moe_routing_stats(
@@ -382,6 +454,7 @@ class QBRoutedMoE(eqx.Module):
                     token_valid,
                     num_experts=router.shape[1],
                     num_experts_per_token=self.num_experts_per_token,
+                    stats=self.router_stats,
                 )
 
         with jax.named_scope("moe_qb_beta"):
@@ -391,6 +464,7 @@ class QBRoutedMoE(eqx.Module):
                 batch_axes=self.batch_axes,
                 num_experts_per_token=self.num_experts_per_token,
                 num_experts=router.shape[1],
+                threshold_impl=self.qb_threshold_impl,
             )
             if self.local_stats:
                 router_stats["qb_beta_local"], router_stats["qb_beta_weight_local"] = qb_beta_topk_local(
@@ -407,14 +481,21 @@ class QBRoutedMoE(eqx.Module):
                 token_valid=token_valid,
                 mesh=mesh,
                 report_capacity_overflow=report_capacity_overflow,
+                local_capacity_drops=self.local_capacity_drops,
             )
         if report_capacity_overflow:
             routed, dispatch_counts = cast(tuple[Float[Array, "T D"], MoeDispatchCounts], moe_out)
-            router_stats["capacity_overflow"] = dispatch_counts.dropped.astype(jnp.float32)
+            assignments = x.shape[0] * self.num_experts_per_token
             router_stats["skipped_assignments"] = dispatch_counts.padding_skipped.astype(jnp.float32)
-            router_stats["routing_assignments"] = jnp.asarray(x.shape[0] * self.num_experts_per_token, dtype=jnp.int32)
-            router_stats["routing_sender_drops"] = dispatch_counts.sender_dropped
-            router_stats["routing_receiver_drops"] = dispatch_counts.receiver_dropped
+            router_stats["routing_assignments"] = jnp.asarray(assignments, dtype=jnp.int32)
+            if self.local_capacity_drops:
+                drops = jnp.stack([dispatch_counts.sender_dropped, dispatch_counts.receiver_dropped], axis=-1)
+                exact_in_float = assignments <= _MAX_FLOAT32_EXACT_COUNT
+                router_stats["capacity_drops_local"] = drops.astype(jnp.float32 if exact_in_float else jnp.int32)
+            else:
+                router_stats["capacity_overflow"] = dispatch_counts.dropped.astype(jnp.float32)
+                router_stats["routing_sender_drops"] = dispatch_counts.sender_dropped
+                router_stats["routing_receiver_drops"] = dispatch_counts.receiver_dropped
         else:
             routed = cast(Float[Array, "T D"], moe_out)
             router_stats["capacity_overflow"] = jnp.zeros((), dtype=jnp.float32)
@@ -506,6 +587,7 @@ class MoEExpertMlp(eqx.Module):
         token_valid: Bool[Array, "T"] | None = None,
         mesh: jax.sharding.AbstractMesh | None = None,
         report_capacity_overflow: bool = False,
+        local_capacity_drops: bool = False,
     ) -> Float[Array, "T D"] | tuple[Float[Array, "T D"], MoeDispatchCounts]:
         w_gate_up = jnp.concatenate([self.w_gate, self.w_up], axis=-1)
         return moe_mlp(
@@ -521,6 +603,7 @@ class MoEExpertMlp(eqx.Module):
             capacity_factor=self.capacity_factor,
             pooled_transport_capacity_factor=self.pooled_transport_capacity_factor,
             report_capacity_overflow=report_capacity_overflow,
+            local_capacity_drops=local_capacity_drops,
             expert_chunks=self.expert_chunks,
             num_expert_waves=self.num_expert_waves,
             token_blocks=self.token_blocks,
@@ -542,6 +625,7 @@ def moe_mlp(
     capacity_factor: float = _DEFAULT_EP_CAPACITY_FACTOR,
     pooled_transport_capacity_factor: float | None = None,
     report_capacity_overflow: bool = False,
+    local_capacity_drops: bool = False,
     expert_chunks: int = 1,
     num_expert_waves: int = 1,
     token_blocks: int = 1,
@@ -570,7 +654,11 @@ def moe_mlp(
     weights exactly.
 
     Set `report_capacity_overflow=True` to also return sender and receiver
-    capacity drops plus padding-skipped assignment counts.
+    capacity drops plus padding-skipped assignment counts. With
+    `local_capacity_drops=True` the drop counts are not summed across the token
+    shards: each is an [S] array sharded over the token axes, one count per
+    shard, so the caller can defer that reduction (e.g. past a layer scan).
+    Expert-parallel calls support it only with `ring_dedup`.
 
     `expert_chunks` applies only to the local `sonic_cute` FSDP path. Values
     greater than one split the expert bank into equal, statically sized chunks.
@@ -588,6 +676,7 @@ def moe_mlp(
         raise ValueError(f"token_blocks must be positive, got {token_blocks}")
     if token_blocks > 1 and resolved_implementation != "ring_dedup":
         raise ValueError(f"token_blocks > 1 requires ring_dedup, got implementation={resolved_implementation!r}")
+    local_capacity_drops = local_capacity_drops and report_capacity_overflow
 
     if mesh is None:
         mesh = _current_mesh()
@@ -649,6 +738,8 @@ def moe_mlp(
             implementation=resolved_implementation,
             expert_chunks=expert_chunks,
         )
+        if local_capacity_drops:
+            dropped = dropped[None]
         if report_capacity_overflow:
             return out, dispatch_counts(
                 CapacityDrops(sender_dropped=dropped, receiver_dropped=jnp.zeros_like(dropped))
@@ -676,6 +767,10 @@ def moe_mlp(
             )
         if num_experts % expert_axis_size != 0:
             raise ValueError(f"num_experts={num_experts} must be divisible by expert axis size={expert_axis_size}")
+        if local_capacity_drops and resolved_implementation != "ring_dedup":
+            raise ValueError(
+                f"local_capacity_drops needs ring_dedup under expert parallelism, got {resolved_implementation!r}"
+            )
         if (
             resolved_implementation in _TRANSPORT_CAPACITY_MOE_IMPLEMENTATIONS
             and pooled_transport_capacity_factor is None
@@ -691,6 +786,7 @@ def moe_mlp(
                 _moe_mlp_ep_ring_dedup_local,
                 transport_capacity_factor=pooled_transport_capacity_factor,
                 token_blocks=token_blocks,
+                reduce_drops=not local_capacity_drops,
             )
         elif resolved_implementation == "ragged_all_to_all":
             shard_local_fn = _moe_mlp_ep_ragged_a2a_local
@@ -707,6 +803,7 @@ def moe_mlp(
         else:
             raise AssertionError(f"Unhandled MoE implementation {resolved_implementation!r}")
 
+        drops_spec = P(token_sharding_axes) if local_capacity_drops else P()
         w_up_gate_spec = keep_reduced(P("expert", None, None), w_up_gate)
         w_down_spec = keep_reduced(P("expert", None, None), w_down)
 
@@ -734,7 +831,7 @@ def moe_mlp(
                 w_up_gate_spec,
                 w_down_spec,
             ),
-            out_specs=(token_spec, CapacityDrops(sender_dropped=P(), receiver_dropped=P())),
+            out_specs=(token_spec, CapacityDrops(sender_dropped=drops_spec, receiver_dropped=drops_spec)),
             check_vma=False,
         )
         out, drops = shard_fn(x, selected_experts, combine_weights, token_valid, w_up_gate, w_down)
@@ -790,10 +887,17 @@ def moe_mlp(
             implementation=resolved_implementation,
             expert_chunks=expert_chunks,
         )
-        local_token_sharding_axes = _axis_names(x_spec[0])
+        if local_capacity_drops:
+            return out, dropped[None]
         if report_capacity_overflow and local_token_sharding_axes:
             dropped = jax.lax.psum(dropped, axis_name=local_token_sharding_axes)
         return out, dropped
+
+    local_token_sharding_axes = _axis_names(x_spec[0])
+    if local_capacity_drops:
+        drops_spec = P(local_token_sharding_axes) if local_token_sharding_axes else P(None)
+    else:
+        drops_spec = P()
 
     shard_fn = shard_map(
         local_moe,
@@ -806,7 +910,7 @@ def moe_mlp(
             w_up_gate_spec,
             w_down_spec,
         ),
-        out_specs=(x_spec, P()),
+        out_specs=(x_spec, drops_spec),
         check_vma=False,
     )
     out, dropped = shard_fn(x, selected_experts, combine_weights, token_valid, w_up_gate, w_down)
@@ -828,6 +932,8 @@ __all__ = [
     "MoeImplementation",
     "PspecAxis",
     "QBRoutedMoE",
+    "QbThresholdImpl",
+    "RouterStats",
     "moe_mlp",
     "moe_routing_stats",
     "moe_routing_stats_local",
