@@ -11,7 +11,7 @@ import dataclasses
 import functools
 import math
 from dataclasses import dataclass
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, get_args
 
 import equinox as eqx
 import jax
@@ -19,7 +19,7 @@ import jax.numpy as jnp
 from einops import rearrange
 from haliax.jax_utils import named_call
 from haliax.nn import ArrayStacked
-from jax import random
+from jax import random, shard_map
 from jax.sharding import PartitionSpec as P
 from jax.sharding import get_abstract_mesh, reshard
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
@@ -49,6 +49,8 @@ from levanter.grug.grug_moe import (
 from levanter.grug.loss import fused_linear_softmax_cross_entropy_loss
 from levanter.grug.sharding import Pembed_vocab, Plm_head, _mesh_axis_size, unshard
 from levanter.kernels.pallas.fused_cross_entropy_loss import BlockSizes
+from levanter.kernels.pallas.qk_norm_rope import positions_or_arange, qk_norm_rope, rope_tables
+from levanter.sharding import partition_spec_of
 from levanter.tracker.histogram import Histogram, SummaryStats
 from levanter.utils.activation import ActivationFunctionEnum
 
@@ -69,6 +71,10 @@ ATTENTION_REMAT_SAVE_NAME = "context"
 ScanReduction = Literal["per_layer", "after_scan"]
 QbBalance = Literal["global", "per_node"]
 RmsNormImpl = Literal["barrier", "custom_vjp", "custom_vjp_recompute"]
+QkNormRope = Literal["xla", "custom_vjp", "pallas"]
+AttentionSchedule = Literal["cond", "static", "all_short"]
+# The q/k head norm's epsilon (``rms_norm``'s default).
+_QK_NORM_EPS = 1e-6
 
 
 def _batch_spec() -> P:
@@ -240,6 +246,23 @@ class GrugModelConfig:
     """With ``router_z_loss_coef == 0``, leave the router z-loss out of the loss instead of adding 0 times it, so its
     backward does not run. Same loss and gradients (unless the z-loss is not finite, where 0 times it is NaN). Always
     the case without ``router_diagnostics``."""
+    qk_norm_rope: QkNormRope = "xla"
+    """How the attention normalizes, rotates and scales q and k per head. "xla" runs ``rms_norm`` (per
+    ``rms_norm_impl``), the half-RoPE rotation and the ``qk_mult`` scale as separate ops, which XLA splits into several
+    kernels per tensor and direction. "custom_vjp" and "pallas" compute all three in one function whose backward
+    recomputes the norm's statistic from the saved input (``levanter.kernels.pallas.qk_norm_rope``): in JAX ops under a
+    custom VJP, or in one Pallas-Triton kernel per direction (in the Pallas interpreter off GPU). They round where the
+    separate ops do and differ from "xla" only in how the float32 statistic is summed (about one bfloat16 ulp in a few
+    elements), whatever ``rms_norm_impl`` is."""
+    attention_schedule: AttentionSchedule = "cond"
+    """How the stacked layer scan picks each layer's attention (full causal on every 4th and the last layer, sliding
+    window elsewhere). "cond": a ``lax.cond`` on a scanned flag in every layer, whose branch XLA:GPU reads on the host
+    (one device-to-host sync per layer, forward, recomputed forward and backward). "static": the kinds are fixed at
+    trace time: the scan runs groups of ``LONG_ATTENTION_INTERVAL`` layers with the group unrolled, each layer's
+    weights a dynamic slice of the full [num_layers] stacks (no regrouped copies), and the remaining layers after it.
+    Same model. "all_short": every layer uses the sliding window and the long layers' options (PKO, no RoPE, extra
+    q scale) are not applied: a different model, only to time the cost of the conditional. Unstacked blocks always
+    branch at trace time ("cond" and "static" are the same there)."""
     rope: RotaryConfig = dataclasses.field(default_factory=RotaryConfig)
 
     @property
@@ -288,6 +311,10 @@ class GrugModelConfig:
             raise ValueError('qb_balance="per_node" needs router_stats_reduction="after_scan"')
         if self.capacity_drop_reduction == "after_scan" and self.router_stats_reduction != "after_scan":
             raise ValueError('capacity_drop_reduction="after_scan" needs router_stats_reduction="after_scan"')
+        if self.qk_norm_rope not in get_args(QkNormRope):
+            raise ValueError(f"unknown qk_norm_rope {self.qk_norm_rope!r}")
+        if self.attention_schedule not in get_args(AttentionSchedule):
+            raise ValueError(f"unknown attention_schedule {self.attention_schedule!r}")
 
     @property
     def inferred_head_dim(self) -> int:
@@ -413,6 +440,25 @@ def _apply_half_rope(
     return _apply(q), _apply(k)
 
 
+def _qk_head_norm(
+    x: Float[Array, "B S H D"], positions: jax.Array, *, cfg: GrugModelConfig, rope: bool, scales: tuple[float, ...]
+) -> Float[Array, "B S H D"]:
+    """``qk_norm_rope`` per ``cfg.qk_norm_rope``; the Pallas kernels run per device under ``shard_map``."""
+
+    def local(x, positions):
+        cos, sin = rope_tables(positions, x.shape[-1] // 4, cfg.rope.theta)
+        impl = "pallas" if cfg.qk_norm_rope == "pallas" else "custom_vjp"
+        return qk_norm_rope(x, cos, sin, eps=_QK_NORM_EPS, rope=rope, scales=scales, impl=impl)
+
+    mesh = get_abstract_mesh()
+    if cfg.qk_norm_rope != "pallas" or mesh is None or mesh.empty:
+        return local(x, positions)
+    x_spec, positions_spec = (P(*(*partition_spec_of(a), *(None,) * a.ndim)[: a.ndim]) for a in (x, positions))
+    return shard_map(local, mesh=mesh, in_specs=(x_spec, positions_spec), out_specs=x_spec, check_vma=False)(
+        x, positions
+    )
+
+
 class CausalSelfAttention(eqx.Module):
     w_q: Float[Array, "D NH"]
     w_k: Float[Array, "D MH"]
@@ -494,13 +540,21 @@ class CausalSelfAttention(eqx.Module):
             k = jnp.concatenate([k[..., :half], k_shifted], axis=-1)
 
         cfg = self.cfg
-        q = rms_norm(q, impl=cfg.rms_norm_impl)
-        k = rms_norm(k, impl=cfg.rms_norm_impl)
-        if not disable_rope:
-            # Half-RoPE: rotary embedding only on the first half of Q/K head_dim; the second half is rope-free
-            # on every layer.
-            q, k = _apply_half_rope(q, k, seq_len=seq_len, head_dim=head_dim, rope=cfg.rope, position_ids=position_ids)
-        q = q * cfg.qk_mult * qk_mult_scale
+        if cfg.qk_norm_rope == "xla":
+            q = rms_norm(q, impl=cfg.rms_norm_impl)
+            k = rms_norm(k, impl=cfg.rms_norm_impl)
+            if not disable_rope:
+                # Half-RoPE: rotary embedding only on the first half of Q/K head_dim; the second half is rope-free
+                # on every layer.
+                q, k = _apply_half_rope(
+                    q, k, seq_len=seq_len, head_dim=head_dim, rope=cfg.rope, position_ids=position_ids
+                )
+            q = q * cfg.qk_mult * qk_mult_scale
+        else:
+            positions = positions_or_arange(position_ids, seq_len)
+            rope = not disable_rope
+            q = _qk_head_norm(q, positions, cfg=cfg, rope=rope, scales=(cfg.qk_mult, qk_mult_scale))
+            k = _qk_head_norm(k, positions, cfg=cfg, rope=rope, scales=())
         attn_out = attention(q, k, v, mask, implementation=self.cfg.attention_implementation)
         # Half-RoPE's slice+concat on the head_dim axis can leave the explicit-mesh
         # propagator with ``model`` annotated on ``head_dim`` rather than
@@ -1033,24 +1087,32 @@ class Block(eqx.Module):
         position_ids: jax.Array | None = None,
     ) -> tuple[Float[Array, "B S D"], dict[str, jax.Array]]:
         attn_in = self.attn_gated_norm(self.rms_attn(x))
-        # lax.cond so the body has a uniform shape across scan iterations:
-        # long layers use the full causal mask (and may PKO / drop RoPE); short
-        # layers use the sliding-window mask, never PKO, and always RoPE.
-        attn_out = jax.lax.cond(
-            jnp.asarray(use_long_mask, dtype=jnp.bool_),
-            lambda _: self.attn(
+
+        # Long layers use the full causal mask (and may PKO / drop RoPE); short layers use the sliding-window mask,
+        # never PKO, and always RoPE.
+        def long_attention(_):
+            return self.attn(
                 attn_in,
                 long_mask,
                 use_pko=use_pko,
                 disable_rope=disable_long_rope,
                 qk_mult_scale=self.attn.cfg.qk_mult_long_scale,
                 position_ids=position_ids,
-            ),
-            lambda _: self.attn(
+            )
+
+        def short_attention(_):
+            return self.attn(
                 attn_in, short_mask, use_pko=False, disable_rope=False, qk_mult_scale=1.0, position_ids=position_ids
-            ),
-            operand=None,
-        )
+            )
+
+        if isinstance(use_long_mask, bool) and self.attn.cfg.attention_schedule != "cond":
+            attn_out = long_attention(None) if use_long_mask else short_attention(None)
+        else:
+            # lax.cond so the body has a uniform shape across scan iterations. XLA:GPU reads a traced predicate on the
+            # host, one sync per call.
+            attn_out = jax.lax.cond(
+                jnp.asarray(use_long_mask, dtype=jnp.bool_), long_attention, short_attention, operand=None
+            )
         x = x + attn_out
         mlp_in = self.mlp_gated_norm(self.rms_mlp(x))
         token_valid = token_validity_from_attention_mask(
@@ -1069,6 +1131,44 @@ def _long_layer_schedule(num_layers: int) -> jax.Array:
     """Bool[num_layers] = True for every 4th layer and the last layer."""
     idx = jnp.arange(num_layers)
     return ((idx % LONG_ATTENTION_INTERVAL) == LONG_ATTENTION_INTERVAL - 1) | (idx == num_layers - 1)
+
+
+def _is_long_layer(index: int, num_layers: int) -> bool:
+    return index % LONG_ATTENTION_INTERVAL == LONG_ATTENTION_INTERVAL - 1 or index == num_layers - 1
+
+
+def _layer_at(tree, index):
+    """Layer ``index`` of every [num_layers] stack in ``tree`` (a dynamic slice of each)."""
+    return jax.tree.map(lambda a: jax.lax.dynamic_index_in_dim(a, index, keepdims=False), tree)
+
+
+def _static_layer_scan(body, carry, *, num_layers: int, unroll: int, all_short: bool):
+    """Run ``carry, out = body(carry, index, use_long_mask)`` for every layer in order, with each layer's attention
+    kind a Python bool fixed at trace time instead of a scanned flag.
+
+    A scan runs ``num_layers // LONG_ATTENTION_INTERVAL`` groups (short, ..., short, long) with the group unrolled;
+    the remaining layers run after it. ``index`` is a traced layer index: ``body`` slices the layer's weights out of
+    the full [num_layers] stacks with it, so nothing is regrouped or copied. Returns the carry and the per-layer
+    outputs stacked in layer order. ``all_short`` makes every layer short.
+    """
+    period = LONG_ATTENTION_INTERVAL
+    groups = num_layers // period
+
+    def group_body(carry, group):
+        outputs = []
+        for j in range(period):
+            carry, out = body(carry, group * period + j, not all_short and j == period - 1)
+            outputs.append(out)
+        return carry, jax.tree.map(lambda *ys: jnp.stack(ys), *outputs)
+
+    outputs = []
+    if groups:
+        carry, grouped = jax.lax.scan(group_body, carry, jnp.arange(groups, dtype=jnp.int32), unroll=unroll)
+        outputs.append(jax.tree.map(lambda a: a.reshape(groups * period, *a.shape[2:]), grouped))
+    for index in range(groups * period, num_layers):
+        carry, out = body(carry, jnp.int32(index), not all_short and _is_long_layer(index, num_layers))
+        outputs.append(jax.tree.map(lambda a: a[None], out))
+    return carry, jax.tree.map(lambda *ys: jnp.concatenate(ys), *outputs)
 
 
 class Transformer(eqx.Module):
@@ -1199,8 +1299,7 @@ class Transformer(eqx.Module):
             num_blocks = len(self.blocks)
             moe_router_stats: list[dict[str, jax.Array]] = []
             for i, block in enumerate(self.blocks):
-                is_last = i == num_blocks - 1
-                is_long = i % LONG_ATTENTION_INTERVAL == LONG_ATTENTION_INTERVAL - 1 or is_last
+                is_long = _is_long_layer(i, num_blocks) and cfg.attention_schedule != "all_short"
                 use_pko = is_long and not cfg.disable_pko
                 hidden, router_stats = checkpoint(block)(
                     hidden, short_mask, long_mask, is_long, use_pko, cfg.disable_long_rope, position_ids
@@ -1236,16 +1335,56 @@ class Transformer(eqx.Module):
                     )
                 return (hidden_out, buffers), stats
 
+            def _static_layer(
+                carry: tuple[Float[Array, "B S D"], Block | None], index: jax.Array, use_long_mask: bool
+            ) -> tuple[tuple[Float[Array, "B S D"], Block | None], dict[str, jax.Array]]:
+                # Layer ``index`` of the stacks. The slices are taken inside the checkpoint, whose inputs are then the
+                # whole stacks (loop-invariant, so the backward reads them in place): sliced outside it, each layer's
+                # weights would be saved for the backward as a stacked copy.
+                carry_hidden, buffers = carry
+                layer_args = (carry_hidden, short_mask, long_mask, use_long_mask, False, cfg.disable_long_rope)
+
+                def apply(weights, offsets, sinks, index, *args):
+                    if offsets is None:
+                        return weights(*args)
+                    return _block_with_grad_offsets(weights, _layer_at(offsets, index), _layer_at(sinks, index), *args)
+
+                if block_gather_sinks is None:
+
+                    def apply_stacked(weights, offsets, sinks, index, *args):
+                        return apply(_layer_at(weights, index), offsets, sinks, index, *args)
+
+                    hidden_out, stats = checkpoint(apply_stacked)(
+                        stacked, block_grad_offsets, block_grad_sinks, index, *layer_args, position_ids
+                    )
+                else:
+                    layer, buffers = _apply_gathers(
+                        _layer_at(stacked, index), _layer_at(block_gather_sinks, index), buffers, index
+                    )
+                    hidden_out, stats = checkpoint(apply)(
+                        layer, block_grad_offsets, block_grad_sinks, index, *layer_args, position_ids
+                    )
+                return (hidden_out, buffers), stats
+
             stacked = self.stacked_blocks.stacked
             if cfg.replicated_grad_reduction == "after_scan":
                 stacked = _mark_reduced(stacked, cfg.replicated_grad_max_bytes)
             layer_indices = None if block_gather_sinks is None else jnp.arange(cfg.num_layers, dtype=jnp.int32)
-            (hidden, gathered_blocks), stacked_router_stats = jax.lax.scan(
-                _scan_layers,
-                (hidden, block_gather_buffers),
-                xs=(stacked, mask_schedule, block_grad_offsets, block_grad_sinks, block_gather_sinks, layer_indices),
-                unroll=cfg.scan_unroll,
-            )
+            if cfg.attention_schedule == "cond":
+                (hidden, gathered_blocks), stacked_router_stats = jax.lax.scan(
+                    _scan_layers,
+                    (hidden, block_gather_buffers),
+                    xs=(stacked, mask_schedule, block_grad_offsets, block_grad_sinks, block_gather_sinks, layer_indices),
+                    unroll=cfg.scan_unroll,
+                )
+            else:
+                (hidden, gathered_blocks), stacked_router_stats = _static_layer_scan(
+                    _static_layer,
+                    (hidden, block_gather_buffers),
+                    num_layers=cfg.num_layers,
+                    unroll=cfg.scan_unroll,
+                    all_short=cfg.attention_schedule == "all_short",
+                )
             if cfg.router_stats_reduction == "after_scan":
                 # One cross-device reduction for the whole layer stack (moe_routing_stats_local).
                 reduced_stats = reduce_moe_routing_stats(
