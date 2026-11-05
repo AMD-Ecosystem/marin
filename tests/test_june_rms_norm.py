@@ -1,14 +1,16 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""The June model's custom-VJP RMS norm (``rms_norm_impl="custom_vjp"``) against the optimization-barrier one.
+"""The June model's custom-VJP RMS norms (``rms_norm_impl="custom_vjp"`` and ``"custom_vjp_recompute"``) against the
+optimization-barrier one.
 
 Both compute the same float32 forward expression, ``x * rsqrt(mean(x^2) + eps)``, but the barrier keeps the reduction
 and its users in separate kernels, while without it XLA may fuse them (on CPU at d=2560 into one YNNPACK fusion), which
 rounds the reduction and ``rsqrt`` differently: the outputs differ by a few float32 ulps, at most one ulp after the cast
 to bfloat16. The custom VJP's backward uses the saved inverse RMS ``r`` and ``r^3`` where AD of the barrier path uses
 ``rsqrt``'s derivative ``-r / (2 (v + eps))``, so the gradients also agree to float32 rounding. Both paths are compared
-with a float64 reference, to which they are equally close.
+with a float64 reference, to which they are equally close. ``custom_vjp_recompute`` recomputes ``r`` in the backward
+from the saved ``x`` with the forward's expression instead of saving it, so its gradients agree to the same rounding.
 """
 
 import collections
@@ -23,9 +25,17 @@ import numpy as np
 import pytest
 from levanter.grug.sharding import compact_grug_mesh
 
-from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig, RMSNorm, Transformer, rms_norm, rms_normalize
+from experiments.june_tpu_67b_a2b.moe.model import (
+    GrugModelConfig,
+    RMSNorm,
+    Transformer,
+    rms_norm,
+    rms_normalize,
+    rms_normalize_recompute,
+)
 
 SHAPES = [(4, 16), (2, 8, 128), (2, 3, 4, 128), (3, 7, 2560)]
+CUSTOM_IMPLS = ["custom_vjp", "custom_vjp_recompute"]
 # Largest error of each path against the float64 reference, in units of the output dtype's epsilon times the
 # reference's largest magnitude.
 _EPS_MULTIPLE = {jnp.float32: 64, jnp.bfloat16: 2}
@@ -65,14 +75,15 @@ def _max_scaled_error(actual, expected):
     return float(np.max(np.abs(actual - expected)) / max(np.max(np.abs(expected)), 1e-30))
 
 
+@pytest.mark.parametrize("impl", CUSTOM_IMPLS)
 @pytest.mark.parametrize("eps", [1e-6, 1e-5])
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_custom_vjp_rms_norm_matches_the_barrier_rms_norm(dtype, shape, eps):
+def test_custom_vjp_rms_norm_matches_the_barrier_rms_norm(dtype, shape, eps, impl):
     x, g = _inputs(shape, dtype)
     run = jax.jit(_value_and_vjp, static_argnums=0)
     y_barrier, dx_barrier = run(lambda v: rms_norm(v, eps, impl="barrier"), x, g)
-    y_custom, dx_custom = run(lambda v: rms_norm(v, eps, impl="custom_vjp"), x, g)
+    y_custom, dx_custom = run(lambda v: rms_norm(v, eps, impl=impl), x, g)
     assert y_custom.dtype == y_barrier.dtype == dtype
     assert dx_custom.dtype == dx_barrier.dtype == dtype
     # Same forward expression; the barrier only changes which kernels compute it, and so the float32 rounding.
@@ -80,7 +91,7 @@ def test_custom_vjp_rms_norm_matches_the_barrier_rms_norm(dtype, shape, eps):
 
     tolerance = _EPS_MULTIPLE[dtype] * float(jnp.finfo(dtype).eps)
     y_ref, dx_ref, _ = _reference(x, g, eps)
-    for name, dx in (("barrier", dx_barrier), ("custom_vjp", dx_custom)):
+    for name, dx in (("barrier", dx_barrier), (impl, dx_custom)):
         assert _max_scaled_error(dx, dx_ref) <= tolerance, name
     assert _max_scaled_error(y_custom, y_ref) <= tolerance
     # The two gradients differ by float32 rounding, before the cast to the input dtype.
@@ -91,16 +102,19 @@ def test_custom_vjp_rms_norm_matches_the_barrier_rms_norm(dtype, shape, eps):
 def test_rms_normalize_is_float32_without_barriers():
     x = jnp.ones((2, 8), jnp.bfloat16)
     assert rms_normalize(x, 1e-6).dtype == jnp.float32
+    assert rms_normalize_recompute(x, 1e-6).dtype == jnp.float32
     barriers = {}
-    for impl in ("barrier", "custom_vjp"):
+    for impl in ("barrier", *CUSTOM_IMPLS):
         text = str(jax.make_jaxpr(jax.grad(lambda v, i=impl: jnp.sum(rms_norm(v, impl=i).astype(jnp.float32))))(x))
         barriers[impl] = text.count("optimization_barrier")
-    assert barriers["barrier"] > 0 and barriers["custom_vjp"] == 0, barriers
+    assert barriers == {"barrier": barriers["barrier"], "custom_vjp": 0, "custom_vjp_recompute": 0}
+    assert barriers["barrier"] > 0
 
 
+@pytest.mark.parametrize("impl", CUSTOM_IMPLS)
 @pytest.mark.parametrize("eps", [1e-6, 1e-5])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_custom_vjp_rms_norm_layer_matches_the_barrier_layer(dtype, eps):
+def test_custom_vjp_rms_norm_layer_matches_the_barrier_layer(dtype, eps, impl):
     # The weighted layer: the weight multiplies the float32 normalized activations outside the custom VJP, so its
     # gradient comes from AD in both paths.
     x, g = _inputs((2, 64, 256), dtype, seed=3)
@@ -116,14 +130,14 @@ def test_custom_vjp_rms_norm_layer_matches_the_barrier_layer(dtype, eps):
             return y, dx, dw
 
         y_barrier, dx_barrier, dw_barrier = jax.jit(run, static_argnums=0)("barrier")
-        y_custom, dx_custom, dw_custom = jax.jit(run, static_argnums=0)("custom_vjp")
+        y_custom, dx_custom, dw_custom = jax.jit(run, static_argnums=0)(impl)
     np.testing.assert_allclose(y_custom, y_barrier, rtol=_FORWARD_RTOL[dtype], atol=0)
     tolerance = _EPS_MULTIPLE[dtype] * float(jnp.finfo(dtype).eps)
     _, dx_ref, dw_ref = _reference(x, np.asarray(g.astype(dtype), np.float64), eps, weight)
-    for name, dx in (("barrier", dx_barrier), ("custom_vjp", dx_custom)):
+    for name, dx in (("barrier", dx_barrier), (impl, dx_custom)):
         assert _max_scaled_error(dx, dx_ref) <= tolerance, name
     # The weight gradient comes from AD in both paths; it differs only through the normalized activations' rounding.
-    for name, dw in (("barrier", dw_barrier), ("custom_vjp", dw_custom)):
+    for name, dw in (("barrier", dw_barrier), (impl, dw_custom)):
         assert _max_scaled_error(dw, dw_ref) <= 64 * float(jnp.finfo(jnp.float32).eps), name
 
 
@@ -168,14 +182,15 @@ _SMALL = GrugModelConfig(
 )
 
 
-def test_rms_norm_impl_reaches_every_norm():
+@pytest.mark.parametrize("impl", CUSTOM_IMPLS)
+def test_rms_norm_impl_reaches_every_norm(impl):
     with jax.set_mesh(compact_grug_mesh(expert_axis_size=1)):
-        model = Transformer.init(dataclasses.replace(_SMALL, rms_norm_impl="custom_vjp"), key=jax.random.key(0))
+        model = Transformer.init(dataclasses.replace(_SMALL, rms_norm_impl=impl), key=jax.random.key(0))
     leaves = jax.tree.leaves(model, is_leaf=lambda node: isinstance(node, RMSNorm))
     norms = [leaf for leaf in leaves if isinstance(leaf, RMSNorm)]
     # embed, final, and the stacked blocks' attention and MLP norms.
     assert len(norms) == 4
-    assert {norm.impl for norm in norms} == {"custom_vjp"}
+    assert {norm.impl for norm in norms} == {impl}
 
 
 @pytest.mark.parametrize("stacked", [True, False])
@@ -208,6 +223,10 @@ def test_custom_vjp_rms_norm_saves_no_more_residuals(remat_mode, stacked):
 
     for num_layers in (2, 4):
         barrier, custom = saved(num_layers, "barrier"), saved(num_layers, "custom_vjp")
+        recompute = saved(num_layers, "custom_vjp_recompute")
         assert custom <= barrier, num_layers
         activation, statistic = f"f32[{_BATCH_SHARDED_ROWS},8,16]", f"f32[{_BATCH_SHARDED_ROWS},8,1]"
         assert barrier - custom == collections.Counter({activation: 2, statistic: 2}), num_layers
+        # The recomputing VJP also drops the saved inverse RMS of the embedding and final norms.
+        assert custom - recompute == collections.Counter({statistic: 2}), num_layers
+        assert recompute <= custom, num_layers
