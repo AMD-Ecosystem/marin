@@ -1,7 +1,8 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""The June model's kernel options: ``ce_v_block_size``, ``moe_gather_sum`` and ``moe_routing_metadata``.
+"""The June model's kernel options: ``ce_v_block_size``, ``moe_gather_sum``, ``moe_routing_metadata`` and
+``moe_flydsl_gather_a``.
 
 An explicit fused cross-entropy vocabulary block changes only the summation order of the streamed logsumexp and of
 the gradient blocks, so the loss and the gradients match the backend's default block to float32 rounding. The Pallas
@@ -91,3 +92,17 @@ def test_moe_routing_metadata_reaches_every_expert_mlp(routing_metadata):
         model = Transformer.init(cfg, key=jax.random.key(0))
     mlps = [leaf for leaf in jax.tree.leaves(model, is_leaf=lambda n: isinstance(n, MoEMLP)) if isinstance(leaf, MoEMLP)]
     assert mlps and {mlp.expert_mlp.routing_metadata for mlp in mlps} == {routing_metadata}
+
+
+@pytest.mark.parametrize("flydsl_gather_a", [False, True])
+def test_moe_flydsl_gather_a_reaches_every_expert_mlp(flydsl_gather_a):
+    cfg = dataclasses.replace(
+        _SMALL,
+        moe_implementation="ring_filtered",
+        pooled_transport_capacity_factor=1.0,
+        moe_flydsl_gather_a=flydsl_gather_a,
+    )
+    with jax.set_mesh(compact_grug_mesh(expert_axis_size=1)):
+        model = Transformer.init(cfg, key=jax.random.key(0))
+    mlps = [leaf for leaf in jax.tree.leaves(model, is_leaf=lambda n: isinstance(n, MoEMLP)) if isinstance(leaf, MoEMLP)]
+    assert mlps and {mlp.expert_mlp.flydsl_gather_a for mlp in mlps} == {flydsl_gather_a}

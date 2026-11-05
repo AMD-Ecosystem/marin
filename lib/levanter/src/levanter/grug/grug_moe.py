@@ -546,6 +546,7 @@ class MoEExpertMlp(eqx.Module):
     token_blocks: int = eqx.field(static=True, default=1)
     gather_sum: MoeGatherSum = eqx.field(static=True, default="xla")
     routing_metadata: MoeRoutingMetadata = eqx.field(static=True, default="xla")
+    flydsl_gather_a: bool = eqx.field(static=True, default=False)
 
     @staticmethod
     def init(
@@ -565,6 +566,7 @@ class MoEExpertMlp(eqx.Module):
         token_blocks: int = 1,
         gather_sum: MoeGatherSum = "xla",
         routing_metadata: MoeRoutingMetadata = "xla",
+        flydsl_gather_a: bool = False,
         pspecs: MoEExpertMlpPspecs = MoEExpertMlpPspecs(),
     ) -> "MoEExpertMlp":
         resolved_implementation = resolve_moe_implementation(implementation)
@@ -591,6 +593,7 @@ class MoEExpertMlp(eqx.Module):
             token_blocks=token_blocks,
             gather_sum=gather_sum,
             routing_metadata=routing_metadata,
+            flydsl_gather_a=flydsl_gather_a,
         )
 
     @named_call
@@ -628,6 +631,7 @@ class MoEExpertMlp(eqx.Module):
             gather_sum=self.gather_sum,
             routing_metadata=self.routing_metadata,
             grad_acc=grad_acc,
+            flydsl_gather_a=self.flydsl_gather_a,
         )
 
 
@@ -653,6 +657,7 @@ def moe_mlp(
     gather_sum: MoeGatherSum = "xla",
     routing_metadata: MoeRoutingMetadata = "xla",
     grad_acc: ExpertGradAccumulator | None = None,
+    flydsl_gather_a: bool = False,
 ) -> Any:
     """Functional routed MoE MLP core used by Grug modules and benchmarks.
 
@@ -708,6 +713,9 @@ def moe_mlp(
     `ExpertGradAccumulator` with its layer set) folds the expert weight gradients into float32 sums of the stacked
     expert weights inside the jax-flydsl weight-gradient kernel (`ring_filtered` under expert parallelism only); the call
     then returns `(result, grad_acc)`, `result` being what it returns without it.
+    `flydsl_gather_a=True` lets the jax-flydsl up-projection GEMM gather `ring_filtered`'s dispatch rows in its A loads
+    (forward and weight gradient) instead of building the expert-ordered copy, with the same results bit for bit
+    (`ring_filtered` with `ragged_dot`'s flydsl implementation only).
     """
     resolved_implementation = resolve_moe_implementation(implementation)
     if token_blocks < 1:
@@ -727,6 +735,8 @@ def moe_mlp(
         raise ValueError(
             f"routing_metadata={routing_metadata!r} requires ring_filtered, got implementation={resolved_implementation!r}"
         )
+    if flydsl_gather_a and resolved_implementation != "ring_filtered":
+        raise ValueError(f"flydsl_gather_a requires ring_filtered, got implementation={resolved_implementation!r}")
 
     if mesh is None:
         mesh = _current_mesh()
@@ -848,6 +858,7 @@ def moe_mlp(
                 reduce_drops=not local_capacity_drops,
                 gather_sum=gather_sum,
                 routing_metadata=routing_metadata,
+                flydsl_gather_a=flydsl_gather_a,
             )
             if grad_acc is not None:
                 # The accumulator rides last, after the weights, as a keyword of the local function.

@@ -42,6 +42,7 @@ from levanter.grug._moe.common import (
 )
 from levanter.grug._moe.ep_common import _assignment_sources, _combine_gather_sum_impl
 from levanter.grug._moe.ep_ring import _combine_rows, _dispatch_rows, _select_local_assignments
+from levanter.grug._moe.flydsl_gather import gathered_up_projection
 from levanter.grug._moe.grad_accum import ExpertGradAccumulator, from_local_view, local_view
 from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
 from levanter.grug._moe.pallas_routing_metadata import MoeRoutingMetadata, expert_rows, send_slots
@@ -221,6 +222,7 @@ def _moe_mlp_ep_ring_filtered_local(
     reduce_drops: bool = True,
     gather_sum: MoeGatherSum = "xla",
     routing_metadata: MoeRoutingMetadata = "xla",
+    flydsl_gather_a: bool = False,
     grad_acc: ExpertGradAccumulator | None = None,
 ) -> (
     tuple[Float[Array, "Tlocal H"], CapacityDrops]
@@ -257,6 +259,11 @@ def _moe_mlp_ep_ring_filtered_local(
     gradients into it (``ragged_dot_accumulating_grad``), one token block after another, and the accumulator comes
     back as a third output. With several token blocks the float32 sums take each block's bf16 gradient in turn, where
     XLA first adds the blocks' gradients in bf16, so the rounding differs; mode "final" needs one block.
+
+    ``flydsl_gather_a`` runs the up projection on the received rows through ``flydsl_gather.gathered_up_projection``:
+    the jax-flydsl GEMM gathers its A rows itself, so the expert-ordered copy ``x_dispatch`` is never built and the
+    received rows are what the remat policy saves. Same values and gradients bit for bit; needs ``ragged_dot``'s flydsl
+    implementation on GPU.
     """
     tokens = x_local.shape[0]
     local_experts = moe_w13_local.shape[0]
@@ -277,6 +284,7 @@ def _moe_mlp_ep_ring_filtered_local(
         transport_capacity_factor=transport_capacity_factor,
         gather_sum=gather_sum,
         routing_metadata=routing_metadata,
+        flydsl_gather_a=flydsl_gather_a,
     )
     if token_blocks == 1:
         out_local, sender_dropped, receiver_dropped, grad_acc = block(
@@ -340,6 +348,7 @@ def _ring_filtered_block(
     transport_capacity_factor: float,
     gather_sum: MoeGatherSum,
     routing_metadata: MoeRoutingMetadata,
+    flydsl_gather_a: bool,
     grad_acc: ExpertGradAccumulator | None = None,
 ) -> tuple[Float[Array, "T H"], Int[Array, ""], Int[Array, ""], ExpertGradAccumulator | None]:
     """One block of tokens through the exchange: its output, its local sender and receiver drops, and ``grad_acc``
@@ -384,14 +393,23 @@ def _ring_filtered_block(
                 routing_metadata=routing_metadata,
             )
         )
-        x_dispatch = _dispatch_rows(
-            received_x, jnp.minimum(dispatch_row, send_rows - 1), dispatch_valid, position, gather_sum
-        )
-        x_dispatch = tree_checkpoint_name(x_dispatch, _CHECKPOINT_DISPATCH_INPUT)
+        if flydsl_gather_a:
+            # The up projection reads the received rows through dispatch_row (sentinel send_rows reads zeros), so
+            # they, not an expert-ordered copy, are the saved dispatch input.
+            received_x = tree_checkpoint_name(received_x, _CHECKPOINT_DISPATCH_INPUT)
+        else:
+            x_dispatch = _dispatch_rows(
+                received_x, jnp.minimum(dispatch_row, send_rows - 1), dispatch_valid, position, gather_sum
+            )
+            x_dispatch = tree_checkpoint_name(x_dispatch, _CHECKPOINT_DISPATCH_INPUT)
 
     with jax.named_scope("moe_up_down"):
         moe_dim = moe_w2_local.shape[1]
-        if grad_acc is None:
+        if flydsl_gather_a:
+            if grad_acc is not None:
+                raise NotImplementedError("flydsl_gather_a with grad_acc")
+            w13_out = gathered_up_projection(received_x, dispatch_row, position, moe_w13_local, group_sizes, gather_sum)
+        elif grad_acc is None:
             w13_out = ragged_dot(x_dispatch, moe_w13_local, group_sizes)
         else:
             w13_out, grad_acc = _accumulating_ragged_dot(x_dispatch, moe_w13_local, group_sizes, grad_acc, "w13")
