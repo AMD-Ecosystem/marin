@@ -9,8 +9,11 @@ be updated after the scan by a separate float32 add over the whole stack. ``Expe
 into the MoE instead: each layer's expert matmuls fold their weight gradient into that layer of the sums in the backward.
 """
 
+from typing import Any
+
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 from haliax.nn.ragged_dot import GradAccumulation
 
 
@@ -50,3 +53,16 @@ def local_view(x: jax.Array) -> jax.Array:
 
 def from_local_view(x: jax.Array) -> jax.Array:
     return x.reshape(x.shape[0], 1, *x.shape[1:])
+
+
+def accumulate_reference(dw: jax.Array, acc: Any, layer: jax.Array, mode: GradAccumulation) -> Any:
+    """jax-flydsl's ``grouped_gemm_bf16_wgrad_accum`` contract in XLA, for a bf16 weight gradient ``dw`` computed
+    elsewhere: "init"/"accum" set/add ``f32(dw)`` to layer ``layer`` of ``acc`` (one float32 array or two column
+    halves) and return it, "final" returns ``bf16(acc[layer] + f32(dw))``."""
+    dw = dw.astype(jnp.float32)
+    parts = tuple(acc) if isinstance(acc, (tuple, list)) else (acc,)
+    if mode == "final":
+        return (jnp.concatenate([p[layer] for p in parts], axis=-1) + dw).astype(jnp.bfloat16)
+    pieces = jnp.split(dw, len(parts), axis=-1)
+    new = tuple(p.at[layer].set(d) if mode == "init" else p.at[layer].add(d) for p, d in zip(parts, pieces))
+    return new if isinstance(acc, (tuple, list)) else new[0]

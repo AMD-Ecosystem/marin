@@ -1,13 +1,14 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""The June model's kernel options: ``ce_v_block_size``, ``moe_gather_sum``, ``moe_routing_metadata`` and
-``moe_flydsl_gather_a``.
+"""The June model's kernel options: ``ce_v_block_size``, ``moe_gather_sum``, ``moe_routing_metadata``,
+``moe_flydsl_gather_a`` and ``moe_scatter_epilogue``.
 
 An explicit fused cross-entropy vocabulary block changes only the summation order of the streamed logsumexp and of
 the gradient blocks, so the loss and the gradients match the backend's default block to float32 rounding. The Pallas
 gather-sum's numerics are tested in ``lib/levanter/tests/grug/test_pallas_gather_sum.py``, the routing-metadata kernels'
-in ``lib/levanter/tests/grug/test_pallas_routing_metadata.py``."""
+in ``lib/levanter/tests/grug/test_pallas_routing_metadata.py``, the scatter epilogue's in
+``lib/levanter/tests/grug/test_scatter_epilogue.py``."""
 
 import dataclasses
 
@@ -106,3 +107,17 @@ def test_moe_flydsl_gather_a_reaches_every_expert_mlp(flydsl_gather_a):
         model = Transformer.init(cfg, key=jax.random.key(0))
     mlps = [leaf for leaf in jax.tree.leaves(model, is_leaf=lambda n: isinstance(n, MoEMLP)) if isinstance(leaf, MoEMLP)]
     assert mlps and {mlp.expert_mlp.flydsl_gather_a for mlp in mlps} == {flydsl_gather_a}
+
+
+@pytest.mark.parametrize("scatter_epilogue", ["off", "flydsl"])
+def test_moe_scatter_epilogue_reaches_every_expert_mlp(scatter_epilogue):
+    cfg = dataclasses.replace(
+        _SMALL,
+        moe_implementation="ring_filtered",
+        pooled_transport_capacity_factor=1.0,
+        moe_scatter_epilogue=scatter_epilogue,
+    )
+    with jax.set_mesh(compact_grug_mesh(expert_axis_size=1)):
+        model = Transformer.init(cfg, key=jax.random.key(0))
+    mlps = [leaf for leaf in jax.tree.leaves(model, is_leaf=lambda n: isinstance(n, MoEMLP)) if isinstance(leaf, MoEMLP)]
+    assert mlps and {mlp.expert_mlp.scatter_epilogue for mlp in mlps} == {scatter_epilogue}

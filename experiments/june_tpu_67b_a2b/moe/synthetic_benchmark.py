@@ -49,6 +49,7 @@ from levanter.distributed import DistributedConfig
 from levanter.grug._moe.common import _TRANSPORT_CAPACITY_MOE_IMPLEMENTATIONS
 from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
 from levanter.grug._moe.pallas_routing_metadata import MoeRoutingMetadata
+from levanter.grug._moe.scatter_epilogue import MoeScatterEpilogue
 from levanter.grug.attention import GrugAttentionImplementation
 from levanter.grug.grug_moe import QbThresholdImpl
 from levanter.optim.config import AdamConfig
@@ -205,6 +206,14 @@ def parse_args() -> argparse.Namespace:
         help="ring_filtered with RAGGED_DOT_IMPL=flydsl only: gather the dispatch rows inside the up-projection GEMM "
         "(forward and weight gradient) instead of building the expert-ordered copy; same results bit for bit "
         "(GrugModelConfig.moe_flydsl_gather_a).",
+    )
+    parser.add_argument(
+        "--moe-scatter-epilogue",
+        choices=get_args(MoeScatterEpilogue),
+        default="off",
+        help="ring_filtered only: run the expert-side combine and dispatch backward as separate gathers (off) or as "
+        "row-scatter epilogues of jax-flydsl's grouped GEMMs plus a Pallas gather-sum of the other rows (flydsl), "
+        "with the same results bit for bit (GrugModelConfig.moe_scatter_epilogue).",
     )
     parser.add_argument(
         "--ce-v-block-size",
@@ -437,6 +446,7 @@ def main() -> None:
         moe_gather_sum=args.moe_gather_sum,
         moe_routing_metadata=args.moe_routing_metadata,
         moe_flydsl_gather_a=args.moe_flydsl_gather_a,
+        moe_scatter_epilogue=args.moe_scatter_epilogue,
         ce_v_block_size=args.ce_v_block_size,
         scan_unroll=args.scan_unroll,
         replicated_grad_reduction=args.replicated_grads,
@@ -532,8 +542,8 @@ def main() -> None:
         "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d microbatches=%d "
         "overlap_last_microbatch=%s seq_len=%d "
         "window=%d mp=%s expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d "
-        "token_blocks=%d gather_sum=%s routing_metadata=%s flydsl_gather_a=%s ce_v_block=%s remat=%s "
-        "remat_prevent_cse=%s rms_norm_impl=%s fused_norm_impl=%s qk_norm_rope=%s attention_schedule=%s "
+        "token_blocks=%d gather_sum=%s routing_metadata=%s flydsl_gather_a=%s scatter_epilogue=%s ce_v_block=%s "
+        "remat=%s remat_prevent_cse=%s rms_norm_impl=%s fused_norm_impl=%s qk_norm_rope=%s attention_schedule=%s "
         "replicated_grads=%s router_stats=%s capacity_drops=%s qb_threshold=%s router_diagnostics=%s "
         "skip_zero_router_z_loss=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
         "zero1=%s gather_in_first_microbatch=%s expert_grad_accumulation=%s watch_interval=%d pipelined_step_logging=%s "
@@ -562,6 +572,7 @@ def main() -> None:
         model.moe_gather_sum,
         model.moe_routing_metadata,
         model.moe_flydsl_gather_a,
+        model.moe_scatter_epilogue,
         model.ce_v_block_size,
         args.remat_mode,
         model.remat_prevent_cse,
