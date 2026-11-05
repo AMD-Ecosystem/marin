@@ -1009,6 +1009,96 @@ def _ragged_dot_flydsl_bwd(residuals, dout):
 _ragged_dot_flydsl_impl.defvjp(_ragged_dot_flydsl_fwd, _ragged_dot_flydsl_bwd)
 
 
+# How ``ragged_dot_accumulating_grad`` folds the weight gradient into a stacked float32 accumulator (see there).
+GradAccumulation: TypeAlias = Literal["init", "accum", "final"]
+
+
+def _flydsl_offsets(lhs: jax.Array, group_sizes: jax.Array) -> jax.Array:
+    return jnp.minimum(jnp.cumulative_sum(group_sizes.astype(jnp.int32), include_initial=True), lhs.shape[0])
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5,))
+def _ragged_dot_flydsl_accum_impl(lhs, rhs, group_sizes, acc, layer, mode):
+    return _flydsl_grouped_matmul(lhs, rhs, group_sizes), acc
+
+
+def _ragged_dot_flydsl_accum_fwd(lhs, rhs, group_sizes, acc, layer, mode):
+    return (_flydsl_grouped_matmul(lhs, rhs, group_sizes), acc), (lhs, rhs, group_sizes, layer)
+
+
+def _ragged_dot_flydsl_accum_bwd(mode, residuals, cotangents):
+    lhs, rhs, group_sizes, layer = residuals
+    dout, acc = cotangents
+    dlhs = _flydsl_grouped_matmul(dout, rhs, group_sizes, _DLHS_DIM_NUMS)
+    acc = _flydsl_grouped_gemm_ops().grouped_gemm_bf16_wgrad_accum(
+        lhs, dout, _flydsl_offsets(lhs, group_sizes), acc, layer, mode=mode
+    )
+    # The weight's gradient went into the accumulator.
+    return dlhs, None, None, acc, None
+
+
+_ragged_dot_flydsl_accum_impl.defvjp(_ragged_dot_flydsl_accum_fwd, _ragged_dot_flydsl_accum_bwd)
+
+
+@jax.custom_vjp
+def _ragged_dot_flydsl_final_impl(lhs, rhs, group_sizes, acc, layer):
+    return _flydsl_grouped_matmul(lhs, rhs, group_sizes)
+
+
+def _ragged_dot_flydsl_final_fwd(lhs, rhs, group_sizes, acc, layer):
+    return _flydsl_grouped_matmul(lhs, rhs, group_sizes), (lhs, rhs, group_sizes, acc, layer)
+
+
+def _ragged_dot_flydsl_final_bwd(residuals, dout):
+    lhs, rhs, group_sizes, acc, layer = residuals
+    dlhs = _flydsl_grouped_matmul(dout, rhs, group_sizes, _DLHS_DIM_NUMS)
+    drhs = _flydsl_grouped_gemm_ops().grouped_gemm_bf16_wgrad_accum(
+        lhs, dout, _flydsl_offsets(lhs, group_sizes), acc, layer, mode="final"
+    )
+    return dlhs, drhs, None, None, None
+
+
+_ragged_dot_flydsl_final_impl.defvjp(_ragged_dot_flydsl_final_fwd, _ragged_dot_flydsl_final_bwd)
+
+
+def ragged_dot_accumulating_grad(
+    lhs: jax.Array,
+    rhs: jax.Array,
+    group_sizes: jax.Array,
+    acc: jax.Array | tuple[jax.Array, jax.Array],
+    layer: jax.Array,
+    mode: GradAccumulation = "accum",
+):
+    """``ragged_dot(lhs, rhs, group_sizes, implementation="flydsl")`` whose backward folds the weight gradient into
+    layer ``layer`` of a stacked float32 accumulator inside the weight-gradient kernel, instead of returning it.
+
+    ``acc`` is float32 ``[L, G, K, N]`` (``rhs`` is ``[G, K, N]``), or two ``[L, G, K, N / 2]`` arrays holding the two
+    column halves of the gradient (``N / 2`` a multiple of 256), e.g. the gradients of two weights the caller
+    concatenated into ``rhs``. ``layer`` is an int32 scalar. ``mode``:
+
+    * ``"init"`` / ``"accum"``: returns ``(out, acc)``; the backward sets / adds ``bf16(dw)`` in float32 to
+      ``acc[layer]`` of the cotangent of the returned ``acc`` and returns that as the cotangent of ``acc``, updated in
+      place. ``rhs`` gets a zero cotangent. Thread ``acc`` through the computation and seed the cotangent of the final
+      ``acc`` with the running sum (``jax.vjp``): its cotangent is then the updated sum.
+    * ``"final"``: returns ``out``; ``acc`` is only read, and the cotangent of ``rhs`` is
+      ``bf16(acc[layer] + bf16(dw))``, the running sum including this gradient, in ``rhs``'s dtype.
+
+    Each mode is bit-identical to the bf16 gradient followed by the same float32 arithmetic in XLA. Only jax-flydsl
+    implements it; the operand limits of ``implementation="flydsl"`` apply.
+    """
+    _flydsl_grouped_gemm_ops()
+    _check_flydsl_operands(lhs, rhs, group_sizes)
+    rows = lhs.shape[0]
+    if rows % 512:
+        lhs = jax.lax.pad(lhs, jnp.zeros((), dtype=lhs.dtype), [(0, 512 - rows % 512, 0), (0, 0, 0)])
+    if mode == "final":
+        return _ragged_dot_flydsl_final_impl(lhs, rhs, group_sizes, acc, layer)[:rows]
+    if mode not in ("init", "accum"):
+        raise ValueError(f"mode must be one of {GradAccumulation.__args__}, got {mode!r}")
+    out, acc = _ragged_dot_flydsl_accum_impl(lhs, rhs, group_sizes, acc, layer, mode)
+    return out[:rows], acc
+
+
 def _ragged_dot_xla_impl(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array) -> jax.Array:
     out = jax.lax.ragged_dot_general(
         lhs=lhs,
@@ -1128,4 +1218,4 @@ def ragged_dot(
     return out
 
 
-__all__ = ["Implementation", "ragged_dot"]
+__all__ = ["GradAccumulation", "Implementation", "ragged_dot", "ragged_dot_accumulating_grad"]

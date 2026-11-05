@@ -25,11 +25,12 @@ matmuls. Capacities are per block, sized from the block's tokens.
 import functools
 import math
 from collections.abc import Callable
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
 from haliax.jax_utils import tree_checkpoint_name
-from haliax.nn.ragged_dot import ragged_dot
+from haliax.nn.ragged_dot import ragged_dot, ragged_dot_accumulating_grad
 from jaxtyping import Array, Bool, Float, Int
 
 from levanter.grug._moe.common import (
@@ -41,6 +42,7 @@ from levanter.grug._moe.common import (
 )
 from levanter.grug._moe.ep_common import _assignment_sources, _combine_gather_sum_impl
 from levanter.grug._moe.ep_ring import _combine_rows, _dispatch_rows, _select_local_assignments
+from levanter.grug._moe.grad_accum import ExpertGradAccumulator, from_local_view, local_view
 from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
 from levanter.grug._moe.pallas_routing_metadata import MoeRoutingMetadata, expert_rows, send_slots
 
@@ -114,25 +116,92 @@ def _down_project_combine_fwd(hidden, moe_w2, group_sizes, weights, inv, flat_id
     return out, (hidden, moe_w2, group_sizes, weights, inv, flat_idx)
 
 
-def _down_project_combine_bwd(residual, cotangent):
-    hidden, moe_w2, group_sizes, weights, inv, flat_idx = residual
+def _expert_row_cotangent(cotangent, weights, flat_idx, dtype):
+    """The cotangent of the down projection's rows ``y`` and each row's routing weight (zero for unread rows)."""
     num_rows, num_slots = weights.shape
     flat_valid = flat_idx < num_rows * num_slots
     safe_flat = jnp.minimum(flat_idx, num_rows * num_slots - 1)
     row_weight = jnp.where(flat_valid, weights.reshape(-1)[safe_flat].astype(jnp.float32), 0.0)
-    d_y = (cotangent[safe_flat // num_slots].astype(jnp.float32) * row_weight[:, None]).astype(hidden.dtype)
+    d_y = (cotangent[safe_flat // num_slots].astype(jnp.float32) * row_weight[:, None]).astype(dtype)
+    return d_y, row_weight
+
+
+def _routing_weight_grad(hidden, d_hidden, row_weight, weights, inv):
+    """``<hidden, dhidden> / w`` per row, in float32, gathered back to ``weights``' layout; a zero weight gets zero."""
+    weighted_score = jnp.sum(hidden.astype(jnp.float32) * d_hidden.astype(jnp.float32), axis=-1)
+    nonzero = row_weight != 0
+    row_score = jnp.where(nonzero, weighted_score / jnp.where(nonzero, row_weight, 1.0), 0.0)
+    return jnp.take(row_score, inv, mode="fill", fill_value=0).astype(weights.dtype)
+
+
+def _down_project_combine_bwd(residual, cotangent):
+    hidden, moe_w2, group_sizes, weights, inv, flat_idx = residual
+    d_y, row_weight = _expert_row_cotangent(cotangent, weights, flat_idx, hidden.dtype)
 
     _, down_vjp = jax.vjp(lambda h, w: ragged_dot(h, w, group_sizes), hidden, moe_w2)
     d_hidden, d_w2 = down_vjp(d_y)
 
-    weighted_score = jnp.sum(hidden.astype(jnp.float32) * d_hidden.astype(jnp.float32), axis=-1)
-    nonzero = row_weight != 0
-    row_score = jnp.where(nonzero, weighted_score / jnp.where(nonzero, row_weight, 1.0), 0.0)
-    d_weights = jnp.take(row_score, inv, mode="fill", fill_value=0).astype(weights.dtype)
+    d_weights = _routing_weight_grad(hidden, d_hidden, row_weight, weights, inv)
     return d_hidden, d_w2, None, d_weights, None, None
 
 
 _down_project_combine.defvjp(_down_project_combine_fwd, _down_project_combine_bwd)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(8,))
+def _down_project_combine_accumulating(
+    hidden: Float[Array, "M I"],
+    moe_w2: Float[Array, "Elocal I H"],
+    group_sizes: Int[Array, "Elocal"],
+    weights: Float[Array, "N J"],
+    inv: Int[Array, "N J"],
+    flat_idx: Int[Array, "M"],
+    acc: Float[Array, "L Elocal I H"],
+    layer: Int[Array, ""],
+    mode: str,
+):
+    """``_down_project_combine`` with the down projection as ``ragged_dot_accumulating_grad(..., acc, layer, mode)``:
+    the weight gradient goes into the accumulator as there, and the routing-weight gradient comes from the down
+    projection's backward as in ``_down_project_combine``, so the two paths match bit for bit. Returns the combined
+    rows, and with modes "init"/"accum" also the accumulator."""
+    return _down_project_combine_accumulating_fwd(
+        hidden, moe_w2, group_sizes, weights, inv, flat_idx, acc, layer, mode
+    )[0]
+
+
+def _down_project_combine_accumulating_fwd(hidden, moe_w2, group_sizes, weights, inv, flat_idx, acc, layer, mode):
+    out = ragged_dot_accumulating_grad(hidden, moe_w2, group_sizes, acc, layer, mode)
+    y = out if mode == "final" else out[0]
+    combined = _combine_gather_sum_impl(y, inv.reshape(-1), weights, y.dtype)
+    # "final" reads the accumulator in the backward; "init"/"accum" take it from the cotangent.
+    kept_acc = acc if mode == "final" else None
+    result = combined if mode == "final" else (combined, out[1])
+    return result, (hidden, moe_w2, group_sizes, weights, inv, flat_idx, kept_acc, layer)
+
+
+def _down_project_combine_accumulating_bwd(mode, residual, cotangent):
+    hidden, moe_w2, group_sizes, weights, inv, flat_idx, acc, layer = residual
+    if mode == "final":
+        out_cotangent = cotangent
+    else:
+        # The accumulator's cotangent carries the running sum; it also stands in for the primal, which the
+        # accumulating backward does not read.
+        out_cotangent, acc = cotangent
+    d_y, row_weight = _expert_row_cotangent(out_cotangent, weights, flat_idx, hidden.dtype)
+
+    _, down_vjp = jax.vjp(
+        lambda h, w, a: ragged_dot_accumulating_grad(h, w, group_sizes, a, layer, mode), hidden, moe_w2, acc
+    )
+    d_hidden, d_w2, d_acc = down_vjp(d_y if mode == "final" else (d_y, acc))
+
+    d_weights = _routing_weight_grad(hidden, d_hidden, row_weight, weights, inv)
+    # "final" only reads the accumulator, which gets no cotangent, as in ragged_dot_accumulating_grad.
+    return d_hidden, d_w2, None, d_weights, None, None, None if mode == "final" else d_acc, None
+
+
+_down_project_combine_accumulating.defvjp(
+    _down_project_combine_accumulating_fwd, _down_project_combine_accumulating_bwd
+)
 
 
 def _moe_mlp_ep_ring_filtered_local(
@@ -152,7 +221,11 @@ def _moe_mlp_ep_ring_filtered_local(
     reduce_drops: bool = True,
     gather_sum: MoeGatherSum = "xla",
     routing_metadata: MoeRoutingMetadata = "xla",
-) -> tuple[Float[Array, "Tlocal H"], CapacityDrops]:
+    grad_acc: ExpertGradAccumulator | None = None,
+) -> (
+    tuple[Float[Array, "Tlocal H"], CapacityDrops]
+    | tuple[Float[Array, "Tlocal H"], CapacityDrops, ExpertGradAccumulator]
+):
     """Filtered all-to-all dispatch, ring's grouped expert MLP, expert-side combine.
 
     The shard's tokens are split into ``token_blocks`` contiguous blocks, each dispatched, run and
@@ -179,6 +252,10 @@ def _moe_mlp_ep_ring_filtered_local(
     ``routing_metadata`` picks how the integer routing maps (send slots, expert rows, group sizes, drop counts) are
     built from the top-k expert ids: XLA fusions ("xla") or the Pallas-Triton counting sorts of
     ``pallas_routing_metadata`` ("pallas"), with the same values.
+
+    With ``grad_acc`` (this shard's block of an ``ExpertGradAccumulator``) the expert matmuls fold their weight
+    gradients into it (``ragged_dot_accumulating_grad``), one token block after another, and the accumulator comes
+    back as a third output.
     """
     tokens = x_local.shape[0]
     local_experts = moe_w13_local.shape[0]
@@ -201,8 +278,8 @@ def _moe_mlp_ep_ring_filtered_local(
         routing_metadata=routing_metadata,
     )
     if token_blocks == 1:
-        out_local, sender_dropped, receiver_dropped = block(
-            x_local, selected_experts_local, combine_weights_local, token_valid_local
+        out_local, sender_dropped, receiver_dropped, grad_acc = block(
+            x_local, selected_experts_local, combine_weights_local, token_valid_local, grad_acc=grad_acc
         )
     else:
         block_tokens = tokens // token_blocks
@@ -210,8 +287,12 @@ def _moe_mlp_ep_ring_filtered_local(
         for i in range(token_blocks):
             rows = slice(i * block_tokens, (i + 1) * block_tokens)
             with jax.named_scope(f"token_block_{i}"):
-                out, sender, receiver = block(
-                    x_local[rows], selected_experts_local[rows], combine_weights_local[rows], token_valid_local[rows]
+                out, sender, receiver, grad_acc = block(
+                    x_local[rows],
+                    selected_experts_local[rows],
+                    combine_weights_local[rows],
+                    token_valid_local[rows],
+                    grad_acc=grad_acc,
                 )
             outputs.append(out)
             sender_drops.append(sender)
@@ -221,12 +302,16 @@ def _moe_mlp_ep_ring_filtered_local(
         receiver_dropped = sum(receiver_drops)
 
     if not reduce_drops:
-        return out_local, CapacityDrops(
+        drops = CapacityDrops(
             sender_dropped=jnp.reshape(sender_dropped, (1,)), receiver_dropped=jnp.reshape(receiver_dropped, (1,))
         )
-    with jax.named_scope("combine"):
-        drops = jax.lax.psum(jnp.stack([sender_dropped, receiver_dropped]), token_sharding_axes)
-    return out_local, CapacityDrops(sender_dropped=drops[0], receiver_dropped=drops[1])
+    else:
+        with jax.named_scope("combine"):
+            reduced = jax.lax.psum(jnp.stack([sender_dropped, receiver_dropped]), token_sharding_axes)
+        drops = CapacityDrops(sender_dropped=reduced[0], receiver_dropped=reduced[1])
+    if grad_acc is None:
+        return out_local, drops
+    return out_local, drops, grad_acc
 
 
 def _ring_filtered_block(
@@ -243,8 +328,10 @@ def _ring_filtered_block(
     transport_capacity_factor: float,
     gather_sum: MoeGatherSum,
     routing_metadata: MoeRoutingMetadata,
-) -> tuple[Float[Array, "T H"], Int[Array, ""], Int[Array, ""]]:
-    """One block of tokens through the exchange: its output and its local sender and receiver drops."""
+    grad_acc: ExpertGradAccumulator | None = None,
+) -> tuple[Float[Array, "T H"], Int[Array, ""], Int[Array, ""], ExpertGradAccumulator | None]:
+    """One block of tokens through the exchange: its output, its local sender and receiver drops, and ``grad_acc``
+    with this block's expert weight gradients folded in (None without one)."""
     tokens, topk = selected_experts_local.shape
     hidden_dim = x_local.shape[1]
     local_experts = moe_w13_local.shape[0]
@@ -291,12 +378,35 @@ def _ring_filtered_block(
         x_dispatch = tree_checkpoint_name(x_dispatch, _CHECKPOINT_DISPATCH_INPUT)
 
     with jax.named_scope("moe_up_down"):
-        w13_out = tree_checkpoint_name(ragged_dot(x_dispatch, moe_w13_local, group_sizes), _CHECKPOINT_EXPERT_HIDDEN)
         moe_dim = moe_w2_local.shape[1]
+        if grad_acc is None:
+            w13_out = ragged_dot(x_dispatch, moe_w13_local, group_sizes)
+        else:
+            w13_out, grad_acc = _accumulating_ragged_dot(x_dispatch, moe_w13_local, group_sizes, grad_acc, "w13")
+        w13_out = tree_checkpoint_name(w13_out, _CHECKPOINT_EXPERT_HIDDEN)
         gate, up = jnp.split(w13_out, [moe_dim], axis=-1)
-        expert_combined = _down_project_combine(
-            activation_fn(gate) * up, moe_w2_local, group_sizes, received_weights, position, picked
-        )
+        hidden = activation_fn(gate) * up
+        if grad_acc is None:
+            expert_combined = _down_project_combine(
+                hidden, moe_w2_local, group_sizes, received_weights, position, picked
+            )
+        else:
+            expert_combined = _down_project_combine_accumulating(
+                hidden,
+                moe_w2_local,
+                group_sizes,
+                received_weights,
+                position,
+                picked,
+                local_view(grad_acc.w_down),
+                grad_acc.layer,
+                grad_acc.mode,
+            )
+            if grad_acc.mode != "final":
+                expert_combined, w_down = expert_combined
+                grad_acc = ExpertGradAccumulator(
+                    grad_acc.w_gate, grad_acc.w_up, from_local_view(w_down), grad_acc.layer, grad_acc.mode
+                )
 
     with jax.named_scope("combine"):
         returned = jax.lax.all_to_all(
@@ -307,7 +417,7 @@ def _ring_filtered_block(
             tiled=True,
         ).reshape(send_rows, hidden_dim)
         out_local = _combine_rows(returned, safe_source, slot_valid, slot, gather_sum).astype(x_local.dtype)
-    return out_local, sender_dropped, receiver_dropped
+    return out_local, sender_dropped, receiver_dropped, grad_acc
 
 
 def _send_routing(
@@ -444,3 +554,25 @@ def _expert_routing(
         (group_sizes, picked, dispatch_valid, dispatch_row, position), _CHECKPOINT_ROUTING
     )
     return received_weights, group_sizes, receiver_dropped, picked, dispatch_valid, dispatch_row, position
+
+def _accumulating_ragged_dot(
+    lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, grad_acc: ExpertGradAccumulator, which: str
+) -> tuple[jax.Array, ExpertGradAccumulator]:
+    """``ragged_dot`` of the up (``which="w13"``, ``rhs`` = w_gate | w_up) or down (``"w2"``) projection with its weight
+    gradient folded into this shard's block of ``grad_acc``."""
+    if which == "w13":
+        acc = (local_view(grad_acc.w_gate), local_view(grad_acc.w_up))
+    else:
+        acc = local_view(grad_acc.w_down)
+    result = ragged_dot_accumulating_grad(lhs, rhs, group_sizes, acc, grad_acc.layer, grad_acc.mode)
+    if grad_acc.mode == "final":
+        return cast(jax.Array, result), grad_acc
+    out, acc = cast(tuple[jax.Array, Any], result)
+    if which == "w13":
+        w_gate, w_up = acc
+        return out, ExpertGradAccumulator(
+            from_local_view(w_gate), from_local_view(w_up), grad_acc.w_down, grad_acc.layer, grad_acc.mode
+        )
+    return out, ExpertGradAccumulator(
+        grad_acc.w_gate, grad_acc.w_up, from_local_view(acc), grad_acc.layer, grad_acc.mode
+    )
