@@ -163,6 +163,10 @@ class GrugModelConfig:
     """How ``ring_dedup`` builds its integer routing maps from the top-k expert ids (send slots, expert rows, group
     sizes, drop counts): XLA fusions ("xla") or two Pallas-Triton counting-sort kernels per side ("pallas"). Both give
     the same values; off GPU the kernels run in the Pallas interpreter. Needs ``moe_implementation="ring_dedup"``."""
+    moe_flydsl_gather_a: bool = False
+    """Let ``ring_dedup``'s up-projection GEMM (forward and weight gradient) gather the dispatch rows in its A loads
+    instead of building the expert-ordered copy (F3). Same values bit for bit; needs ``moe_implementation="ring_dedup"``
+    and ``RAGGED_DOT_IMPL=flydsl`` on GPU (off GPU it runs the explicit gather)."""
     ce_implementation: str | None = None
     """Fused cross-entropy backend selection (levanter fused_cross_entropy_loss). None keeps the
     backend default (GPU: full-logits ``xla`` path). Set ``"batched_xla"`` to use the blocked-vocab
@@ -901,6 +905,7 @@ class MoEMLP(eqx.Module):
                 token_blocks=cfg.moe_token_blocks,
                 gather_sum=cfg.moe_gather_sum,
                 routing_metadata=cfg.moe_routing_metadata,
+                flydsl_gather_a=cfg.moe_flydsl_gather_a,
             ),
             routed_moe=QBRoutedMoE(
                 num_experts_per_token=cfg.num_experts_per_token,
