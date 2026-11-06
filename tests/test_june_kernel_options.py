@@ -1,8 +1,7 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""The June model's kernel options: ``ce_v_block_size``, ``ce_bwd_grad_x``, ``ce_bwd_weight_blocks``,
-``moe_gather_sum`` and ``moe_routing_metadata``.
+"""The June model's kernel options: ``ce_v_block_size``, ``moe_gather_sum`` and ``moe_routing_metadata``.
 
 An explicit fused cross-entropy vocabulary block changes only the summation order of the streamed logsumexp and of
 the gradient blocks, so the loss and the gradients match the backend's default block to float32 rounding. The Pallas
