@@ -73,6 +73,7 @@ RematMode = Literal["recompute_all", "save_moe", "save_moe_attn"]
 # saves the name keeps the backward from re-running the attention forward.
 ATTENTION_REMAT_SAVE_NAME = "context"
 ScanReduction = Literal["per_layer", "after_scan"]
+CeWeightGrad = Literal["stacked", "in_place"]
 QbBalance = Literal["global", "per_node"]
 RmsNormImpl = Literal["barrier", "custom_vjp", "custom_vjp_recompute"]
 FusedNormImpl = Literal["off", "xla", "pallas"]
@@ -185,6 +186,14 @@ class GrugModelConfig:
     default batch and hidden blocks (1024, 512). None lets the backend choose (``batched_xla`` autotunes its forward at
     startup; on MI355X it picks 1024). Explicit block sizes skip that autotune. On MI355X ``batched_xla``'s backward
     keeps its tuned 8192 block either way, so this sets only the forward there; elsewhere it sets both."""
+    ce_weight_grad: CeWeightGrad = "stacked"
+    """How the fused cross-entropy's ``batched_xla`` backward (GPU) produces the output projection's gradient.
+    "stacked": its vocab loop emits each block's gradient as a float32 ``[blocks, H, v_block]`` stack, transposed,
+    sliced and cast to ``[H, V]`` after the loop, from the projection padded to whole blocks. "in_place": each block's
+    gradient, already in the projection's dtype, is written into the ``[H, V]`` result inside the loop, and the last,
+    partial block is a narrower one instead of padding (implementation ``batched_xla_in_place_dw``, same block sizes and
+    gradients). At d=2560, V=128256 that is ~1.9 GiB less live through the layer backward. "in_place" needs
+    ``ce_implementation`` None or "batched_xla" and a GPU (``batched_xla`` refuses other backends)."""
     remat_mode: RematMode = "recompute_all"
     """Per-block gradient checkpointing. "recompute_all" reruns the whole block in
     backward (lowest memory); "save_moe" keeps the tagged MoE dispatch tensors so
@@ -331,6 +340,10 @@ class GrugModelConfig:
         validate_moe_implementation(self.moe_implementation)
         if self.ce_v_block_size is not None and self.ce_v_block_size <= 0:
             raise ValueError("ce_v_block_size must be positive")
+        if self.ce_weight_grad not in get_args(CeWeightGrad):
+            raise ValueError(f"unknown ce_weight_grad {self.ce_weight_grad!r}")
+        if self.ce_weight_grad == "in_place" and self.ce_implementation not in (None, "batched_xla"):
+            raise ValueError('ce_weight_grad="in_place" needs ce_implementation None or "batched_xla"')
         stacked_only = {
             "replicated_grad_reduction": self.replicated_grad_reduction,
             "router_stats_reduction": self.router_stats_reduction,
@@ -1213,6 +1226,65 @@ def _block_with_grad_offsets(layer: "Block", offsets: "Block", sinks: "Block | N
     return _apply_grad_offsets(layer, offsets, sinks, offsets_added)(*args)
 
 
+@jax.custom_vjp
+def _grad_into_sum(weight: jax.Array, total: jax.Array, index: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """``(weight, total)`` unchanged; the backward adds ``weight``'s gradient into layer ``index`` of ``total``'s.
+
+    ``weight`` is one layer of a stacked block weight marked ``reduced`` over some mesh axes, so its gradient is
+    ``unreduced`` over them. ``total`` is the float32 sum of that stack's gradients as ``unreduced_to_local(sum,
+    leading=1)``, ``[L, S, ...]``: one row per device along those axes. Threaded through the layer scan and
+    differentiated with its cotangent seeded with the running sum, the backward of the scan carries the sum and adds
+    each layer's gradient into its row of it, ``row + gradient.astype(float32)``, the arithmetic of the after-scan add;
+    ``weight``'s own gradient is zero, so no stacked per-microbatch gradient is built."""
+    del index
+    return weight, total
+
+
+def _grad_into_sum_fwd(weight, total, index):
+    return (weight, total), index
+
+
+def _grad_into_sum_bwd(index, cotangents):
+    weight_ct, total_ct = cotangents
+    gradient = unreduced_to_local(weight_ct).astype(total_ct.dtype)
+    # A one-row scatter-add (``row + gradient``) rather than a dynamic slice, add and dynamic-update-slice: XLA:GPU
+    # fuses a dynamic slice of the updated buffer into the in-place update only within one fusion, so the latter
+    # takes a separate read-add kernel; the scatter reads and writes the row in place in one.
+    total_ct = total_ct.at[index].add(gradient, indices_are_sorted=True, unique_indices=True, mode="promise_in_bounds")
+    return None, total_ct, None
+
+
+_grad_into_sum.defvjp(_grad_into_sum_fwd, _grad_into_sum_bwd)
+
+
+def _sum_block_grads(layer: "Block", sums: "Block", index: jax.Array) -> tuple["Block", "Block"]:
+    """Route the layer weights that have a sum in ``sums`` (a stacked ``Block`` of ``_grad_into_sum`` totals, None
+    elsewhere) through ``_grad_into_sum``: the layer, and the sums to carry to the next layer."""
+    totals, treedef = jax.tree.flatten(sums, is_leaf=lambda x: x is None)
+    weights = treedef.flatten_up_to(layer)
+    routed = [w if t is None else _grad_into_sum(w, t, index) for w, t in zip(weights, totals, strict=True)]
+    layer_out = treedef.unflatten([r if t is None else r[0] for r, t in zip(routed, totals, strict=True)])
+    sums_out = treedef.unflatten([None if t is None else r[1] for r, t in zip(routed, totals, strict=True)])
+    return layer_out, sums_out
+
+
+def _block_with_grad_sums(
+    layer: "Block",
+    sums: "Block",
+    index: jax.Array,
+    offsets: "Block | None",
+    sinks: "Block | None",
+    offsets_added: bool,
+    *args,
+):
+    """``layer`` applied to ``args`` with the weights in ``sums`` routed through ``_grad_into_sum`` and those in
+    ``offsets`` through ``_apply_grad_offsets``: the layer's outputs followed by the sums."""
+    layer, sums = _sum_block_grads(layer, sums, index)
+    if offsets is not None:
+        layer = _apply_grad_offsets(layer, offsets, sinks, offsets_added)
+    return (*layer(*args), sums)
+
+
 class Block(eqx.Module):
     rms_attn: RMSNorm
     attn_gated_norm: GatedNorm
@@ -1409,7 +1481,7 @@ class Transformer(eqx.Module):
         block_grad_offsets: "Block | None" = None,
         block_grad_sinks: "Block | None" = None,
     ) -> tuple[Float[Array, "B S D"], dict[str, jax.Array]]:
-        hidden, router_metrics, _, _ = self._forward(
+        hidden, router_metrics, *_ = self._forward(
             token_ids,
             mask,
             position_ids=position_ids,
@@ -1430,9 +1502,13 @@ class Transformer(eqx.Module):
         block_gather_sinks: "Block | None" = None,
         block_gather_buffers: "Block | None" = None,
         expert_grad_acc: ExpertGradAccumulator | None = None,
-    ) -> tuple[Float[Array, "B S D"], dict[str, jax.Array], "Block | None", ExpertGradAccumulator | None]:
+        block_grad_sums: "Block | None" = None,
+    ) -> tuple[
+        Float[Array, "B S D"], dict[str, jax.Array], "Block | None", ExpertGradAccumulator | None, "Block | None"
+    ]:
         """The final hidden states, the per-layer router metrics, ``block_gather_buffers`` holding the block weights
-        gathered by ``block_gather_sinks`` (None without them) and ``expert_grad_acc`` as the scan returns it.
+        gathered by ``block_gather_sinks`` (None without them), and ``expert_grad_acc`` and ``block_grad_sums`` as the
+        scan returns them.
 
         ``block_gather_sinks`` is a stacked ``Block`` with a zero "sink" for each weight to gather (None elsewhere): each
         layer of the scan all-gathers its slice of that weight, cast to the sink's dtype, to the sink's sharding just
@@ -1447,7 +1523,14 @@ class Transformer(eqx.Module):
         scan carries the sums, each layer returning them to the next, and returns them; differentiate with ``jax.vjp``,
         seeding the returned sums' cotangent with the running sums. In mode "final" every layer reads them, and with
         ``block_grad_offsets`` holding the same sums the expert weights' reductions take the gradients as they come,
-        sums already added."""
+        sums already added.
+
+        ``block_grad_sums`` (stacked layout only): a stacked ``Block`` holding, for some block weights (None elsewhere),
+        the float32 sums of their gradients over earlier microbatches as ``unreduced_to_local(sum, leading=1)``. The
+        scan carries them, and each layer routes its slice of those weights through ``_grad_into_sum``, so the
+        backward of the scan adds each layer's gradient into its row of the sums instead of stacking a per-microbatch
+        gradient. Differentiate with ``jax.vjp``, seeding the returned sums' cotangent with the running sums; the
+        weights' own gradients are zero. Not with ``block_gather_sinks``."""
         if (block_gather_sinks is None) != (block_gather_buffers is None):
             raise ValueError("block_gather_sinks and block_gather_buffers go together")
         if mask is None:
@@ -1478,6 +1561,8 @@ class Transformer(eqx.Module):
 
         gathered_blocks = None
         carried_acc = None
+        if block_grad_sums is not None and block_gather_sinks is not None:
+            raise ValueError("block_grad_sums does not go with block_gather_sinks")
         if expert_grad_acc is not None:
             if expert_grad_acc.mode == "final" and block_grad_offsets is None:
                 raise ValueError('expert_grad_acc mode "final" goes with block_grad_offsets (the same sums)')
@@ -1488,6 +1573,8 @@ class Transformer(eqx.Module):
                 raise ValueError("block_gather_sinks needs the stacked layer layout (use_array_stacked_blocks)")
             if expert_grad_acc is not None:
                 raise ValueError("expert_grad_acc needs the stacked layer layout (use_array_stacked_blocks)")
+            if block_grad_sums is not None:
+                raise ValueError("block_grad_sums needs the stacked layer layout (use_array_stacked_blocks)")
             num_blocks = len(self.blocks)
             moe_router_stats: list[dict[str, jax.Array]] = []
             for i, block in enumerate(self.blocks):
@@ -1507,10 +1594,13 @@ class Transformer(eqx.Module):
             mask_schedule = _long_layer_schedule(cfg.num_layers)
 
             def _scan_layers(
-                carry: tuple[Float[Array, "B S D"], Block | None, ExpertGradAccumulator | None],
+                carry: tuple[Float[Array, "B S D"], Block | None, ExpertGradAccumulator | None, Block | None],
                 scan_inputs: tuple[Block, Bool[Array, ""], Block | None, Block | None, Block | None, jax.Array | None],
-            ) -> tuple[tuple[Float[Array, "B S D"], Block | None, ExpertGradAccumulator | None], dict[str, jax.Array]]:
-                carry_hidden, buffers, acc = carry
+            ) -> tuple[
+                tuple[Float[Array, "B S D"], Block | None, ExpertGradAccumulator | None, Block | None],
+                dict[str, jax.Array],
+            ]:
+                carry_hidden, buffers, acc, sums = carry
                 layer, layer_use_long_mask, layer_grad_offsets, layer_grad_sinks, layer_gather_sinks, index = scan_inputs
                 if layer_gather_sinks is not None:
                     layer, buffers = _apply_gathers(layer, layer_gather_sinks, buffers, index)
@@ -1520,7 +1610,21 @@ class Transformer(eqx.Module):
                 if expert_grad_acc is not None:
                     layer_acc = (expert_grad_acc if acc is None else acc).at_layer(index)
                 acc_args = () if layer_acc is None else (layer_acc,)
-                if layer_grad_offsets is None:
+                if sums is not None:
+                    # The sums inside the checkpoint with the layer's slices; the backward needs only their cotangent.
+                    offsets_added = layer_acc is not None and layer_acc.mode == "final"
+                    hidden_out, stats, *acc_out, sums = checkpoint(_block_with_grad_sums)(
+                        layer,
+                        sums,
+                        index,
+                        layer_grad_offsets,
+                        layer_grad_sinks,
+                        offsets_added,
+                        *layer_args,
+                        position_ids,
+                        *acc_args,
+                    )
+                elif layer_grad_offsets is None:
                     hidden_out, stats, *acc_out = checkpoint(layer)(*layer_args, position_ids, *acc_args)
                 else:
                     # The reductions inside the checkpoint: its inputs are then the layer's own slices, which the
@@ -1533,17 +1637,20 @@ class Transformer(eqx.Module):
                     )
                 if acc is not None:
                     acc = acc_out[0].without_layer()
-                return (hidden_out, buffers, acc), stats
+                return (hidden_out, buffers, acc, sums), stats
 
             def _static_layer(
-                carry: tuple[Float[Array, "B S D"], Block | None, ExpertGradAccumulator | None],
+                carry: tuple[Float[Array, "B S D"], Block | None, ExpertGradAccumulator | None, Block | None],
                 index: jax.Array,
                 use_long_mask: bool,
-            ) -> tuple[tuple[Float[Array, "B S D"], Block | None, ExpertGradAccumulator | None], dict[str, jax.Array]]:
+            ) -> tuple[
+                tuple[Float[Array, "B S D"], Block | None, ExpertGradAccumulator | None, Block | None],
+                dict[str, jax.Array],
+            ]:
                 # Layer ``index`` of the stacks. The slices are taken inside the checkpoint, whose inputs are then the
                 # whole stacks (loop-invariant, so the backward reads them in place): sliced outside it, each layer's
                 # weights would be saved for the backward as a stacked copy.
-                carry_hidden, buffers, acc = carry
+                carry_hidden, buffers, acc, sums = carry
                 layer_args = (carry_hidden, short_mask, long_mask, use_long_mask, False, cfg.disable_long_rope)
                 # The expert gradient sums, as in ``_scan_layers``.
                 layer_acc = None
@@ -1559,7 +1666,16 @@ class Transformer(eqx.Module):
                         weights, _layer_at(offsets, index), _layer_at(sinks, index), offsets_added, *args
                     )
 
-                if block_gather_sinks is None:
+                if sums is not None:
+
+                    def apply_summed(weights, sums, offsets, sinks, index, *args):
+                        layer, sums = _sum_block_grads(_layer_at(weights, index), sums, index)
+                        return (*apply(layer, offsets, sinks, index, *args), sums)
+
+                    hidden_out, stats, *acc_out, sums = checkpoint(apply_summed)(
+                        stacked, sums, block_grad_offsets, block_grad_sinks, index, *layer_args, position_ids, *acc_args
+                    )
+                elif block_gather_sinks is None:
 
                     def apply_stacked(weights, offsets, sinks, index, *args):
                         return apply(_layer_at(weights, index), offsets, sinks, index, *args)
@@ -1576,25 +1692,25 @@ class Transformer(eqx.Module):
                     )
                 if acc is not None:
                     acc = acc_out[0].without_layer()
-                return (hidden_out, buffers, acc), stats
+                return (hidden_out, buffers, acc, sums), stats
 
             stacked = self.stacked_blocks.stacked
             if cfg.replicated_grad_reduction == "after_scan":
                 stacked = _mark_reduced(stacked, cfg.replicated_grad_max_bytes)
             layer_indices = None
-            if block_gather_sinks is not None or expert_grad_acc is not None:
+            if block_gather_sinks is not None or expert_grad_acc is not None or block_grad_sums is not None:
                 layer_indices = jnp.arange(cfg.num_layers, dtype=jnp.int32)
             if cfg.attention_schedule == "cond":
-                (hidden, gathered_blocks, carried_acc), stacked_router_stats = jax.lax.scan(
+                (hidden, gathered_blocks, carried_acc, block_grad_sums), stacked_router_stats = jax.lax.scan(
                     _scan_layers,
-                    (hidden, block_gather_buffers, carried_acc),
+                    (hidden, block_gather_buffers, carried_acc, block_grad_sums),
                     xs=(stacked, mask_schedule, block_grad_offsets, block_grad_sinks, block_gather_sinks, layer_indices),
                     unroll=cfg.scan_unroll,
                 )
             else:
-                (hidden, gathered_blocks, carried_acc), stacked_router_stats = _static_layer_scan(
+                (hidden, gathered_blocks, carried_acc, block_grad_sums), stacked_router_stats = _static_layer_scan(
                     _static_layer,
-                    (hidden, block_gather_buffers, carried_acc),
+                    (hidden, block_gather_buffers, carried_acc, block_grad_sums),
                     num_layers=cfg.num_layers,
                     unroll=cfg.scan_unroll,
                     all_short=cfg.attention_schedule == "all_short",
@@ -1615,7 +1731,7 @@ class Transformer(eqx.Module):
                 if name in stacked_router_stats
             }
         hidden = self._norm_and_gate(hidden, self.final_norm, self.final_gated_norm)
-        return hidden, router_metrics, gathered_blocks, carried_acc
+        return hidden, router_metrics, gathered_blocks, carried_acc, block_grad_sums
 
     def _norm_and_gate(self, x: jax.Array, norm: RMSNorm, gated: GatedNorm) -> jax.Array:
         if self.config.fused_norm_impl == "off":
@@ -1670,6 +1786,7 @@ class Transformer(eqx.Module):
         block_gather_sinks: "Block | None" = None,
         block_gather_buffers: "Block | None" = None,
         expert_grad_acc: ExpertGradAccumulator | None = None,
+        block_grad_sums: "Block | None" = None,
     ) -> "LossTerms":
         """The cross-entropy loss, the weighted router aux loss, the raw per-layer router metrics and the buffers
         holding the block weights gathered by ``block_gather_sinks`` (see ``_forward``).
@@ -1678,7 +1795,7 @@ class Transformer(eqx.Module):
         Callers that combine several batches, such as gradient accumulation, combine the raw metrics first and
         summarize once.
         """
-        hidden, router_metrics, gathered_blocks, expert_grad_acc = self._forward(
+        hidden, router_metrics, gathered_blocks, expert_grad_acc, block_grad_sums = self._forward(
             token_ids,
             mask,
             block_grad_offsets=block_grad_offsets,
@@ -1686,6 +1803,7 @@ class Transformer(eqx.Module):
             block_gather_sinks=block_gather_sinks,
             block_gather_buffers=block_gather_buffers,
             expert_grad_acc=expert_grad_acc,
+            block_grad_sums=block_grad_sums,
         )
         labels = jnp.concatenate([token_ids[:, 1:], token_ids[:, :1] * 0], axis=1).astype(jnp.int32)
         loss_weight = loss_weight.astype(loss_dtype)
@@ -1698,7 +1816,9 @@ class Transformer(eqx.Module):
             reduction=reduction,
             logsumexp_weight=logsumexp_weight,
             dtype=loss_dtype,
-            implementation=self.config.ce_implementation,
+            implementation=(
+                "batched_xla_in_place_dw" if self.config.ce_weight_grad == "in_place" else self.config.ce_implementation
+            ),
             block_sizes=(
                 None if self.config.ce_v_block_size is None else BlockSizes(v_block_size=self.config.ce_v_block_size)
             ),
@@ -1710,7 +1830,7 @@ class Transformer(eqx.Module):
             aux_loss = self.config.router_z_loss_coef * rzl
         else:
             aux_loss = jnp.zeros((), jnp.float32)
-        return LossTerms(cross_entropy_loss, aux_loss, router_metrics, gathered_blocks, expert_grad_acc)
+        return LossTerms(cross_entropy_loss, aux_loss, router_metrics, gathered_blocks, expert_grad_acc, block_grad_sums)
 
 
 class LossTerms(NamedTuple):
@@ -1723,6 +1843,8 @@ class LossTerms(NamedTuple):
     gathered_blocks: Block | None
     # The expert gradient sums as the layer scan returns them (``Transformer._forward``), in modes "init"/"accum".
     expert_grad_acc: ExpertGradAccumulator | None = None
+    # The block weight gradient sums as the layer scan returns them (``Transformer._forward``'s ``block_grad_sums``).
+    block_grad_sums: Block | None = None
 
 
 def router_token_validity(token_ids: Int[Array, "B S"], mask: AttentionMask | jax.Array | None) -> Bool[Array, "B S"]:

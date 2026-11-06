@@ -2823,3 +2823,84 @@ def test_xla_ce_packed_length_preserves_requested_gemm_rows(rows, backward_tile)
 
     row_counts = [int(rows) for rows in re.findall(r"tensor<(\d+)x8xf32>", hlo)]
     assert max(row_counts) < rows + 256
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("v_dim", [512, 456, 100])
+def test_batched_xla_in_place_streaming_backward_matches_stacked(dtype, v_dim):
+    """The in-place streaming backward writes each vocab block's weight gradient into the [H, V] result and pads only
+    the last, partial block; both gradients equal the stacked, padded backward's bit for bit (V a multiple of the
+    block, not one, and narrower than one block)."""
+    b_dim, h_dim, v_block = 64, 32, 128
+    kx, kw, kl, kg = jax.random.split(jax.random.key(3), 4)
+    x = jax.random.normal(kx, (b_dim, h_dim), jnp.float32).astype(dtype)
+    w = (0.2 * jax.random.normal(kw, (h_dim, v_dim), jnp.float32)).astype(dtype)
+    labels = jax.random.randint(kl, (b_dim,), 0, v_dim).at[3].set(-1)
+    logits = jnp.einsum("bh,hv->bv", x.astype(jnp.float32), w.astype(jnp.float32))
+    lse = jax.nn.logsumexp(logits, axis=-1)
+    g_loss = jax.random.uniform(kg, (b_dim,), jnp.float32)
+    g_lse = 0.1 * g_loss
+    kwargs = dict(v_block_size=v_block, logit_soft_cap=None, precision=None)
+
+    gx, gw = batched_xla._backward_streaming_from_lse(x, labels, w, lse, g_loss, g_lse, **kwargs)
+    gx_in_place, gw_in_place = batched_xla._backward_streaming_from_lse_in_place(
+        x, labels, w, lse, g_loss, g_lse, **kwargs
+    )
+
+    assert gx_in_place.dtype == gx.dtype and gw_in_place.dtype == gw.dtype == w.dtype
+    np.testing.assert_array_equal(np.asarray(gw_in_place, np.float32), np.asarray(gw, np.float32))
+    np.testing.assert_array_equal(np.asarray(gx_in_place, np.float32), np.asarray(gx, np.float32))
+
+
+def test_batched_xla_in_place_dw_implementation_matches_batched_xla(monkeypatch: pytest.MonkeyPatch):
+    """The "batched_xla_in_place_dw" implementation through the custom VJP: the loss and both gradients equal
+    "batched_xla"'s (the GPU input contract skipped so the streaming backward runs on CPU)."""
+    monkeypatch.setattr(batched_xla, "_validate_input_contract", lambda *args, **kwargs: None)
+    b_dim, h_dim, v_dim = 128, 32, 300
+    kx, kw, kl = jax.random.split(jax.random.key(4), 3)
+    x = jax.random.normal(kx, (b_dim, h_dim), jnp.float32).astype(jnp.bfloat16)
+    w = (0.2 * jax.random.normal(kw, (h_dim, v_dim), jnp.float32)).astype(jnp.bfloat16)
+    labels = jax.random.randint(kl, (b_dim,), 0, v_dim)
+    block_sizes = BlockSizes(b_block_size=128, h_block_size=16, v_block_size=128)
+
+    def loss(impl):
+        def fn(x_raw, w_raw):
+            per_example, lse = fused_api.IMPLEMENTATIONS[impl](x_raw, labels, w_raw, block_sizes=block_sizes)
+            return jnp.sum(per_example) + 0.01 * jnp.sum(lse**2)
+
+        return jax.value_and_grad(fn, argnums=(0, 1))(x, w)
+
+    value, (gx, gw) = loss("batched_xla")
+    value_in_place, (gx_in_place, gw_in_place) = loss("batched_xla_in_place_dw")
+    np.testing.assert_array_equal(np.asarray(value_in_place), np.asarray(value))
+    np.testing.assert_array_equal(np.asarray(gx_in_place, np.float32), np.asarray(gx, np.float32))
+    np.testing.assert_array_equal(np.asarray(gw_in_place, np.float32), np.asarray(gw, np.float32))
+
+
+def test_batched_xla_in_place_dw_takes_batched_xla_block_sizes(monkeypatch: pytest.MonkeyPatch):
+    """The alias resolves its block sizes as "batched_xla" (autotune under the "batched_xla" identity) and calls
+    the in-place variant."""
+    seen: dict[str, object] = {}
+
+    def fake_autotune(*, impl_name, fn, inferred, **_):
+        seen["impl_name"] = impl_name
+        seen["fn"] = fn
+        return BlockSizes(b_block_size=32, h_block_size=16, v_block_size=64)
+
+    def fake_impl(x, labels, w, *, block_sizes, **_):
+        seen["block_sizes"] = block_sizes
+        return jnp.zeros(x.shape[0], jnp.float32), jnp.zeros(x.shape[0], jnp.float32)
+
+    monkeypatch.setattr(fused_api, "_autotune_block_sizes_on_miss", fake_autotune)
+    monkeypatch.setattr(fused_api, "_implementation_matches_current_backend", lambda *a, **k: True)
+    monkeypatch.setattr(fused_api, "infer_block_sizes_with_tuned_match", lambda *a, **k: (BlockSizes(), False))
+    monkeypatch.setitem(fused_api.IMPLEMENTATIONS, "batched_xla_in_place_dw", fake_impl)
+    x = jnp.ones((64, 32), jnp.float32)
+    w = jnp.ones((32, 128), jnp.float32)
+    labels = jnp.zeros((64,), jnp.int32)
+    fused_api.fused_cross_entropy_loss_and_logsumexp_penalty(
+        x, labels, w, reduction="sum", implementation="batched_xla_in_place_dw"
+    )
+    assert seen["impl_name"] == "batched_xla"
+    assert seen["fn"] is fused_api.IMPLEMENTATIONS["batched_xla"]
+    assert seen["block_sizes"] == BlockSizes(b_block_size=32, h_block_size=16, v_block_size=64)

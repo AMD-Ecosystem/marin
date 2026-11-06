@@ -202,6 +202,19 @@ class GrugTrainerConfig:
     the stacked layer layout and the ``ring_filtered`` MoE on an expert axis of size two or more; the expert matmuls then
     run on jax-flydsl whatever ``RAGGED_DOT_IMPL`` says."""
 
+    block_grad_accumulation: Literal["after_scan", "in_scan"] = "after_scan"
+    """How ``microbatches`` > 1 sums the gradients of the stacked block weights other than those
+    ``expert_grad_accumulation="flydsl"`` sums in its kernel (all of them with "xla"): attention, shared expert, norms,
+    router. "after_scan": each microbatch's layer scan returns their bf16 gradients stacked over the layers, and a
+    float32 add after the scan adds them to the sums. "in_scan": the layer scan carries the float32 sums and its
+    backward adds each layer's gradient into that layer of them (``Transformer._forward``'s ``block_grad_sums``), so the
+    stacked per-microbatch gradient is never built; the arithmetic is the same, ``sum + gradient.astype(float32)``, bit
+    for bit. Applies to the loop's microbatches and, with ``overlap_last_microbatch``, the last one; the first
+    microbatch of ``gather_in_first_microbatch``, which starts the sums, keeps "after_scan" (carrying float32 sums
+    through it would hold more than its bf16 gradient) and converts its gradients to the float32 sums only after its
+    whole backward, so none of the sums (the output projection's in particular) is live during it. Needs
+    ``microbatches`` >= 2 and the stacked layer layout."""
+
     pipelined_step_logging: bool = False
     """Dispatch step N+1 before fetching step N's metrics, checking its loss and running its hooks and logging, so
     that host work runs while the devices compute the next step instead of between steps. The non-finite loss check
@@ -577,6 +590,7 @@ def _make_train_step(
     overlap_last_microbatch: bool = False,
     gather_in_first_microbatch: bool = False,
     expert_grad_accumulation: str = "xla",
+    block_grad_accumulation: str = "after_scan",
 ):
     if microbatches < 1:
         raise ValueError(f"microbatches must be at least 1, got {microbatches}")
@@ -584,6 +598,10 @@ def _make_train_step(
         raise ValueError(f"expert_grad_accumulation must be 'xla' or 'flydsl', got {expert_grad_accumulation!r}")
     if expert_grad_accumulation != "xla" and microbatches < 2:
         raise ValueError(f"expert_grad_accumulation={expert_grad_accumulation!r} needs microbatches >= 2")
+    if block_grad_accumulation not in ("after_scan", "in_scan"):
+        raise ValueError(f"block_grad_accumulation must be 'after_scan' or 'in_scan', got {block_grad_accumulation!r}")
+    if block_grad_accumulation != "after_scan" and microbatches < 2:
+        raise ValueError(f"block_grad_accumulation={block_grad_accumulation!r} needs microbatches >= 2")
     if zero1 and microbatches < 2:
         # With one microbatch the gradients are reduced in the backward, so zero1 would only add the all-gather.
         raise ValueError(f"zero1 needs microbatches >= 2, got {microbatches}")
@@ -631,6 +649,7 @@ def _make_train_step(
             block_gather_sinks=None,
             block_gather_buffers=None,
             expert_grad_acc=None,
+            block_grad_sums=None,
         ):
             return compute_params.next_token_loss_terms(
                 microbatch.tokens,
@@ -643,6 +662,7 @@ def _make_train_step(
                 block_gather_sinks=block_gather_sinks,
                 block_gather_buffers=block_gather_buffers,
                 expert_grad_acc=expert_grad_acc,
+                block_grad_sums=block_grad_sums,
             )
 
         gathered_blocks = None
@@ -660,6 +680,7 @@ def _make_train_step(
                 grad_shardings=qb_params,
                 gather_sources=qb_params if gather_in_first_microbatch else None,
                 expert_grad_accumulation=expert_grad_accumulation,
+                block_grad_accumulation=block_grad_accumulation,
             )
             grads = mp.cast_to_param(accumulated_grads)
         elif state.compute_params is None:
@@ -809,6 +830,7 @@ def _microbatched_loss_and_grads(
     grad_shardings: Transformer,
     gather_sources: Transformer | None = None,
     expert_grad_accumulation: str = "xla",
+    block_grad_accumulation: str = "after_scan",
 ) -> tuple[jax.Array, dict, Transformer, Block | None]:
     """Loss, summarized metrics and gradients of the whole ``batch``, one microbatch at a time, and the buffers the
     first microbatch gathered into (None without ``gather_sources``).
@@ -855,6 +877,13 @@ def _microbatched_loss_and_grads(
     differentiating with ``jax.vjp`` and seeding the returned sums' cotangent with the sums. With
     ``overlap_last_microbatch`` the last microbatch reads them ("final"): the kernel emits each layer's bf16 sum, which
     the layer's reduction takes as it is. The arithmetic is that of "xla" bit for bit.
+
+    With ``block_grad_accumulation="in_scan"`` the float32 sums of the other stacked block weights (all of them without
+    "flydsl"; ``_in_scan_summed``) are kept in the same ``[L, S, ...]`` layout and threaded through each microbatch's
+    layer scan as ``block_grad_sums``: its backward adds each layer's gradient into them in place, the microbatch
+    differentiating with ``jax.vjp`` and seeding the returned sums' cotangent with the sums (``_grads_into_sums``). The
+    first microbatch of ``gather_sources`` starts them as without it. In the last microbatch of
+    ``overlap_last_microbatch`` the weights it reduces per layer take theirs as offsets, the others carry theirs.
     """
     batch_size = batch.tokens.shape[0]
     batch_shards = _batch_shards(get_abstract_mesh())
@@ -898,13 +927,44 @@ def _microbatched_loss_and_grads(
             terms.router_metrics,
         )
 
+    in_scan = block_grad_accumulation == "in_scan"
+    if in_scan and params.stacked_blocks is None:
+        raise ValueError("block_grad_accumulation='in_scan' needs the stacked layer layout (use_array_stacked_blocks)")
+    in_scan_flags = _in_scan_summed(params, in_kernel) if in_scan else None
+
+    def loss_and_terms_into_block_sums(p, sums, acc, microbatch, token_share):
+        terms = loss_terms_fn(p, microbatch, expert_grad_acc=acc, block_grad_sums=sums)
+        cross_entropy_loss = terms.cross_entropy_loss / loss_denominator
+        aux_loss = token_share * terms.aux_loss
+        return (cross_entropy_loss + aux_loss, (terms.block_grad_sums, terms.expert_grad_acc)), (
+            cross_entropy_loss,
+            aux_loss,
+            terms.router_metrics,
+        )
+
     def body(carry, xs):
         grad_sum, loss_sum, cross_entropy_sum, aux_sum = carry
         microbatch, token_share = xs
         # When XLA unrolls this loop, the barrier keeps each microbatch after the previous one's gradients are summed,
         # so only one per-microbatch gradient tree is live at a time.
         grad_sum, microbatch, token_share = jax.lax.optimization_barrier((grad_sum, microbatch, token_share))
-        if in_kernel:
+        if in_scan:
+            loss, (cross_entropy_loss, aux_loss, router_metrics), grads, sums, expert_sums = _grads_into_sums(
+                lambda p, sums, acc: loss_and_terms_into_block_sums(p, sums, acc, microbatch, token_share),
+                (marked_params,),
+                _block_sums(grad_sum, in_scan_flags),
+                _expert_sums(grad_sum) if in_kernel else None,
+                "accum",
+            )
+            # The summed weights' (and with in_kernel the expert weights') own gradients are zero: skip them.
+            skipped = _with_expert(in_scan_flags, (True,) * len(_EXPERT_WEIGHTS)) if in_kernel else in_scan_flags
+            grad_sum = jax.tree.map(
+                lambda acc, g, skip: acc if skip else acc + g.astype(jnp.float32), grad_sum, grads[0], skipped
+            )
+            grad_sum = _with_block_sums(grad_sum, sums, in_scan_flags)
+            if in_kernel:
+                grad_sum = _with_expert(grad_sum, expert_sums)
+        elif in_kernel:
             loss, (cross_entropy_loss, aux_loss, router_metrics), grads, sums = _grads_into_expert_sums(
                 lambda p, acc: loss_and_terms_into_sums(p, acc, microbatch, token_share),
                 (marked_params,),
@@ -927,6 +987,8 @@ def _microbatched_loss_and_grads(
     init_sums = jax.tree.map(_zero_accumulator, marked_params)
     if in_kernel:
         init_sums = _with_expert(init_sums, tuple(unreduced_to_local(x, leading=1) for x in _expert_sums(init_sums)))
+    if in_scan:
+        init_sums = _block_sums_to_local(init_sums, in_scan_flags)
     init = (init_sums, zero, zero, zero)
     head = (split_batch, token_shares)
     if overlap_last_microbatch:
@@ -1003,9 +1065,15 @@ def _microbatched_loss_and_grads(
         if in_kernel:
             # The expert weights' gradients went into the sums; their sinks carried zeros.
             first_grads = _without_expert(first_grads)
+        if in_scan:
+            # Start the float32 sums only once the whole backward is done: converted as each gradient comes out (the
+            # output projection's right after the cross-entropy), they would be live through the layer backward.
+            first_grads = jax.lax.optimization_barrier(first_grads)
         accumulators = jax.tree.map(lambda g: g.astype(jnp.float32) if isinstance(g, jax.Array) else g, first_grads)
         if in_kernel:
             accumulators = _with_expert(accumulators, first_sums)
+        if in_scan:
+            accumulators = _block_sums_to_local(accumulators, in_scan_flags)
         init = (accumulators, first_loss, first_ce, first_aux)
     if jax.tree.leaves(head)[0].shape[0] > 0:
         (grad_sum, loss, cross_entropy_loss, aux_loss), stacked_router_metrics = jax.lax.scan(body, init, head)
@@ -1021,6 +1089,8 @@ def _microbatched_loss_and_grads(
         router_metrics = _combine_microbatch_router_metrics(stacked_router_metrics, token_shares)
         if in_kernel:
             grad_sum = _with_expert(grad_sum, tuple(local_to_unreduced(x, leading=1) for x in _expert_sums(grad_sum)))
+        if in_scan:
+            grad_sum = _block_sums_from_local(grad_sum, in_scan_flags)
         grads = jax.tree.map(_finalize_accumulated_grad, grad_sum, params, grad_shardings)
         return loss, summarize_loss_metrics(router_metrics, cross_entropy_loss, aux_loss), grads, gathered_blocks
 
@@ -1047,6 +1117,15 @@ def _microbatched_loss_and_grads(
             stacked=True,
         )
         last_acc = ExpertGradAccumulator(*_expert_sums(grad_sum), mode="final")
+    elif in_scan:
+        # The in-scan sums are already in the offsets' layout.
+        offsets = jax.tree.map(
+            lambda acc, pl, sm: (acc if sm else unreduced_to_local(acc, leading=1)) if pl else None,
+            grad_sum.stacked_blocks.stacked,
+            per_layer.stacked_blocks.stacked,
+            in_scan_flags.stacked_blocks.stacked,
+        )
+        last_acc = None
     else:
         offsets = jax.tree.map(
             lambda acc, pl: unreduced_to_local(acc, leading=1) if pl else None,
@@ -1072,9 +1151,34 @@ def _microbatched_loss_and_grads(
         aux = token_share * aux
         return cross_entropy + aux, (cross_entropy, aux, router)
 
-    (last_loss, (last_ce, last_aux, last_router)), (last_grads, sink_grads) = jax.value_and_grad(
-        last_loss_and_terms, argnums=(0, 1), has_aux=True
-    )(last_params, sinks, last_microbatch, last_share)
+    done = None
+    if in_scan:
+        # The weights reduced after the last microbatch carry their sums through its scan, which adds its gradients.
+        last_summed = jax.tree.map(lambda sm, pl: sm and not pl, in_scan_flags, per_layer)
+
+        def last_loss_and_terms_into_sums(p, block_sinks, sums, microbatch, token_share):
+            terms = loss_terms_fn(p, microbatch, offsets, block_sinks, expert_grad_acc=last_acc, block_grad_sums=sums)
+            cross_entropy = terms.cross_entropy_loss / loss_denominator
+            aux = token_share * terms.aux_loss
+            return (cross_entropy + aux, terms.block_grad_sums), (cross_entropy, aux, terms.router_metrics)
+
+        last_sums = _block_sums(grad_sum, last_summed)
+        (last_loss, _), last_vjp, (last_ce, last_aux, last_router) = jax.vjp(
+            lambda p, block_sinks, sums: last_loss_and_terms_into_sums(
+                p, block_sinks, sums, last_microbatch, last_share
+            ),
+            last_params,
+            sinks,
+            last_sums,
+            has_aux=True,
+        )
+        last_grads, sink_grads, last_sums = last_vjp((jnp.ones_like(last_loss), last_sums))
+        totals = jax.tree.map(_local_to_unreduced_leading_1, last_sums)
+        done = _with_block_sums(jax.tree.map(lambda _: None, params), totals, last_summed)
+    else:
+        (last_loss, (last_ce, last_aux, last_router)), (last_grads, sink_grads) = jax.value_and_grad(
+            last_loss_and_terms, argnums=(0, 1), has_aux=True
+        )(last_params, sinks, last_microbatch, last_share)
     if sinks is not None:
         # The sinks' gradients are the reduce-scattered expert gradients; the weights' own are zero.
         stacked = jax.tree.map(
@@ -1088,15 +1192,21 @@ def _microbatched_loss_and_grads(
     )
     router_metrics = _combine_microbatch_router_metrics(stacked_router_metrics, token_shares)
 
-    def finalize(acc, g, p, target, pl):
+    def finalize(acc, g, p, target, pl, total=None):
         if pl:
             # Already reduced in the backward, with the accumulator added, into the sharding of ``target``.
             return reshard(g, jax.typeof(target).sharding)
+        if total is not None:
+            # Summed in the scan, the last microbatch's gradient included.
+            return _finalize_accumulated_grad(total, p, target)
         if not isinstance(acc, jax.Array):
             return acc
         return _finalize_accumulated_grad(acc + g.astype(jnp.float32), p, target)
 
-    grads = jax.tree.map(finalize, grad_sum, last_grads, params, grad_shardings, per_layer)
+    if done is None:
+        grads = jax.tree.map(finalize, grad_sum, last_grads, params, grad_shardings, per_layer)
+    else:
+        grads = jax.tree.map(finalize, grad_sum, last_grads, params, grad_shardings, per_layer, done)
     loss, cross_entropy_loss, aux_loss = loss + last_loss, cross_entropy_loss + last_ce, aux_loss + last_aux
     return loss, summarize_loss_metrics(router_metrics, cross_entropy_loss, aux_loss), grads, gathered_blocks
 
@@ -1139,6 +1249,69 @@ def _grads_into_expert_sums(fn, primals: tuple, sums: tuple, mode: str):
     (loss, _), vjp_fn, aux = jax.vjp(fn, *primals, acc, has_aux=True)
     *grads, acc_ct = vjp_fn((jnp.ones_like(loss), acc))
     return loss, aux, tuple(grads), (acc_ct.w_gate, acc_ct.w_up, acc_ct.w_down)
+
+
+def _grads_into_sums(fn, primals: tuple, block_sums, expert_sums: tuple | None, mode: str):
+    """``_grads_into_expert_sums`` with the block weight sums of ``block_grad_accumulation="in_scan"`` as well.
+
+    Differentiate ``fn(*primals, block_sums, acc) -> ((loss, (block_sums_out, acc_out)), aux)``, where ``acc`` is the
+    ``ExpertGradAccumulator`` of ``expert_sums`` in mode ``mode`` (None without them). Returns ``(loss, aux,
+    gradients of primals, new block sums, new expert sums or None)``: seeding the returned sums' cotangents with the
+    running sums starts the layer scan's backward from them, and each layer folds its gradients in place."""
+    acc = None if expert_sums is None else ExpertGradAccumulator(*expert_sums, mode=mode)
+    (loss, _), vjp_fn, aux = jax.vjp(fn, *primals, block_sums, acc, has_aux=True)
+    *grads, sums_ct, acc_ct = vjp_fn((jnp.ones_like(loss), (block_sums, acc)))
+    new_expert = None if acc_ct is None else (acc_ct.w_gate, acc_ct.w_up, acc_ct.w_down)
+    return loss, aux, tuple(grads), sums_ct, new_expert
+
+
+def _in_scan_summed(params: Transformer, in_kernel: bool) -> Transformer:
+    """True for the stacked block weights ``block_grad_accumulation="in_scan"`` sums in the layer scan: every one with
+    a gradient (not ``router_bias``), but the expert weights when the weight-gradient kernel sums them
+    (``in_kernel``)."""
+
+    def summed(path, x):
+        return isinstance(x, jax.Array) and not any(getattr(k, "name", None) == "router_bias" for k in path)
+
+    flags = jax.tree.map(lambda _: False, params)
+    stacked = jax.tree_util.tree_map_with_path(summed, params.stacked_blocks.stacked)
+    flags = eqx.tree_at(lambda t: t.stacked_blocks.stacked, flags, stacked)
+    if in_kernel:
+        flags = _with_expert(flags, (False,) * len(_EXPERT_WEIGHTS))
+    return flags
+
+
+def _block_sums(tree, summed: Transformer) -> Block:
+    """The stacked ``Block`` of ``tree``'s entries that ``summed`` flags, None elsewhere."""
+    return jax.tree.map(lambda sm, x: x if sm else None, summed.stacked_blocks.stacked, tree.stacked_blocks.stacked)
+
+
+def _with_block_sums(tree, sums: Block, summed: Transformer):
+    """``tree`` with the stacked block entries that ``summed`` flags replaced by those of ``sums``."""
+    stacked = jax.tree.map(
+        lambda sm, x, s: s if sm else x,
+        summed.stacked_blocks.stacked,
+        tree.stacked_blocks.stacked,
+        sums,
+        is_leaf=lambda x: x is None,
+    )
+    return eqx.tree_at(lambda t: t.stacked_blocks.stacked, tree, stacked, is_leaf=lambda x: x is None)
+
+
+def _block_sums_to_local(tree, summed: Transformer):
+    """The flagged unreduced float32 sums of ``tree`` in ``_grad_into_sum``'s ``[L, S, ...]`` layout (moves no data)."""
+    local = jax.tree.map(lambda x: unreduced_to_local(x, leading=1), _block_sums(tree, summed))
+    return _with_block_sums(tree, local, summed)
+
+
+def _block_sums_from_local(tree, summed: Transformer):
+    """Inverse of ``_block_sums_to_local``."""
+    unreduced = jax.tree.map(_local_to_unreduced_leading_1, _block_sums(tree, summed))
+    return _with_block_sums(tree, unreduced, summed)
+
+
+def _local_to_unreduced_leading_1(x: jax.Array) -> jax.Array:
+    return local_to_unreduced(x, leading=1)
 
 
 def _is_zero1_shard(x) -> bool:
@@ -1543,6 +1716,7 @@ def _run_grug_local(config: GrugRunConfig, *, step_hooks: Sequence[Callable[[cal
         overlap_last_microbatch=config.trainer.overlap_last_microbatch,
         gather_in_first_microbatch=config.trainer.gather_in_first_microbatch,
         expert_grad_accumulation=config.trainer.expert_grad_accumulation,
+        block_grad_accumulation=config.trainer.block_grad_accumulation,
     )
 
     data_key, model_key = jax.random.split(jax.random.PRNGKey(trainer.seed), 2)
