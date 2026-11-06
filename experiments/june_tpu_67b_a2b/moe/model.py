@@ -23,6 +23,7 @@ from jax import random, shard_map
 from jax.sharding import PartitionSpec as P
 from jax.sharding import get_abstract_mesh, reshard
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
+from levanter.grug._moe.grad_accum import ExpertGradAccumulator
 from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
 from levanter.grug._moe.pallas_routing_metadata import MoeRoutingMetadata
 from levanter.grug.attention import (
@@ -918,21 +919,26 @@ class MoEMLP(eqx.Module):
         self,
         x: Float[Array, "B S D"],
         token_valid: Bool[Array, "B S"],
-    ) -> tuple[Float[Array, "B S D"], dict[str, jax.Array]]:
+        grad_acc: ExpertGradAccumulator | None = None,
+    ):
+        """The routed output and router stats, and with ``grad_acc`` (``moe_mlp``) the accumulator as a third output."""
         b, s, _ = x.shape
         x_flat = rearrange(x, "b s d -> (b s) d")
         token_valid_flat = rearrange(token_valid, "b s -> (b s)")
-        routed_flat, router_stats = self.routed_moe(
+        routed_flat, router_stats, *acc_out = self.routed_moe(
             x_flat,
             token_valid_flat,
             router=self.router,
             router_bias=self.router_bias,
             expert_mlp=self.expert_mlp,
             mesh=get_abstract_mesh(),
+            grad_acc=grad_acc,
         )
 
         routed = rearrange(routed_flat, "(b s) d -> b s d", b=b, s=s)
         routed = reshard(routed, _batch_spec())
+        if grad_acc is not None:
+            return routed, router_stats, acc_out[0]
         return routed, router_stats
 
 
@@ -1013,8 +1019,10 @@ def after_scan_reduced_spec(path, x, max_bytes: int) -> P | None:
     return P(*spec, reduced=frozenset(_BATCH_AXES))
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(2, 3))
-def _reduce_with_offset(weight: jax.Array, offset: jax.Array, reduced_spec: P, weight_spec: P) -> jax.Array:
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4))
+def _reduce_with_offset(
+    weight: jax.Array, offset: jax.Array, reduced_spec: P, weight_spec: P, offset_added: bool
+) -> jax.Array:
     """``weight`` (one layer's slice, sharded as ``weight_spec``) marked ``reduced`` as ``reduced_spec``; in the
     backward its gradient plus ``offset`` is reduced across devices into ``weight_spec``, inside the backward of the
     layer scan.
@@ -1022,32 +1030,45 @@ def _reduce_with_offset(weight: jax.Array, offset: jax.Array, reduced_spec: P, w
     ``offset`` is the float32 sum of the earlier microbatches' unreduced gradients for this layer. The backward adds the
     layer's unreduced gradient to it in float32, casts the sum to the gradient's dtype and reshards it to
     ``weight_spec``: an all-reduce over the reduced axes, or a reduce-scatter over those ``weight_spec`` shards over.
-    ``offset`` gets no gradient."""
-    del offset, weight_spec
+    ``offset`` gets no gradient. With ``offset_added`` the gradient already holds the offset (the expert weight
+    gradient kernel added it, ``ExpertGradAccumulator`` mode "final"), so the backward only reduces it."""
+    del offset, weight_spec, offset_added
     return reshard(weight, reduced_spec)
 
 
-def _reduce_with_offset_fwd(weight, offset, reduced_spec, weight_spec):
+def _reduce_with_offset_fwd(weight, offset, reduced_spec, weight_spec, offset_added):
     del weight_spec
-    return reshard(weight, reduced_spec), offset
+    return reshard(weight, reduced_spec), None if offset_added else offset
 
 
-def _reduce_with_offset_bwd(reduced_spec, weight_spec, offset, cotangent):
-    del reduced_spec
-    total = (_local_to_unreduced(offset) + cotangent.astype(jnp.float32)).astype(cotangent.dtype)
-    return reshard(total, weight_spec), None
+def _offset_total(offset: jax.Array | None, cotangent: jax.Array) -> jax.Array:
+    if offset is None:
+        return cotangent
+    return (_local_to_unreduced(offset) + cotangent.astype(jnp.float32)).astype(cotangent.dtype)
+
+
+def _reduce_with_offset_bwd(reduced_spec, weight_spec, offset_added, offset, cotangent):
+    del reduced_spec, offset_added
+    return reshard(_offset_total(offset, cotangent), weight_spec), None
 
 
 def _local_to_unreduced(local: jax.Array) -> jax.Array:
     """[n, ...] with dim 0 sharded over the axes ``axes`` (each device's own partial sum) -> [...] ``unreduced`` over
     them, the same per-device data. Inverse of ``unreduced_to_local``; moves no data."""
+    return local_to_unreduced(local)
+
+
+def local_to_unreduced(local: jax.Array, *, leading: int = 0) -> jax.Array:
+    """``_local_to_unreduced`` with the per-device dimension at ``leading``: the inverse of
+    ``unreduced_to_local(x, leading=leading)``. Moves no data."""
     spec = jax.typeof(local).sharding.spec
-    axes = spec.partitions[0]
+    parts = tuple(spec.partitions) + (None,) * (local.ndim - len(spec.partitions))
+    axes = parts[leading]
     axes = axes if isinstance(axes, tuple) else (axes,)
-    rest = spec.partitions[1:]
+    rest = (*parts[:leading], *parts[leading + 1 :])
     return jax.shard_map(
-        lambda a: jax.lax.pcast(a[0], axes, to="unreduced"),
-        in_specs=P(axes, *rest),
+        lambda a: jax.lax.pcast(jnp.squeeze(a, leading), axes, to="unreduced"),
+        in_specs=P(*parts[:leading], axes, *parts[leading + 1 :]),
         out_specs=P(*rest, unreduced=frozenset(axes)),
     )(local)
 
@@ -1072,35 +1093,39 @@ def unreduced_to_local(x: jax.Array, *, leading: int = 0) -> jax.Array:
 _reduce_with_offset.defvjp(_reduce_with_offset_fwd, _reduce_with_offset_bwd)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4))
-def _reduce_into_sink(weight: jax.Array, offset: jax.Array, sink: jax.Array, reduced_spec: P, sink_spec: P) -> jax.Array:
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5))
+def _reduce_into_sink(
+    weight: jax.Array, offset: jax.Array, sink: jax.Array, reduced_spec: P, sink_spec: P, offset_added: bool
+) -> jax.Array:
     """``_reduce_with_offset`` with the reduced gradient sharded as ``sink_spec``, which shards more than the weight
     does (ZeRO-1: the expert dimension over the replicas as well), so the reduction is a reduce-scatter.
 
     A custom_vjp's backward must return a cotangent of its input's type, so the gradient cannot leave as the weight's:
     it leaves as that of ``sink``, a zero input sharded as ``sink_spec`` that the forward ignores; the weight's
     cotangent is zero. The caller differentiates with respect to the sinks."""
-    del offset, sink, sink_spec
+    del offset, sink, sink_spec, offset_added
     return reshard(weight, reduced_spec)
 
 
-def _reduce_into_sink_fwd(weight, offset, sink, reduced_spec, sink_spec):
+def _reduce_into_sink_fwd(weight, offset, sink, reduced_spec, sink_spec, offset_added):
     del sink, sink_spec
-    return reshard(weight, reduced_spec), offset
+    return reshard(weight, reduced_spec), None if offset_added else offset
 
 
-def _reduce_into_sink_bwd(reduced_spec, sink_spec, offset, cotangent):
-    del reduced_spec
-    total = (_local_to_unreduced(offset) + cotangent.astype(jnp.float32)).astype(cotangent.dtype)
-    return None, None, reshard(total, sink_spec)
+def _reduce_into_sink_bwd(reduced_spec, sink_spec, offset_added, offset, cotangent):
+    del reduced_spec, offset_added
+    return None, None, reshard(_offset_total(offset, cotangent), sink_spec)
 
 
 _reduce_into_sink.defvjp(_reduce_into_sink_fwd, _reduce_into_sink_bwd)
 
 
-def _apply_grad_offsets(layer: "Block", offsets: "Block", sinks: "Block | None" = None) -> "Block":
+def _apply_grad_offsets(
+    layer: "Block", offsets: "Block", sinks: "Block | None" = None, offsets_added: bool = False
+) -> "Block":
     """Route the layer weights that have an offset in ``offsets`` (None elsewhere) through ``_reduce_with_offset``, or
-    through ``_reduce_into_sink`` where ``sinks`` has a sink for them."""
+    through ``_reduce_into_sink`` where ``sinks`` has a sink for them. ``offsets_added``: their gradients arrive with the
+    offsets already added (``ExpertGradAccumulator`` mode "final")."""
 
     def apply(offset, weight, sink=None):
         if offset is None:
@@ -1111,8 +1136,8 @@ def _apply_grad_offsets(layer: "Block", offsets: "Block", sinks: "Block | None" 
         axes = offset_spec.partitions[0]
         reduced_spec = P(*offset_spec.partitions[1:], reduced=frozenset(axes if isinstance(axes, tuple) else (axes,)))
         if sink is None:
-            return _reduce_with_offset(weight, offset, reduced_spec, jax.typeof(weight).sharding.spec)
-        return _reduce_into_sink(weight, offset, sink, reduced_spec, jax.typeof(sink).sharding.spec)
+            return _reduce_with_offset(weight, offset, reduced_spec, jax.typeof(weight).sharding.spec, offsets_added)
+        return _reduce_into_sink(weight, offset, sink, reduced_spec, jax.typeof(sink).sharding.spec, offsets_added)
 
     if sinks is None:
         return jax.tree.map(apply, offsets, layer, is_leaf=lambda x: x is None)
@@ -1169,9 +1194,9 @@ def _apply_gathers(layer: "Block", sinks: "Block", buffers: "Block", index: jax.
     return layer, jax.tree.map(write, gathered, buffers, is_leaf=lambda x: x is None)
 
 
-def _block_with_grad_offsets(layer: "Block", offsets: "Block", sinks: "Block | None", *args):
+def _block_with_grad_offsets(layer: "Block", offsets: "Block", sinks: "Block | None", offsets_added: bool, *args):
     """``layer`` applied to ``args`` with its weights routed through ``_apply_grad_offsets``."""
-    return _apply_grad_offsets(layer, offsets, sinks)(*args)
+    return _apply_grad_offsets(layer, offsets, sinks, offsets_added)(*args)
 
 
 class Block(eqx.Module):
@@ -1211,7 +1236,9 @@ class Block(eqx.Module):
         use_pko: bool = False,
         disable_long_rope: bool = False,
         position_ids: jax.Array | None = None,
-    ) -> tuple[Float[Array, "B S D"], dict[str, jax.Array]]:
+        grad_acc: ExpertGradAccumulator | None = None,
+    ):
+        """The block's output and router stats, and with ``grad_acc`` (``moe_mlp``) the accumulator as a third output."""
         fused = self.attn.cfg.fused_norm_impl
         if fused == "off":
             attn_in = self.attn_gated_norm(self.rms_attn(x))
@@ -1254,10 +1281,12 @@ class Block(eqx.Module):
             batch_size=x.shape[0],
             sequence_length=x.shape[1],
         )
-        mlp_out, router_stats = self.mlp(mlp_in, token_valid)
+        mlp_out, router_stats, *acc_out = self.mlp(mlp_in, token_valid, grad_acc)
         if self.shared is not None:
             mlp_out = mlp_out + self.shared(mlp_in, activation=ActivationFunctionEnum.silu)
         x = x + mlp_out
+        if grad_acc is not None:
+            return x, router_stats, acc_out[0]
         return x, router_stats
 
 
@@ -1366,7 +1395,7 @@ class Transformer(eqx.Module):
         block_grad_offsets: "Block | None" = None,
         block_grad_sinks: "Block | None" = None,
     ) -> tuple[Float[Array, "B S D"], dict[str, jax.Array]]:
-        hidden, router_metrics, _ = self._forward(
+        hidden, router_metrics, _, _ = self._forward(
             token_ids,
             mask,
             position_ids=position_ids,
@@ -1386,9 +1415,10 @@ class Transformer(eqx.Module):
         block_grad_sinks: "Block | None" = None,
         block_gather_sinks: "Block | None" = None,
         block_gather_buffers: "Block | None" = None,
-    ) -> tuple[Float[Array, "B S D"], dict[str, jax.Array], "Block | None"]:
-        """The final hidden states, the per-layer router metrics and ``block_gather_buffers`` holding the block weights
-        gathered by ``block_gather_sinks`` (None without them).
+        expert_grad_acc: ExpertGradAccumulator | None = None,
+    ) -> tuple[Float[Array, "B S D"], dict[str, jax.Array], "Block | None", ExpertGradAccumulator | None]:
+        """The final hidden states, the per-layer router metrics, ``block_gather_buffers`` holding the block weights
+        gathered by ``block_gather_sinks`` (None without them) and ``expert_grad_acc`` as the scan returns it.
 
         ``block_gather_sinks`` is a stacked ``Block`` with a zero "sink" for each weight to gather (None elsewhere): each
         layer of the scan all-gathers its slice of that weight, cast to the sink's dtype, to the sink's sharding just
@@ -1396,7 +1426,14 @@ class Transformer(eqx.Module):
         gradients leave unreduced through the sinks. ``block_gather_buffers`` (both or neither) is a stacked ``Block``
         with a full-size destination in the model's sharding for each of those weights: the scan carries it and writes
         each layer's gathered weights into it, so the gathered stack is the carried buffer rather than a separate scan
-        output, for the caller to reuse."""
+        output, for the caller to reuse.
+
+        ``expert_grad_acc`` (stacked layout only): float32 sums of the expert weight gradients that every layer's
+        expert matmuls fold their weight gradients into (``ExpertGradAccumulator``). In modes "init" and "accum" the
+        scan carries the sums, each layer returning them to the next, and returns them; differentiate with ``jax.vjp``,
+        seeding the returned sums' cotangent with the running sums. In mode "final" every layer reads them, and with
+        ``block_grad_offsets`` holding the same sums the expert weights' reductions take the gradients as they come,
+        sums already added."""
         if (block_gather_sinks is None) != (block_gather_buffers is None):
             raise ValueError("block_gather_sinks and block_gather_buffers go together")
         if mask is None:
@@ -1426,9 +1463,17 @@ class Transformer(eqx.Module):
         checkpoint = functools.partial(eqx.filter_checkpoint, policy=remat_policy, prevent_cse=prevent_cse)
 
         gathered_blocks = None
+        carried_acc = None
+        if expert_grad_acc is not None:
+            if expert_grad_acc.mode == "final" and block_grad_offsets is None:
+                raise ValueError('expert_grad_acc mode "final" goes with block_grad_offsets (the same sums)')
+            if expert_grad_acc.mode != "final":
+                carried_acc = expert_grad_acc.without_layer()
         if self.blocks is not None:
             if block_gather_sinks is not None:
                 raise ValueError("block_gather_sinks needs the stacked layer layout (use_array_stacked_blocks)")
+            if expert_grad_acc is not None:
+                raise ValueError("expert_grad_acc needs the stacked layer layout (use_array_stacked_blocks)")
             num_blocks = len(self.blocks)
             moe_router_stats: list[dict[str, jax.Array]] = []
             for i, block in enumerate(self.blocks):
@@ -1448,72 +1493,94 @@ class Transformer(eqx.Module):
             mask_schedule = _long_layer_schedule(cfg.num_layers)
 
             def _scan_layers(
-                carry: tuple[Float[Array, "B S D"], Block | None],
+                carry: tuple[Float[Array, "B S D"], Block | None, ExpertGradAccumulator | None],
                 scan_inputs: tuple[Block, Bool[Array, ""], Block | None, Block | None, Block | None, jax.Array | None],
-            ) -> tuple[tuple[Float[Array, "B S D"], Block | None], dict[str, jax.Array]]:
-                carry_hidden, buffers = carry
+            ) -> tuple[tuple[Float[Array, "B S D"], Block | None, ExpertGradAccumulator | None], dict[str, jax.Array]]:
+                carry_hidden, buffers, acc = carry
                 layer, layer_use_long_mask, layer_grad_offsets, layer_grad_sinks, layer_gather_sinks, index = scan_inputs
                 if layer_gather_sinks is not None:
                     layer, buffers = _apply_gathers(layer, layer_gather_sinks, buffers, index)
                 layer_args = (carry_hidden, short_mask, long_mask, layer_use_long_mask, False, cfg.disable_long_rope)
+                # The sums: carried ("init"/"accum") or, in mode "final", read from the closure.
+                layer_acc = None
+                if expert_grad_acc is not None:
+                    layer_acc = (expert_grad_acc if acc is None else acc).at_layer(index)
+                acc_args = () if layer_acc is None else (layer_acc,)
                 if layer_grad_offsets is None:
-                    hidden_out, stats = checkpoint(layer)(*layer_args, position_ids)
+                    hidden_out, stats, *acc_out = checkpoint(layer)(*layer_args, position_ids, *acc_args)
                 else:
                     # The reductions inside the checkpoint: its inputs are then the layer's own slices, which the
                     # backward reads in place, rather than the marked weights, which the scan would stack as a copy.
                     # A weight also sharded over ``data`` (FSDP) is gathered again in the backward, like the rest of
                     # what the checkpoint recomputes.
-                    hidden_out, stats = checkpoint(_block_with_grad_offsets)(
-                        layer, layer_grad_offsets, layer_grad_sinks, *layer_args, position_ids
+                    offsets_added = layer_acc is not None and layer_acc.mode == "final"
+                    hidden_out, stats, *acc_out = checkpoint(_block_with_grad_offsets)(
+                        layer, layer_grad_offsets, layer_grad_sinks, offsets_added, *layer_args, position_ids, *acc_args
                     )
-                return (hidden_out, buffers), stats
+                if acc is not None:
+                    acc = acc_out[0].without_layer()
+                return (hidden_out, buffers, acc), stats
 
             def _static_layer(
-                carry: tuple[Float[Array, "B S D"], Block | None], index: jax.Array, use_long_mask: bool
-            ) -> tuple[tuple[Float[Array, "B S D"], Block | None], dict[str, jax.Array]]:
+                carry: tuple[Float[Array, "B S D"], Block | None, ExpertGradAccumulator | None],
+                index: jax.Array,
+                use_long_mask: bool,
+            ) -> tuple[tuple[Float[Array, "B S D"], Block | None, ExpertGradAccumulator | None], dict[str, jax.Array]]:
                 # Layer ``index`` of the stacks. The slices are taken inside the checkpoint, whose inputs are then the
                 # whole stacks (loop-invariant, so the backward reads them in place): sliced outside it, each layer's
                 # weights would be saved for the backward as a stacked copy.
-                carry_hidden, buffers = carry
+                carry_hidden, buffers, acc = carry
                 layer_args = (carry_hidden, short_mask, long_mask, use_long_mask, False, cfg.disable_long_rope)
+                # The expert gradient sums, as in ``_scan_layers``.
+                layer_acc = None
+                if expert_grad_acc is not None:
+                    layer_acc = (expert_grad_acc if acc is None else acc).at_layer(index)
+                acc_args = () if layer_acc is None else (layer_acc,)
+                offsets_added = layer_acc is not None and layer_acc.mode == "final"
 
                 def apply(weights, offsets, sinks, index, *args):
                     if offsets is None:
                         return weights(*args)
-                    return _block_with_grad_offsets(weights, _layer_at(offsets, index), _layer_at(sinks, index), *args)
+                    return _block_with_grad_offsets(
+                        weights, _layer_at(offsets, index), _layer_at(sinks, index), offsets_added, *args
+                    )
 
                 if block_gather_sinks is None:
 
                     def apply_stacked(weights, offsets, sinks, index, *args):
                         return apply(_layer_at(weights, index), offsets, sinks, index, *args)
 
-                    hidden_out, stats = checkpoint(apply_stacked)(
-                        stacked, block_grad_offsets, block_grad_sinks, index, *layer_args, position_ids
+                    hidden_out, stats, *acc_out = checkpoint(apply_stacked)(
+                        stacked, block_grad_offsets, block_grad_sinks, index, *layer_args, position_ids, *acc_args
                     )
                 else:
                     layer, buffers = _apply_gathers(
                         _layer_at(stacked, index), _layer_at(block_gather_sinks, index), buffers, index
                     )
-                    hidden_out, stats = checkpoint(apply)(
-                        layer, block_grad_offsets, block_grad_sinks, index, *layer_args, position_ids
+                    hidden_out, stats, *acc_out = checkpoint(apply)(
+                        layer, block_grad_offsets, block_grad_sinks, index, *layer_args, position_ids, *acc_args
                     )
-                return (hidden_out, buffers), stats
+                if acc is not None:
+                    acc = acc_out[0].without_layer()
+                return (hidden_out, buffers, acc), stats
 
             stacked = self.stacked_blocks.stacked
             if cfg.replicated_grad_reduction == "after_scan":
                 stacked = _mark_reduced(stacked, cfg.replicated_grad_max_bytes)
-            layer_indices = None if block_gather_sinks is None else jnp.arange(cfg.num_layers, dtype=jnp.int32)
+            layer_indices = None
+            if block_gather_sinks is not None or expert_grad_acc is not None:
+                layer_indices = jnp.arange(cfg.num_layers, dtype=jnp.int32)
             if cfg.attention_schedule == "cond":
-                (hidden, gathered_blocks), stacked_router_stats = jax.lax.scan(
+                (hidden, gathered_blocks, carried_acc), stacked_router_stats = jax.lax.scan(
                     _scan_layers,
-                    (hidden, block_gather_buffers),
+                    (hidden, block_gather_buffers, carried_acc),
                     xs=(stacked, mask_schedule, block_grad_offsets, block_grad_sinks, block_gather_sinks, layer_indices),
                     unroll=cfg.scan_unroll,
                 )
             else:
-                (hidden, gathered_blocks), stacked_router_stats = _static_layer_scan(
+                (hidden, gathered_blocks, carried_acc), stacked_router_stats = _static_layer_scan(
                     _static_layer,
-                    (hidden, block_gather_buffers),
+                    (hidden, block_gather_buffers, carried_acc),
                     num_layers=cfg.num_layers,
                     unroll=cfg.scan_unroll,
                     all_short=cfg.attention_schedule == "all_short",
@@ -1534,7 +1601,7 @@ class Transformer(eqx.Module):
                 if name in stacked_router_stats
             }
         hidden = self._norm_and_gate(hidden, self.final_norm, self.final_gated_norm)
-        return hidden, router_metrics, gathered_blocks
+        return hidden, router_metrics, gathered_blocks, carried_acc
 
     def _norm_and_gate(self, x: jax.Array, norm: RMSNorm, gated: GatedNorm) -> jax.Array:
         if self.config.fused_norm_impl == "off":
@@ -1562,7 +1629,7 @@ class Transformer(eqx.Module):
         loss_dtype: jnp.dtype = jnp.float32,
         return_router_metrics: bool = False,
     ) -> jax.Array | tuple[jax.Array, dict[str, jax.Array | SummaryStats]]:
-        cross_entropy_loss, aux_loss, router_metrics, _ = self.next_token_loss_terms(
+        cross_entropy_loss, aux_loss, router_metrics, *_ = self.next_token_loss_terms(
             token_ids,
             loss_weight,
             mask=mask,
@@ -1588,6 +1655,7 @@ class Transformer(eqx.Module):
         block_grad_sinks: "Block | None" = None,
         block_gather_sinks: "Block | None" = None,
         block_gather_buffers: "Block | None" = None,
+        expert_grad_acc: ExpertGradAccumulator | None = None,
     ) -> "LossTerms":
         """The cross-entropy loss, the weighted router aux loss, the raw per-layer router metrics and the buffers
         holding the block weights gathered by ``block_gather_sinks`` (see ``_forward``).
@@ -1596,13 +1664,14 @@ class Transformer(eqx.Module):
         Callers that combine several batches, such as gradient accumulation, combine the raw metrics first and
         summarize once.
         """
-        hidden, router_metrics, gathered_blocks = self._forward(
+        hidden, router_metrics, gathered_blocks, expert_grad_acc = self._forward(
             token_ids,
             mask,
             block_grad_offsets=block_grad_offsets,
             block_grad_sinks=block_grad_sinks,
             block_gather_sinks=block_gather_sinks,
             block_gather_buffers=block_gather_buffers,
+            expert_grad_acc=expert_grad_acc,
         )
         labels = jnp.concatenate([token_ids[:, 1:], token_ids[:, :1] * 0], axis=1).astype(jnp.int32)
         loss_weight = loss_weight.astype(loss_dtype)
@@ -1627,7 +1696,7 @@ class Transformer(eqx.Module):
             aux_loss = self.config.router_z_loss_coef * rzl
         else:
             aux_loss = jnp.zeros((), jnp.float32)
-        return LossTerms(cross_entropy_loss, aux_loss, router_metrics, gathered_blocks)
+        return LossTerms(cross_entropy_loss, aux_loss, router_metrics, gathered_blocks, expert_grad_acc)
 
 
 class LossTerms(NamedTuple):
@@ -1638,6 +1707,8 @@ class LossTerms(NamedTuple):
     aux_loss: jax.Array
     router_metrics: dict[str, jax.Array]
     gathered_blocks: Block | None
+    # The expert gradient sums as the layer scan returns them (``Transformer._forward``), in modes "init"/"accum".
+    expert_grad_acc: ExpertGradAccumulator | None = None
 
 
 def router_token_validity(token_ids: Int[Array, "B S"], mask: AttentionMask | jax.Array | None) -> Bool[Array, "B S"]:
