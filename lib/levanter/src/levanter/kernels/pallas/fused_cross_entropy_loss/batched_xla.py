@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
+from collections.abc import Iterator
 from functools import partial
 from typing import NamedTuple, Optional
 
@@ -30,6 +33,43 @@ _MI355X_CUSTOM_BWD_V_BLOCK = 8192
 _GPU_MIN_B_BLOCK_SIZE = 128
 _H100_FULL_VOCAB_B_TILED_BLOCK_SIZE = 8192
 _H100_FULL_VOCAB_B_TILED_MIN_BATCH = 8192
+
+
+class BackwardOptions(NamedTuple):
+    """How the streaming backward (``_backward_streaming_from_lse``) sums its vocabulary blocks. The defaults are the
+    original formulation.
+
+    ``grad_x_in_gemm``: each block's ``grad_x`` GEMM writes float32 and the float32 sum is ``sum + gemm``, which XLA's
+    GEMM rewriter fuses into the GEMM as its C operand (beta=1, in place), instead of a bf16 GEMM followed by a separate
+    convert-and-add kernel. Each block is then added unrounded, so ``grad_x`` differs from the default in the last bits.
+
+    ``weight_blocks_in_weight_dtype``: each block's weight gradient is stacked in the weight's dtype, as its GEMM writes
+    it, instead of widened to float32 for the stack and narrowed back after it. The values are the same bit for bit; the
+    stacked blocks take half the bytes.
+
+    The in-place weight-gradient backward (``_backward_streaming_from_lse_in_place``) reads ``grad_x_in_gemm`` alike;
+    it has no block stack and always writes the blocks in the weight's dtype, so ``weight_blocks_in_weight_dtype`` does
+    not change it.
+    """
+
+    grad_x_in_gemm: bool = False
+    weight_blocks_in_weight_dtype: bool = False
+
+
+_BACKWARD_OPTIONS: contextvars.ContextVar[BackwardOptions] = contextvars.ContextVar(
+    "batched_xla_backward_options", default=BackwardOptions()
+)
+
+
+@contextlib.contextmanager
+def backward_options(options: BackwardOptions) -> Iterator[None]:
+    """Within this context, the streaming backward of the cross-entropy calls traced here sums as ``options`` says.
+    They are read when the loss is traced and fixed for its backward."""
+    token = _BACKWARD_OPTIONS.set(options)
+    try:
+        yield
+    finally:
+        _BACKWARD_OPTIONS.reset(token)
 
 
 def _apply_logit_soft_cap(logits: jax.Array, logit_soft_cap: Optional[float]) -> jax.Array:
@@ -634,7 +674,7 @@ def _backward_b_tiled_from_lse(
     return grad_x[:b_dim].astype(x.dtype), grad_w.astype(w.dtype)
 
 
-@partial(jax.jit, static_argnames=["v_block_size", "logit_soft_cap", "precision"])
+@partial(jax.jit, static_argnames=["v_block_size", "logit_soft_cap", "precision", "options"])
 def _backward_streaming_from_lse(
     x: Float[Array, "B H"],
     labels: Int[Array, "B"],
@@ -646,8 +686,9 @@ def _backward_streaming_from_lse(
     v_block_size: int,
     logit_soft_cap: Optional[float],
     precision: jax.lax.PrecisionLike,
+    options: BackwardOptions = BackwardOptions(),
 ) -> tuple[Float[Array, "B H"], Float[Array, "H V"]]:
-    """Streaming backward pass over vocab blocks using saved LSE."""
+    """Streaming backward pass over vocab blocks using saved LSE, summed as ``options`` says."""
     b_dim, h_dim = x.shape
     v_dim = w.shape[1]
 
@@ -696,6 +737,32 @@ def _backward_streaming_from_lse(
             dlogits = dlogits * soft_cap_grad
 
         dlogits_for_matmul = dlogits.astype(x.dtype)
+        if options != BackwardOptions():
+            if options.grad_x_in_gemm:
+                # A float32 GEMM output added to the carried sum: XLA fuses the add into the GEMM (beta=1).
+                grad_x_block = jax.lax.dot_general(
+                    dlogits_for_matmul,
+                    w_block,
+                    (((1,), (1,)), ((), ())),
+                    precision=precision,
+                    preferred_element_type=jnp.float32,
+                )
+            else:
+                grad_x_block = jax.lax.dot_general(
+                    dlogits_for_matmul,
+                    w_block,
+                    (((1,), (1,)), ((), ())),
+                    precision=precision,
+                ).astype(jnp.float32)
+            grad_w_block = jax.lax.dot_general(
+                x,
+                dlogits_for_matmul,
+                (((0,), (0,)), ((), ())),
+                precision=precision,
+            )
+            if not options.weight_blocks_in_weight_dtype:
+                grad_w_block = grad_w_block.astype(jnp.float32)
+            return grad_x + grad_x_block, grad_w_block
         grad_x_block = jax.lax.dot_general(
             dlogits_for_matmul,
             w_block,
@@ -718,7 +785,7 @@ def _backward_streaming_from_lse(
     return grad_x.astype(x.dtype), grad_w.astype(w.dtype)
 
 
-@partial(jax.jit, static_argnames=["v_block_size", "logit_soft_cap", "precision"])
+@partial(jax.jit, static_argnames=["v_block_size", "logit_soft_cap", "precision", "options"])
 def _backward_streaming_from_lse_in_place(
     x: Float[Array, "B H"],
     labels: Int[Array, "B"],
@@ -730,6 +797,7 @@ def _backward_streaming_from_lse_in_place(
     v_block_size: int,
     logit_soft_cap: Optional[float],
     precision: jax.lax.PrecisionLike,
+    options: BackwardOptions = BackwardOptions(),
 ) -> tuple[Float[Array, "B H"], Float[Array, "H V"]]:
     """``_backward_streaming_from_lse`` with each vocab block's weight gradient written into the ``[H, V]`` result.
 
@@ -740,7 +808,11 @@ def _backward_streaming_from_lse_in_place(
     ``[H, blocks * v_block]``: the scan covers the whole blocks, and the remainder runs after it from a copy of only its
     own columns padded to one block. Every block computes what ``_backward_streaming_from_lse``'s does, at the same
     shapes, and the input gradient sums them in the same order: the same arithmetic (bit for bit on CPU; on GPU the
-    strided output and the peeled block may get other GEMM kernels)."""
+    strided output and the peeled block may get other GEMM kernels).
+
+    ``options.grad_x_in_gemm`` sums the input gradient as ``_backward_streaming_from_lse`` does under it.
+    ``options.weight_blocks_in_weight_dtype`` changes nothing here: the blocks are always written in ``w``'s dtype,
+    which is what that option makes the stacked backward do, and their values are the same either way."""
     b_dim, h_dim = x.shape
     v_dim = w.shape[1]
     num_full_blocks = v_dim // v_block_size
@@ -782,12 +854,22 @@ def _backward_streaming_from_lse_in_place(
             dlogits = dlogits * soft_cap_grad
 
         dlogits_for_matmul = dlogits.astype(x.dtype)
-        grad_x_block = jax.lax.dot_general(
-            dlogits_for_matmul,
-            w_block,
-            (((1,), (1,)), ((), ())),
-            precision=precision,
-        ).astype(jnp.float32)
+        if options.grad_x_in_gemm:
+            # A float32 GEMM output added to the carried sum: XLA fuses the add into the GEMM (beta=1).
+            grad_x_block = jax.lax.dot_general(
+                dlogits_for_matmul,
+                w_block,
+                (((1,), (1,)), ((), ())),
+                precision=precision,
+                preferred_element_type=jnp.float32,
+            )
+        else:
+            grad_x_block = jax.lax.dot_general(
+                dlogits_for_matmul,
+                w_block,
+                (((1,), (1,)), ((), ())),
+                precision=precision,
+            ).astype(jnp.float32)
         grad_w_block = jax.lax.dot_general(
             x,
             dlogits_for_matmul,
@@ -818,7 +900,7 @@ def _backward_streaming_from_lse_in_place(
     return grad_x.astype(x.dtype), grad_w
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7))
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7, 8))
 def _linear_softmax_cross_entropy_loss_batched_xla_with_custom_backward(
     x: Float[Array, "B H"],
     labels: Int[Array, "B"],
@@ -828,11 +910,12 @@ def _linear_softmax_cross_entropy_loss_batched_xla_with_custom_backward(
     logit_soft_cap: Optional[float],
     precision: jax.lax.PrecisionLike,
     in_place_weight_grad: bool = False,
+    options: BackwardOptions = BackwardOptions(),
 ) -> tuple[Float[Array, "B"], Float[Array, "B"]]:
     """``in_place_weight_grad``: the streaming backward writes the weight gradient block by block into its ``[H, V]``
     result (``_backward_streaming_from_lse_in_place``); same arithmetic, without the float32 block stack or padded
-    weight copy."""
-    del in_place_weight_grad
+    weight copy. ``options``: how the streaming backward sums its vocabulary blocks (``BackwardOptions``)."""
+    del in_place_weight_grad, options
     return _linear_softmax_cross_entropy_loss_batched_xla_impl(
         x,
         labels,
@@ -853,8 +936,9 @@ def _linear_softmax_cross_entropy_loss_batched_xla_with_custom_backward_fwd(
     logit_soft_cap: Optional[float],
     precision: jax.lax.PrecisionLike,
     in_place_weight_grad: bool = False,
+    options: BackwardOptions = BackwardOptions(),
 ):
-    del in_place_weight_grad
+    del in_place_weight_grad, options
     loss, lse = _linear_softmax_cross_entropy_loss_batched_xla_impl(
         x,
         labels,
@@ -885,6 +969,7 @@ def _linear_softmax_cross_entropy_loss_batched_xla_with_custom_backward_bwd(
     logit_soft_cap: Optional[float],
     precision: jax.lax.PrecisionLike,
     in_place_weight_grad: bool,
+    options: BackwardOptions,
     residuals,
     output_cotangent,
 ):
@@ -914,6 +999,7 @@ def _linear_softmax_cross_entropy_loss_batched_xla_with_custom_backward_bwd(
             v_block_size=residuals.backward_v_block,
             logit_soft_cap=logit_soft_cap,
             precision=precision,
+            options=options,
         )
 
     return grad_x, None, grad_w
@@ -934,6 +1020,7 @@ _linear_softmax_cross_entropy_loss_batched_xla_with_custom_backward.defvjp(
         "precision",
         "return_argmax",
         "in_place_weight_grad",
+        "backward",
     ],
 )
 def _linear_softmax_cross_entropy_loss_batched_xla_dispatch(
@@ -947,6 +1034,7 @@ def _linear_softmax_cross_entropy_loss_batched_xla_dispatch(
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
     return_argmax: bool = False,
     in_place_weight_grad: bool = False,
+    backward: BackwardOptions = BackwardOptions(),
 ) -> tuple[Float[Array, "B"], Float[Array, "B"]] | tuple[Float[Array, "B"], Float[Array, "B"], Int[Array, "B"]]:
     if return_argmax:
         return _linear_softmax_cross_entropy_loss_batched_xla_impl(
@@ -968,6 +1056,7 @@ def _linear_softmax_cross_entropy_loss_batched_xla_dispatch(
         logit_soft_cap,
         precision,
         in_place_weight_grad,
+        backward,
     )
 
 
@@ -1008,7 +1097,13 @@ def linear_softmax_cross_entropy_loss_batched_xla(
         precision=precision,
         return_argmax=return_argmax,
         in_place_weight_grad=in_place_weight_grad,
+        backward=_BACKWARD_OPTIONS.get(),
     )
 
 
-__all__ = ["linear_softmax_cross_entropy_loss_batched_xla", "BatchedXlaUnsupportedError"]
+__all__ = [
+    "BackwardOptions",
+    "backward_options",
+    "linear_softmax_cross_entropy_loss_batched_xla",
+    "BatchedXlaUnsupportedError",
+]

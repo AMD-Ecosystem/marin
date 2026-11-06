@@ -53,6 +53,8 @@ from levanter.grug.loss import fused_linear_softmax_cross_entropy_loss
 from levanter.grug.sharding import Pembed_vocab, Plm_head, _mesh_axis_size, keep_reduced, unshard
 from levanter.kernels.pallas.add_rms_norm import AddRmsNormImpl, add_rms_norm_bwd, add_rms_norm_fwd
 from levanter.kernels.pallas.fused_cross_entropy_loss import BlockSizes
+from levanter.kernels.pallas.fused_cross_entropy_loss.batched_xla import BackwardOptions as CeBackwardOptions
+from levanter.kernels.pallas.fused_cross_entropy_loss.batched_xla import backward_options as ce_backward_options
 from levanter.kernels.pallas.qk_norm_rope import positions_or_arange, qk_norm_rope, rope_tables
 from levanter.sharding import partition_spec_of
 from levanter.tracker.histogram import Histogram, SummaryStats
@@ -69,6 +71,8 @@ _QB_GROUP_AXES: tuple[str, ...] = ("replica_dcn", "data")
 
 
 RematMode = Literal["recompute_all", "save_moe", "save_moe_attn"]
+CeBackwardGradX = Literal["add", "gemm"]
+CeBackwardWeightBlocks = Literal["float32", "weight_dtype"]
 # jax-aiter names its attention residuals (output, LSE, q/k/v) "context", as Transformer Engine does; a policy that
 # saves the name keeps the backward from re-running the attention forward.
 ATTENTION_REMAT_SAVE_NAME = "context"
@@ -195,6 +199,17 @@ class GrugModelConfig:
     differences). At d=2560, V=128256 the float32 stack and the padded weight (~1.9 GiB) are gone from the layer
     backward. "in_place" needs ``ce_implementation`` None or "batched_xla" and a GPU (``batched_xla`` refuses other
     backends)."""
+    ce_bwd_grad_x: CeBackwardGradX = "add"
+    """How the ``batched_xla`` cross-entropy backward sums the input gradient over its vocabulary blocks: each block's
+    GEMM writes bf16 and a separate kernel adds it to the float32 sum ("add"), or the GEMM writes float32 and XLA fuses
+    the add into it as its C operand, in place ("gemm"; beta=1 hipBLASLt). "gemm" adds each block unrounded, so the
+    gradient differs in the last bits. Only the ``batched_xla`` streaming backward reads it."""
+    ce_bwd_weight_blocks: CeBackwardWeightBlocks = "float32"
+    """How the ``batched_xla`` cross-entropy backward stacks the output projection's per-block weight gradients: widened
+    to float32 and narrowed back after the vocabulary loop ("float32"), or in the weight's dtype as the GEMM writes them
+    ("weight_dtype", the same values bit for bit, half the bytes). Only the ``batched_xla`` streaming backward reads
+    it. ``ce_weight_grad="in_place"`` supersedes it: that backward has no block stack and always writes the blocks in
+    the weight's dtype, so both settings give the same program there (``ce_bwd_grad_x`` applies to either backward)."""
     remat_mode: RematMode = "recompute_all"
     """Per-block gradient checkpointing. "recompute_all" reruns the whole block in
     backward (lowest memory); "save_moe" keeps the tagged MoE dispatch tensors so
@@ -1809,21 +1824,26 @@ class Transformer(eqx.Module):
         labels = jnp.concatenate([token_ids[:, 1:], token_ids[:, :1] * 0], axis=1).astype(jnp.int32)
         loss_weight = loss_weight.astype(loss_dtype)
 
-        cross_entropy_loss = fused_linear_softmax_cross_entropy_loss(
-            hidden,
-            self.output_proj,
-            labels,
-            weight=loss_weight,
-            reduction=reduction,
-            logsumexp_weight=logsumexp_weight,
-            dtype=loss_dtype,
-            implementation=(
-                "batched_xla_in_place_dw" if self.config.ce_weight_grad == "in_place" else self.config.ce_implementation
-            ),
-            block_sizes=(
-                None if self.config.ce_v_block_size is None else BlockSizes(v_block_size=self.config.ce_v_block_size)
-            ),
+        ce_backward = CeBackwardOptions(
+            grad_x_in_gemm=self.config.ce_bwd_grad_x == "gemm",
+            weight_blocks_in_weight_dtype=self.config.ce_bwd_weight_blocks == "weight_dtype",
         )
+        with ce_backward_options(ce_backward):
+            cross_entropy_loss = fused_linear_softmax_cross_entropy_loss(
+                hidden,
+                self.output_proj,
+                labels,
+                weight=loss_weight,
+                reduction=reduction,
+                logsumexp_weight=logsumexp_weight,
+                dtype=loss_dtype,
+                implementation=(
+                    "batched_xla_in_place_dw" if self.config.ce_weight_grad == "in_place" else self.config.ce_implementation
+                ),
+                block_sizes=(
+                    None if self.config.ce_v_block_size is None else BlockSizes(v_block_size=self.config.ce_v_block_size)
+                ),
+            )
         # No load-balancing loss; router z-loss only.
         if self.config.uses_router_z_loss:
             num_moe_layers = router_metrics["router_z_loss_per_layer"].shape[0]
