@@ -98,7 +98,7 @@ def test_ring_dedup_flydsl_gather_a_matches_explicit_gather_bitwise(dtype):
 
             with jax.set_mesh(mesh):
                 grad_fn = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2, 3), has_aux=True))
-                gathered = str(jax.make_jaxpr(loss)(*args)).count("name=gathered_up_projection")
+                gathered = str(jax.make_jaxpr(loss)(*args)).count("name=_gathered_up_projection")
                 (_, (out, counts)), grads = grad_fn(*args)
             return out, counts, grads, gathered
 

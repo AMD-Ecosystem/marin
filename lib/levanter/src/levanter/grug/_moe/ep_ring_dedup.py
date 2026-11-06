@@ -45,6 +45,7 @@ from levanter.grug._moe.flydsl_gather import gathered_up_projection
 from levanter.grug._moe.grad_accum import ExpertGradAccumulator, from_local_view, local_view
 from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
 from levanter.grug._moe.pallas_routing_metadata import MoeRoutingMetadata, expert_rows, send_slots
+from levanter.grug._moe.scatter_epilogue import MoeScatterEpilogue, dispatch_up, down_combine, scatter_plan
 
 
 def destination_hit_fraction(*, num_experts: int, local_experts: int, topk: int) -> float:
@@ -70,6 +71,7 @@ def _moe_mlp_ep_ring_dedup_local(
     gather_sum: MoeGatherSum = "xla",
     routing_metadata: MoeRoutingMetadata = "xla",
     flydsl_gather_a: bool = False,
+    scatter_epilogue: MoeScatterEpilogue = "off",
     grad_acc: ExpertGradAccumulator | None = None,
 ) -> (
     tuple[Float[Array, "Tlocal H"], CapacityDrops]
@@ -111,6 +113,11 @@ def _moe_mlp_ep_ring_dedup_local(
     the jax-flydsl GEMM gathers its A rows itself, so the expert-ordered copy ``x_dispatch`` is never built and the
     received rows are what the remat policy saves. Same values and gradients bit for bit; needs ``ragged_dot``'s flydsl
     implementation on GPU.
+
+    ``scatter_epilogue`` other than "off" runs the expert-side combine and dispatch backward as row-scatter epilogues
+    of the expert GEMMs plus a gather-sum of the remaining rows (see ``scatter_epilogue``), with the same results bit
+    for bit. It replaces the expert-side dispatch gather-sum, so ``gather_sum`` then only affects the sender side. With ``flydsl_gather_a`` the up projection inside it gathers its
+    A rows as well, and with ``grad_acc`` its weight gradients go into the accumulator.
     """
     tokens = x_local.shape[0]
     local_experts = moe_w13_local.shape[0]
@@ -132,6 +139,7 @@ def _moe_mlp_ep_ring_dedup_local(
         gather_sum=gather_sum,
         routing_metadata=routing_metadata,
         flydsl_gather_a=flydsl_gather_a,
+        scatter_epilogue=scatter_epilogue,
     )
     if token_blocks == 1:
         out_local, sender_dropped, receiver_dropped, grad_acc = block(
@@ -196,6 +204,7 @@ def _ring_dedup_block(
     gather_sum: MoeGatherSum,
     routing_metadata: MoeRoutingMetadata,
     flydsl_gather_a: bool,
+    scatter_epilogue: MoeScatterEpilogue,
     grad_acc: ExpertGradAccumulator | None = None,
 ) -> tuple[Float[Array, "T H"], Int[Array, ""], Int[Array, ""], ExpertGradAccumulator | None]:
     """One block of tokens through the exchange: its output, its local sender and receiver drops, and ``grad_acc``
@@ -240,43 +249,92 @@ def _ring_dedup_block(
                 routing_metadata=routing_metadata,
             )
         )
+        if scatter_epilogue != "off":
+            scatter_rows, gather_rows = scatter_plan(position, picked, dispatch_valid)
+            scatter_rows, gather_rows = tree_checkpoint_name((scatter_rows, gather_rows), _CHECKPOINT_ROUTING)
         if flydsl_gather_a:
             # The up projection reads the received rows through dispatch_row (sentinel send_rows reads zeros), so
             # they, not an expert-ordered copy, are the saved dispatch input.
             received_x = tree_checkpoint_name(received_x, _CHECKPOINT_DISPATCH_INPUT)
-        else:
+        elif scatter_epilogue == "off":
+            # (dispatch_up saves its own dispatch gather under the same name.)
             x_dispatch = _dispatch_rows(
                 received_x, jnp.minimum(dispatch_row, send_rows - 1), dispatch_valid, position, gather_sum
             )
             x_dispatch = tree_checkpoint_name(x_dispatch, _CHECKPOINT_DISPATCH_INPUT)
 
+    moe_dim = moe_w2_local.shape[1]
     with jax.named_scope("moe_up_down"):
-        moe_dim = moe_w2_local.shape[1]
-        if flydsl_gather_a:
-            if grad_acc is not None:
-                raise NotImplementedError("flydsl_gather_a with grad_acc")
-            w13_out = gathered_up_projection(received_x, dispatch_row, position, moe_w13_local, group_sizes, gather_sum)
+        if scatter_epilogue != "off":
+            w13_out = dispatch_up(
+                received_x,
+                jnp.minimum(dispatch_row, send_rows - 1),
+                dispatch_valid,
+                moe_w13_local,
+                group_sizes,
+                position,
+                scatter_rows,
+                gather_rows,
+                scatter_epilogue,
+                gather_a=flydsl_gather_a,
+                **_acc_args(grad_acc, "w13"),
+            )
+        elif flydsl_gather_a:
+            w13_out = gathered_up_projection(
+                received_x,
+                dispatch_row,
+                position,
+                moe_w13_local,
+                group_sizes,
+                gather_sum,
+                **_acc_args(grad_acc, "w13"),
+            )
         elif grad_acc is None:
             w13_out = ragged_dot(x_dispatch, moe_w13_local, group_sizes)
         else:
-            w13_out, grad_acc = _accumulating_ragged_dot(x_dispatch, moe_w13_local, group_sizes, grad_acc, "w13")
+            w13_out = ragged_dot_accumulating_grad(
+                x_dispatch, moe_w13_local, group_sizes, **_acc_args(grad_acc, "w13")
+            )
+        w13_out, grad_acc = _acc_result(w13_out, grad_acc, "w13")
         w13_out = tree_checkpoint_name(w13_out, _CHECKPOINT_EXPERT_HIDDEN)
         gate, up = jnp.split(w13_out, [moe_dim], axis=-1)
         hidden = activation_fn(gate) * up
-        if grad_acc is None:
-            out_dispatch = ragged_dot(hidden, moe_w2_local, group_sizes)
-        else:
-            out_dispatch, grad_acc = _accumulating_ragged_dot(hidden, moe_w2_local, group_sizes, grad_acc, "w2")
-        out_dispatch = tree_checkpoint_name(out_dispatch, _CHECKPOINT_DISPATCH_OUTPUT)
+        if scatter_epilogue == "off":
+            if grad_acc is None:
+                out_dispatch = ragged_dot(hidden, moe_w2_local, group_sizes)
+            else:
+                out_dispatch = ragged_dot_accumulating_grad(
+                    hidden, moe_w2_local, group_sizes, **_acc_args(grad_acc, "w2")
+                )
+            out_dispatch, grad_acc = _acc_result(out_dispatch, grad_acc, "w2")
+            out_dispatch = tree_checkpoint_name(out_dispatch, _CHECKPOINT_DISPATCH_OUTPUT)
 
     with jax.named_scope("combine"):
-        expert_combined = _combine_gather_sum(
-            out_dispatch,
-            position.reshape(-1),
-            picked,
-            received_weights,
-            out_dispatch.dtype,
-        )
+        if scatter_epilogue != "off":
+            # The down projection's output is saved inside down_combine under _CHECKPOINT_DISPATCH_OUTPUT.
+            expert_combined = down_combine(
+                hidden,
+                moe_w2_local,
+                group_sizes,
+                position,
+                picked,
+                received_weights,
+                scatter_rows,
+                gather_rows,
+                scatter_epilogue,
+                **_acc_args(grad_acc, "w2"),
+            )
+            expert_combined, grad_acc = _acc_result(expert_combined, grad_acc, "w2")
+        else:
+            expert_combined = _combine_gather_sum(
+                out_dispatch,
+                position.reshape(-1),
+                picked,
+                received_weights,
+                out_dispatch.dtype,
+            )
+
+    with jax.named_scope("combine"):
         returned = jax.lax.all_to_all(
             expert_combined.reshape(ep_size, pair_capacity, hidden_dim),
             "expert",
@@ -431,17 +489,25 @@ def _expert_routing(
     return received_weights, group_sizes, receiver_dropped, picked, dispatch_valid, dispatch_row, position
 
 
-def _accumulating_ragged_dot(
-    lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, grad_acc: ExpertGradAccumulator, which: str
-) -> tuple[jax.Array, ExpertGradAccumulator]:
-    """``ragged_dot`` of the up (``which="w13"``, ``rhs`` = w_gate | w_up) or down (``"w2"``) projection with its weight
-    gradient folded into this shard's block of ``grad_acc``."""
+def _acc_args(grad_acc: ExpertGradAccumulator | None, which: str) -> dict[str, Any]:
+    """The ``acc``/``layer``/``mode`` keywords of an expert matmul that folds the weight gradient of the up
+    (``which="w13"``, w_gate | w_up as two column halves) or down (``"w2"``) projection into this shard's block of
+    ``grad_acc`` (``ragged_dot_accumulating_grad``, ``gathered_up_projection``, ``dispatch_up``, ``down_combine``)."""
+    if grad_acc is None:
+        return {}
     if which == "w13":
-        acc = (local_view(grad_acc.w_gate), local_view(grad_acc.w_up))
+        acc: Any = (local_view(grad_acc.w_gate), local_view(grad_acc.w_up))
     else:
         acc = local_view(grad_acc.w_down)
-    result = ragged_dot_accumulating_grad(lhs, rhs, group_sizes, acc, grad_acc.layer, grad_acc.mode)
-    if grad_acc.mode == "final":
+    return {"acc": acc, "layer": grad_acc.layer, "mode": grad_acc.mode}
+
+
+def _acc_result(
+    result: Any, grad_acc: ExpertGradAccumulator | None, which: str
+) -> tuple[jax.Array, ExpertGradAccumulator | None]:
+    """``(output, grad_acc)`` from what a matmul called with ``_acc_args(grad_acc, which)`` returned: the output, or
+    with modes "init"/"accum" the output and the updated accumulator block."""
+    if grad_acc is None or grad_acc.mode == "final":
         return cast(jax.Array, result), grad_acc
     out, acc = cast(tuple[jax.Array, Any], result)
     if which == "w13":

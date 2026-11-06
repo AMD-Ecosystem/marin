@@ -26,6 +26,7 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 from levanter.grug._moe.grad_accum import ExpertGradAccumulator
 from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
 from levanter.grug._moe.pallas_routing_metadata import MoeRoutingMetadata
+from levanter.grug._moe.scatter_epilogue import MoeScatterEpilogue
 from levanter.grug.attention import (
     AttentionMask,
     GrugAttentionImplementation,
@@ -167,6 +168,12 @@ class GrugModelConfig:
     """Let ``ring_dedup``'s up-projection GEMM (forward and weight gradient) gather the dispatch rows in its A loads
     instead of building the expert-ordered copy (F3). Same values bit for bit; needs ``moe_implementation="ring_dedup"``
     and ``RAGGED_DOT_IMPL=flydsl`` on GPU (off GPU it runs the explicit gather)."""
+    moe_scatter_epilogue: MoeScatterEpilogue = "off"
+    """How ``ring_dedup`` runs the expert-side combine and dispatch backward: separate gathers ("off"), or row-scatter
+    epilogues of jax-flydsl's grouped GEMMs (the down projection writes single-slot received rows of the combine, the
+    up projection's data gradient those of the dispatch backward) plus a Pallas gather-sum of the other rows
+    ("flydsl"). Same values bit for bit. "flydsl" needs jax-flydsl on an AMD GPU; "reference" is the same data flow on
+    XLA GEMMs, for tests. Needs ``moe_implementation="ring_dedup"``."""
     ce_implementation: str | None = None
     """Fused cross-entropy backend selection (levanter fused_cross_entropy_loss). None keeps the
     backend default (GPU: full-logits ``xla`` path). Set ``"batched_xla"`` to use the blocked-vocab
@@ -906,6 +913,7 @@ class MoEMLP(eqx.Module):
                 gather_sum=cfg.moe_gather_sum,
                 routing_metadata=cfg.moe_routing_metadata,
                 flydsl_gather_a=cfg.moe_flydsl_gather_a,
+                scatter_epilogue=cfg.moe_scatter_epilogue,
             ),
             routed_moe=QBRoutedMoE(
                 num_experts_per_token=cfg.num_experts_per_token,

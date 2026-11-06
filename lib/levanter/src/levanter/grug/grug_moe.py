@@ -63,6 +63,7 @@ from levanter.grug._moe.local import _moe_mlp_local
 from levanter.grug._moe.grad_accum import ExpertGradAccumulator
 from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
 from levanter.grug._moe.pallas_routing_metadata import MoeRoutingMetadata
+from levanter.grug._moe.scatter_epilogue import MoeScatterEpilogue
 from levanter.grug._moe.routing_top_k import routing_top_k
 from levanter.grug.sharding import (
     _axis_names,
@@ -547,6 +548,7 @@ class MoEExpertMlp(eqx.Module):
     gather_sum: MoeGatherSum = eqx.field(static=True, default="xla")
     routing_metadata: MoeRoutingMetadata = eqx.field(static=True, default="xla")
     flydsl_gather_a: bool = eqx.field(static=True, default=False)
+    scatter_epilogue: MoeScatterEpilogue = eqx.field(static=True, default="off")
 
     @staticmethod
     def init(
@@ -567,6 +569,7 @@ class MoEExpertMlp(eqx.Module):
         gather_sum: MoeGatherSum = "xla",
         routing_metadata: MoeRoutingMetadata = "xla",
         flydsl_gather_a: bool = False,
+        scatter_epilogue: MoeScatterEpilogue = "off",
         pspecs: MoEExpertMlpPspecs = MoEExpertMlpPspecs(),
     ) -> "MoEExpertMlp":
         resolved_implementation = resolve_moe_implementation(implementation)
@@ -594,6 +597,7 @@ class MoEExpertMlp(eqx.Module):
             gather_sum=gather_sum,
             routing_metadata=routing_metadata,
             flydsl_gather_a=flydsl_gather_a,
+            scatter_epilogue=scatter_epilogue,
         )
 
     @named_call
@@ -632,6 +636,7 @@ class MoEExpertMlp(eqx.Module):
             routing_metadata=self.routing_metadata,
             grad_acc=grad_acc,
             flydsl_gather_a=self.flydsl_gather_a,
+            scatter_epilogue=self.scatter_epilogue,
         )
 
 
@@ -658,6 +663,7 @@ def moe_mlp(
     routing_metadata: MoeRoutingMetadata = "xla",
     grad_acc: ExpertGradAccumulator | None = None,
     flydsl_gather_a: bool = False,
+    scatter_epilogue: MoeScatterEpilogue = "off",
 ) -> Any:
     """Functional routed MoE MLP core used by Grug modules and benchmarks.
 
@@ -707,13 +713,18 @@ def moe_mlp(
     counts) with two Pallas-Triton counting-sort kernels per side instead of XLA fusions, with the same values
     (`ring_dedup` only).
 
+    `flydsl_gather_a=True` lets the jax-flydsl up-projection GEMM gather `ring_dedup`'s dispatch rows in its A loads
+    (forward and weight gradient) instead of building the expert-ordered copy, with the same results bit for bit
+    (`ring_dedup` with `ragged_dot`'s flydsl implementation only).
+
+    `scatter_epilogue="flydsl"` runs `ring_dedup`'s expert-side combine and dispatch backward as row-scatter epilogues
+    of jax-flydsl's grouped GEMMs plus a Pallas gather-sum of the remaining rows, with the same results bit for bit
+    (`ring_dedup` only; "reference" is the same data flow on XLA GEMMs, for tests).
+
     Returns the output, or `(output, MoeDispatchCounts)` with `report_capacity_overflow`. `grad_acc` (an
     `ExpertGradAccumulator` with its layer set) folds the expert weight gradients into float32 sums of the stacked
     expert weights inside the jax-flydsl weight-gradient kernel (`ring_dedup` under expert parallelism only); the call
     then returns `(result, grad_acc)`, `result` being what it returns without it.
-    `flydsl_gather_a=True` lets the jax-flydsl up-projection GEMM gather `ring_dedup`'s dispatch rows in its A loads
-    (forward and weight gradient) instead of building the expert-ordered copy, with the same results bit for bit
-    (`ring_dedup` with `ragged_dot`'s flydsl implementation only).
     """
     resolved_implementation = resolve_moe_implementation(implementation)
     if token_blocks < 1:
@@ -735,6 +746,12 @@ def moe_mlp(
         )
     if flydsl_gather_a and resolved_implementation != "ring_dedup":
         raise ValueError(f"flydsl_gather_a requires ring_dedup, got implementation={resolved_implementation!r}")
+    if scatter_epilogue not in get_args(MoeScatterEpilogue):
+        raise ValueError(f"scatter_epilogue must be one of {get_args(MoeScatterEpilogue)}, got {scatter_epilogue!r}")
+    if scatter_epilogue != "off" and resolved_implementation != "ring_dedup":
+        raise ValueError(
+            f"scatter_epilogue={scatter_epilogue!r} requires ring_dedup, got implementation={resolved_implementation!r}"
+        )
 
     if mesh is None:
         mesh = _current_mesh()
@@ -857,6 +874,7 @@ def moe_mlp(
                 gather_sum=gather_sum,
                 routing_metadata=routing_metadata,
                 flydsl_gather_a=flydsl_gather_a,
+                scatter_epilogue=scatter_epilogue,
             )
             if grad_acc is not None:
                 # The accumulator rides last, after the weights, as a keyword of the local function.
