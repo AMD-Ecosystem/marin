@@ -221,6 +221,7 @@ def _moe_mlp_ep_ring_filtered_local(
     token_sharding_axes: tuple[str, ...],
     token_blocks: int,
     reduce_drops: bool = True,
+    dispatch_barrier: bool = False,
     gather_sum: MoeGatherSum = "xla",
     routing_metadata: MoeRoutingMetadata = "xla",
     flydsl_gather_a: bool = False,
@@ -248,6 +249,10 @@ def _moe_mlp_ep_ring_filtered_local(
 
     The drop counts are summed over ``token_sharding_axes`` (one small all-reduce per call), or, with
     ``reduce_drops=False``, returned as this shard's own counts, shape [1], for the caller to reduce later.
+
+    ``dispatch_barrier`` puts an optimization barrier on the expert-ordered dispatch rows ``x_dispatch``: the remat
+    policy saves them, and without it XLA fuses a second copy of their gather into the update of the saved stack. With
+    ``flydsl_gather_a`` or a ``scatter_epilogue`` those rows are never built and it does nothing.
 
     ``gather_sum`` picks how the backward's expert-side dispatch gather-sum and sender-side combine gather run: XLA
     fusions ("xla") or the Pallas-Triton kernel of ``pallas_gather_sum`` ("pallas"), with the same results bit for bit.
@@ -289,6 +294,7 @@ def _moe_mlp_ep_ring_filtered_local(
         num_experts=num_experts,
         capacity_factor=capacity_factor,
         transport_capacity_factor=transport_capacity_factor,
+        dispatch_barrier=dispatch_barrier,
         gather_sum=gather_sum,
         routing_metadata=routing_metadata,
         flydsl_gather_a=flydsl_gather_a,
@@ -354,6 +360,7 @@ def _ring_filtered_block(
     num_experts: int,
     capacity_factor: float,
     transport_capacity_factor: float,
+    dispatch_barrier: bool,
     gather_sum: MoeGatherSum,
     routing_metadata: MoeRoutingMetadata,
     flydsl_gather_a: bool,
@@ -414,6 +421,8 @@ def _ring_filtered_block(
             x_dispatch = _dispatch_rows(
                 received_x, jnp.minimum(dispatch_row, send_rows - 1), dispatch_valid, position, gather_sum
             )
+            if dispatch_barrier:
+                x_dispatch = jax.lax.optimization_barrier(x_dispatch)
             x_dispatch = tree_checkpoint_name(x_dispatch, _CHECKPOINT_DISPATCH_INPUT)
 
     moe_dim = moe_w2_local.shape[1]

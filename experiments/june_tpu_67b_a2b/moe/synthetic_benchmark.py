@@ -187,6 +187,13 @@ def parse_args() -> argparse.Namespace:
         "so one block's exchange can overlap another's expert matmuls.",
     )
     parser.add_argument(
+        "--moe-dispatch-barrier",
+        action="store_true",
+        help="ring_filtered only: optimization barrier on the expert-ordered dispatch rows, so XLA computes their "
+        "gather once instead of also fusing it into the saved-residual update; same results bit for bit "
+        "(GrugModelConfig.moe_dispatch_barrier).",
+    )
+    parser.add_argument(
         "--moe-gather-sum",
         choices=get_args(MoeGatherSum),
         default="xla",
@@ -480,6 +487,7 @@ def main() -> None:
         pooled_transport_capacity_factor=args.pooled_transport_capacity_factor,
         num_expert_waves=args.num_expert_waves,
         moe_token_blocks=args.moe_token_blocks,
+        moe_dispatch_barrier=args.moe_dispatch_barrier,
         moe_gather_sum=args.moe_gather_sum,
         moe_routing_metadata=args.moe_routing_metadata,
         moe_flydsl_gather_a=args.moe_flydsl_gather_a,
@@ -586,7 +594,7 @@ def main() -> None:
         "token_blocks=%d gather_sum=%s routing_metadata=%s flydsl_gather_a=%s scatter_epilogue=%s ce_v_block=%s "
         "remat=%s remat_prevent_cse=%s rms_norm_impl=%s fused_norm_impl=%s qk_norm_rope=%s attention_schedule=%s "
         "replicated_grads=%s router_stats=%s capacity_drops=%s qb_threshold=%s router_diagnostics=%s "
-        "skip_zero_router_z_loss=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
+        "skip_zero_router_z_loss=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s dispatch_barrier=%s "
         "zero1=%s gather_in_first_microbatch=%s expert_grad_accumulation=%s block_grad_accumulation=%s "
         "ce_weight_grad=%s watch_interval=%d pipelined_step_logging=%s ce_bwd_grad_x=%s ce_bwd_weight_blocks=%s "
         "flops_per_example=%.4e",
@@ -631,6 +639,7 @@ def main() -> None:
         args.qb_balance,
         args.qb_sync_interval,
         args.carry_compute_params,
+        model.moe_dispatch_barrier,
         args.zero1,
         args.gather_in_first_microbatch,
         args.expert_grad_accumulation,
