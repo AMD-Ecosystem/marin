@@ -412,6 +412,7 @@ def _expert_routing(
     )
     return received_weights, group_sizes, receiver_dropped, picked, dispatch_valid, dispatch_row, position
 
+
 def _accumulating_ragged_dot(
     lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, grad_acc: ExpertGradAccumulator, which: str
 ) -> tuple[jax.Array, ExpertGradAccumulator]:

@@ -197,3 +197,53 @@ def test_in_kernel_sums_with_token_blocks():
             raise AssertionError("expected a NotImplementedError")
         """
     )
+
+
+@pytest.mark.timeout(900)
+def test_in_kernel_sums_with_the_static_attention_schedule():
+    # The trace-time attention schedule runs its own layer loop (a scanned group of four layers, then two), which
+    # carries the sums like the per-layer cond's scan; with the overlapped last microbatch it reads them per layer.
+    _run(
+        """
+        cfg = dataclasses.replace(GA_CFG, num_layers=6, attention_schedule="static")
+        assert_same_step(cfg=cfg)
+        assert_same_step(cfg=cfg, zero1=True, gather=True, overlap=True)
+        """
+    )
+
+
+@pytest.mark.timeout(900)
+def test_stacked_options_give_the_all_off_step():
+    # The stack1 options together: the fused residual add + RMS norm + GatedNorm, the fused q/k norm + RoPE and the
+    # routing-metadata kernels in Pallas (the interpreter off GPU), and the in-kernel expert gradient sums (the jnp
+    # stand-ins above), in the loop and with ZeRO-1, the first microbatch's gathers and the overlapped last
+    # microbatch. Against the fused norm alone, the others change only float32 rounding of the q/k norm's statistic
+    # (gradients within 1%). Against all four off, the gradients differ by what the fused norm alone changes with bf16
+    # compute (its backward rounds once where the separate modules round at each op): up to ~9% in norm for the router's
+    # in this toy model, whose bf16 gradients are ~6-20% from float32 ones either way. head_dim 64 as in the q/k
+    # kernel's step test.
+    _run(
+        """
+        off = dataclasses.replace(GA_CFG, head_dim=64)
+        fused = dataclasses.replace(off, fused_norm_impl="pallas")
+        on = dataclasses.replace(fused, qk_norm_rope="pallas", moe_routing_metadata="pallas")
+
+        def assert_close(grads, reference, rtol, label):
+            for (path, a), b in zip(
+                jax.tree_util.tree_leaves_with_path(reference), jax.tree.leaves(grads), strict=True
+            ):
+                a, b = np.asarray(a, np.float32), np.asarray(b, np.float32)
+                error = float(np.linalg.norm(a - b)) / max(float(np.linalg.norm(a)), 1e-30)
+                assert error <= rtol, (label, jax.tree_util.keystr(path), error)
+
+        cases = [("replica4_expert2", {}), ("replica2_data2_expert2", {"zero1": True, "gather": True, "overlap": True})]
+        for name, kwargs in cases:
+            mesh = MESHES[name]
+            loss, grads = accumulated_grads(mesh, accumulation="xla", cfg=off, **kwargs)
+            _, fused_grads = accumulated_grads(mesh, accumulation="xla", cfg=fused, **kwargs)
+            on_loss, on_grads = accumulated_grads(mesh, accumulation="flydsl", cfg=on, **kwargs)
+            np.testing.assert_allclose(on_loss, loss, rtol=2e-2, err_msg=name)
+            assert_close(on_grads, fused_grads, 2e-2, (name, "fused norm only"))
+            assert_close(on_grads, grads, 0.15, (name, "all off"))
+        """
+    )
