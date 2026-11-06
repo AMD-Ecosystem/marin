@@ -739,7 +739,8 @@ def _backward_streaming_from_lse_in_place(
     scan covers the whole blocks and a final, narrower block takes the remainder, so ``w`` is never copied to a padded
     ``[H, blocks * v_block]``: the scan covers the whole blocks, and the remainder runs after it from a copy of only its
     own columns padded to one block. Every block computes what ``_backward_streaming_from_lse``'s does, at the same
-    shapes, and the input gradient sums them in the same order, so both gradients are the same."""
+    shapes, and the input gradient sums them in the same order: the same arithmetic (bit for bit on CPU; on GPU the
+    strided output and the peeled block may get other GEMM kernels)."""
     b_dim, h_dim = x.shape
     v_dim = w.shape[1]
     num_full_blocks = v_dim // v_block_size
@@ -829,7 +830,7 @@ def _linear_softmax_cross_entropy_loss_batched_xla_with_custom_backward(
     in_place_weight_grad: bool = False,
 ) -> tuple[Float[Array, "B"], Float[Array, "B"]]:
     """``in_place_weight_grad``: the streaming backward writes the weight gradient block by block into its ``[H, V]``
-    result (``_backward_streaming_from_lse_in_place``); same gradients, without the float32 block stack or padded
+    result (``_backward_streaming_from_lse_in_place``); same arithmetic, without the float32 block stack or padded
     weight copy."""
     del in_place_weight_grad
     return _linear_softmax_cross_entropy_loss_batched_xla_impl(

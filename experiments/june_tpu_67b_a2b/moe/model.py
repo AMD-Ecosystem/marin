@@ -179,9 +179,11 @@ class GrugModelConfig:
     "stacked": its vocab loop emits each block's gradient as a float32 ``[blocks, H, v_block]`` stack, transposed,
     sliced and cast to ``[H, V]`` after the loop, from the projection padded to whole blocks. "in_place": each block's
     gradient, already in the projection's dtype, is written into the ``[H, V]`` result inside the loop, and the last,
-    partial block is a narrower one instead of padding (implementation ``batched_xla_in_place_dw``, same block sizes and
-    gradients). At d=2560, V=128256 that is ~1.9 GiB less live through the layer backward. "in_place" needs
-    ``ce_implementation`` None or "batched_xla" and a GPU (``batched_xla`` refuses other backends)."""
+    partial block alone is padded (implementation ``batched_xla_in_place_dw``, same block sizes). Same arithmetic,
+    bit for bit on CPU; on GPU the new output layout and the peeled last block can pick other GEMM kernels (bf16-ulp
+    differences). At d=2560, V=128256 the float32 stack and the padded weight (~1.9 GiB) are gone from the layer
+    backward. "in_place" needs ``ce_implementation`` None or "batched_xla" and a GPU (``batched_xla`` refuses other
+    backends)."""
     remat_mode: RematMode = "recompute_all"
     """Per-block gradient checkpointing. "recompute_all" reruns the whole block in
     backward (lowest memory); "save_moe" keeps the tagged MoE dispatch tensors so
