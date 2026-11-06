@@ -206,6 +206,15 @@ def parse_args() -> argparse.Namespace:
         "autotune; on MI355X its backward keeps its 8192 block). Default: the backend's choice "
         "(GrugModelConfig.ce_v_block_size).",
     )
+    parser.add_argument(
+        "--ce-weight-grad",
+        choices=("stacked", "in_place"),
+        default="stacked",
+        help="How batched_xla's cross-entropy backward builds the output projection's gradient: a float32 stack of "
+        "vocab blocks cast after the loop, from a padded projection (stacked), or each block written into the [H, V] "
+        "result in place, without padding (in_place; same gradients, ~1.9 GiB less memory) "
+        "(GrugModelConfig.ce_weight_grad).",
+    )
     parser.add_argument("--profile-steps", type=int, default=0, help="Profile this many steps (0 disables).")
     parser.add_argument("--profile-start", type=int, default=10, help="First profiled step.")
     parser.add_argument("--log-dir", type=Path, default=Path("logs/june-synthetic"))
@@ -339,6 +348,16 @@ def parse_args() -> argparse.Namespace:
         "on an expert axis of 2+, bit-identical) (GrugTrainerConfig.expert_grad_accumulation).",
     )
     parser.add_argument(
+        "--block-grad-accumulation",
+        choices=("after_scan", "in_scan"),
+        default="after_scan",
+        help="With --microbatches > 1: sum the other stacked block weights' gradients (attention, shared expert, "
+        "norms, router; the expert weights too without --expert-grad-accumulation flydsl) with a float32 add after "
+        "each microbatch's layer scan (after_scan), or inside the layer scan's backward, layer by layer into the "
+        "carried float32 sums (in_scan; bit-identical, no stacked per-microbatch gradient) "
+        "(GrugTrainerConfig.block_grad_accumulation).",
+    )
+    parser.add_argument(
         "--watch-interval", type=int, default=10, help="Steps between gradient watch steps (0 disables)."
     )
     parser.add_argument(
@@ -430,6 +449,7 @@ def main() -> None:
         moe_gather_sum=args.moe_gather_sum,
         moe_routing_metadata=args.moe_routing_metadata,
         ce_v_block_size=args.ce_v_block_size,
+        ce_weight_grad=args.ce_weight_grad,
         scan_unroll=args.scan_unroll,
         replicated_grad_reduction=args.replicated_grads,
         replicated_grad_max_bytes=int(args.replicated_grads_max_mib * (1 << 20)),
@@ -515,6 +535,7 @@ def main() -> None:
             overlap_last_microbatch=args.overlap_last_microbatch,
             gather_in_first_microbatch=args.gather_in_first_microbatch,
             expert_grad_accumulation=args.expert_grad_accumulation,
+            block_grad_accumulation=args.block_grad_accumulation,
             pipelined_step_logging=args.pipelined_step_logging,
         ),
         eval=None,
@@ -524,11 +545,13 @@ def main() -> None:
         "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d microbatches=%d "
         "overlap_last_microbatch=%s seq_len=%d "
         "window=%d mp=%s expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d "
-        "token_blocks=%d gather_sum=%s routing_metadata=%s ce_v_block=%s remat=%s remat_prevent_cse=%s "
+        "token_blocks=%d gather_sum=%s routing_metadata=%s ce_v_block=%s ce_weight_grad=%s remat=%s "
+        "remat_prevent_cse=%s "
         "rms_norm_impl=%s fused_norm_impl=%s qk_norm_rope=%s attention_schedule=%s "
         "replicated_grads=%s router_stats=%s capacity_drops=%s qb_threshold=%s router_diagnostics=%s "
         "skip_zero_router_z_loss=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
-        "zero1=%s gather_in_first_microbatch=%s expert_grad_accumulation=%s watch_interval=%d pipelined_step_logging=%s "
+        "zero1=%s gather_in_first_microbatch=%s expert_grad_accumulation=%s block_grad_accumulation=%s "
+        "watch_interval=%d pipelined_step_logging=%s "
         "flops_per_example=%.4e",
         args.size,
         model.num_layers,
@@ -554,6 +577,7 @@ def main() -> None:
         model.moe_gather_sum,
         model.moe_routing_metadata,
         model.ce_v_block_size,
+        model.ce_weight_grad,
         args.remat_mode,
         model.remat_prevent_cse,
         model.rms_norm_impl,
@@ -572,6 +596,7 @@ def main() -> None:
         args.zero1,
         args.gather_in_first_microbatch,
         args.expert_grad_accumulation,
+        args.block_grad_accumulation,
         args.watch_interval,
         args.pipelined_step_logging,
         flops_per_example,
