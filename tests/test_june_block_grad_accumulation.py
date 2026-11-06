@@ -165,3 +165,43 @@ def test_in_place_ce_weight_grad_gives_the_stacked_step():
             raise AssertionError("expected a ValueError")
         """
     )
+
+
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "kwargs", ["{}", '{"zero1": True, "gather": True, "overlap": True}'], ids=["loop", "zero1_gathers_overlap"]
+)
+def test_stack3_options_give_the_stack2_step(kwargs):
+    # The stack3 options on the stack1 and stack2 options (as in test_june_expert_grad_accumulation's stacked test,
+    # with the in-kernel expert gradient sums), with batched_xla's streaming backward on CPU: the block sums in the
+    # layer scan, the CE weight gradient's blocks in the weight's dtype, alone or written in place (which supersedes
+    # it), and the dispatch barrier (it acts only without the gathered A and scatter epilogues, hence the stack1 base).
+    # Each is an exact rewrite, so the step is the base's bit for bit.
+    _run(
+        f"""
+        from levanter.kernels.pallas.fused_cross_entropy_loss import batched_xla
+
+        batched_xla._validate_input_contract = lambda *args, **kwargs: None
+        stack1 = dataclasses.replace(
+            GA_CFG, head_dim=64, fused_norm_impl="pallas", qk_norm_rope="pallas", moe_routing_metadata="pallas",
+            vocab_size=40, ce_implementation="batched_xla", ce_v_block_size=16,
+        )
+        stack2 = dataclasses.replace(
+            stack1, moe_gather_sum="pallas", moe_flydsl_gather_a=True, moe_scatter_epilogue="flydsl"
+        )
+
+        def stack3(cfg, **options):
+            return dataclasses.replace(cfg, moe_dispatch_barrier=True, ce_bwd_weight_blocks="weight_dtype", **options)
+
+        kwargs = {kwargs}
+        for name, mesh in MESHES.items():
+            for label, base in (("stack1", stack1), ("stack2", stack2)):
+                loss, grads = block_grads(mesh, block="after_scan", accumulation="flydsl", cfg=base, **kwargs)
+                for variant, cfg in (
+                    ("weight_dtype", stack3(base)),
+                    ("in_place", stack3(base, ce_implementation=None, ce_weight_grad="in_place")),
+                ):
+                    k_loss, k_grads = block_grads(mesh, block="in_scan", accumulation="flydsl", cfg=cfg, **kwargs)
+                    assert_bitwise((name, label, variant), loss, grads, k_loss, k_grads)
+        """
+    )
