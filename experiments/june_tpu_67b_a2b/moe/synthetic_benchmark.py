@@ -564,12 +564,11 @@ def main() -> None:
         "overlap_last_microbatch=%s seq_len=%d "
         "window=%d mp=%s expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d "
         "token_blocks=%d gather_sum=%s routing_metadata=%s flydsl_gather_a=%s scatter_epilogue=%s ce_v_block=%s "
-        "ce_weight_grad=%s remat=%s remat_prevent_cse=%s rms_norm_impl=%s fused_norm_impl=%s qk_norm_rope=%s "
-        "attention_schedule=%s "
+        "remat=%s remat_prevent_cse=%s rms_norm_impl=%s fused_norm_impl=%s qk_norm_rope=%s attention_schedule=%s "
         "replicated_grads=%s router_stats=%s capacity_drops=%s qb_threshold=%s router_diagnostics=%s "
         "skip_zero_router_z_loss=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
         "zero1=%s gather_in_first_microbatch=%s expert_grad_accumulation=%s block_grad_accumulation=%s "
-        "watch_interval=%d pipelined_step_logging=%s "
+        "ce_weight_grad=%s watch_interval=%d pipelined_step_logging=%s "
         "flops_per_example=%.4e",
         args.size,
         model.num_layers,
@@ -597,7 +596,6 @@ def main() -> None:
         model.moe_flydsl_gather_a,
         model.moe_scatter_epilogue,
         model.ce_v_block_size,
-        model.ce_weight_grad,
         args.remat_mode,
         model.remat_prevent_cse,
         model.rms_norm_impl,
@@ -617,6 +615,7 @@ def main() -> None:
         args.gather_in_first_microbatch,
         args.expert_grad_accumulation,
         args.block_grad_accumulation,
+        model.ce_weight_grad,
         args.watch_interval,
         args.pipelined_step_logging,
         flops_per_example,
