@@ -161,6 +161,11 @@ class GrugModelConfig:
     moe_token_blocks: int = 1
     """Token blocks per shard for ``ring_dedup``: each block has its own all-to-all exchange, so one
     block's collectives can overlap another's expert matmuls. Must divide the local token count."""
+    moe_dispatch_barrier: bool = False
+    """Put an optimization barrier on ``ring_dedup``'s expert-ordered dispatch rows (``x_dispatch``), so XLA computes
+    their gather once instead of fusing a second copy of it into the update of the saved-residual stack. Same values
+    bit for bit; only matters without ``moe_flydsl_gather_a`` and with ``moe_scatter_epilogue="off"`` (the others
+    never build those rows). Needs ``moe_implementation="ring_dedup"``."""
     moe_gather_sum: MoeGatherSum = "xla"
     """How ``ring_dedup`` runs the backward's expert-side dispatch gather-sum and sender-side combine gather: XLA
     fusions ("xla") or a Pallas-Triton row-gather kernel ("pallas"). Both give the same values bit for bit; off GPU the
@@ -940,6 +945,7 @@ class MoEMLP(eqx.Module):
                 pooled_transport_capacity_factor=cfg.pooled_transport_capacity_factor,
                 num_expert_waves=cfg.num_expert_waves,
                 token_blocks=cfg.moe_token_blocks,
+                dispatch_barrier=cfg.moe_dispatch_barrier,
                 gather_sum=cfg.moe_gather_sum,
                 routing_metadata=cfg.moe_routing_metadata,
                 flydsl_gather_a=cfg.moe_flydsl_gather_a,

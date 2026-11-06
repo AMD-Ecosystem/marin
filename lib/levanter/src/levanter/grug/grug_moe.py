@@ -545,6 +545,7 @@ class MoEExpertMlp(eqx.Module):
     expert_chunks: int = eqx.field(static=True, default=1)
     num_expert_waves: int = eqx.field(static=True, default=1)
     token_blocks: int = eqx.field(static=True, default=1)
+    dispatch_barrier: bool = eqx.field(static=True, default=False)
     gather_sum: MoeGatherSum = eqx.field(static=True, default="xla")
     routing_metadata: MoeRoutingMetadata = eqx.field(static=True, default="xla")
     flydsl_gather_a: bool = eqx.field(static=True, default=False)
@@ -566,6 +567,7 @@ class MoEExpertMlp(eqx.Module):
         expert_chunks: int = 1,
         num_expert_waves: int = 1,
         token_blocks: int = 1,
+        dispatch_barrier: bool = False,
         gather_sum: MoeGatherSum = "xla",
         routing_metadata: MoeRoutingMetadata = "xla",
         flydsl_gather_a: bool = False,
@@ -594,6 +596,7 @@ class MoEExpertMlp(eqx.Module):
             expert_chunks=expert_chunks,
             num_expert_waves=num_expert_waves,
             token_blocks=token_blocks,
+            dispatch_barrier=dispatch_barrier,
             gather_sum=gather_sum,
             routing_metadata=routing_metadata,
             flydsl_gather_a=flydsl_gather_a,
@@ -632,6 +635,7 @@ class MoEExpertMlp(eqx.Module):
             expert_chunks=self.expert_chunks,
             num_expert_waves=self.num_expert_waves,
             token_blocks=self.token_blocks,
+            dispatch_barrier=self.dispatch_barrier,
             gather_sum=self.gather_sum,
             routing_metadata=self.routing_metadata,
             grad_acc=grad_acc,
@@ -659,6 +663,7 @@ def moe_mlp(
     expert_chunks: int = 1,
     num_expert_waves: int = 1,
     token_blocks: int = 1,
+    dispatch_barrier: bool = False,
     gather_sum: MoeGatherSum = "xla",
     routing_metadata: MoeRoutingMetadata = "xla",
     grad_acc: ExpertGradAccumulator | None = None,
@@ -706,6 +711,9 @@ def moe_mlp(
     `token_blocks` splits each shard's tokens into that many blocks, each with its own exchange, so
     one block's collectives can overlap another block's expert matmuls (`ring_dedup` only).
 
+    `dispatch_barrier=True` puts an optimization barrier on `ring_dedup`'s expert-ordered dispatch rows, so XLA
+    computes their gather once instead of also fusing it into the saved-residual update (`ring_dedup` only).
+
     `gather_sum="pallas"` runs `ring_dedup`'s expert-side dispatch backward and sender-side combine backward row
     gathers in a Pallas-Triton kernel instead of XLA fusions, with the same results bit for bit (`ring_dedup` only).
 
@@ -732,6 +740,8 @@ def moe_mlp(
     if token_blocks > 1 and resolved_implementation != "ring_dedup":
         raise ValueError(f"token_blocks > 1 requires ring_dedup, got implementation={resolved_implementation!r}")
     local_capacity_drops = local_capacity_drops and report_capacity_overflow
+    if dispatch_barrier and resolved_implementation != "ring_dedup":
+        raise ValueError(f"dispatch_barrier requires ring_dedup, got implementation={resolved_implementation!r}")
     if gather_sum not in get_args(MoeGatherSum):
         raise ValueError(f"gather_sum must be one of {get_args(MoeGatherSum)}, got {gather_sum!r}")
     if gather_sum != "xla" and resolved_implementation != "ring_dedup":
@@ -871,6 +881,7 @@ def moe_mlp(
                 transport_capacity_factor=pooled_transport_capacity_factor,
                 token_blocks=token_blocks,
                 reduce_drops=not local_capacity_drops,
+                dispatch_barrier=dispatch_barrier,
                 gather_sum=gather_sum,
                 routing_metadata=routing_metadata,
                 flydsl_gather_a=flydsl_gather_a,
