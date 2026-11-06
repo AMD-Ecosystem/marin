@@ -13,10 +13,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from haliax.nn.ragged_dot import ragged_dot
+from haliax.nn.ragged_dot import ragged_dot, ragged_dot_accumulating_grad
 
 from levanter.grug._moe.ep_common import _assignment_sources, _combine_gather_sum, _combine_gather_sum_impl
 from levanter.grug._moe.ep_ring import _dispatch_rows, _gather_sum_slots, _select_local_assignments
+from levanter.grug._moe.flydsl_gather import gathered_up_projection
 from levanter.grug._moe.pallas_gather_sum import gather_sum_rows_into
 from levanter.grug._moe.scatter_epilogue import dispatch_up, down_combine, scatter_plan
 from levanter.utils.jax_utils import is_rocm_backend
@@ -241,4 +242,91 @@ def test_flydsl_epilogues_match_unfused_bitwise_on_rocm(gather_sum):
             up_ct,
         )(received, w13),
         value_and_grads(lambda r, w: up(r, safe_row, dispatch_valid, w, group_sizes, position), up_ct)(received, w13),
+    )
+
+
+@pytest.mark.parametrize("mode", ["accum", "final"])
+@pytest.mark.parametrize("gather_sum", ["xla", "pallas"])
+def test_stacked_expert_path_matches_unfused_bitwise_on_rocm(gather_sum, mode, monkeypatch):
+    """The epilogues with the dispatch gather inside the up projection's GEMMs (``gather_a``) and the expert weight
+    gradients summed in the wgrad kernel, and ``gathered_up_projection`` with the sums, against the unfused path with
+    ``ragged_dot_accumulating_grad``: outputs, data gradients and the sums (or, with "final", the weight gradients)."""
+    if not is_rocm_backend() or importlib.util.find_spec("jax_flydsl") is None:
+        pytest.skip("needs a ROCm GPU and jax-flydsl")
+    monkeypatch.setenv("RAGGED_DOT_IMPL", "flydsl")
+    received_rows, topk, experts, capacity, hidden, inter, layers = 14988, 4, 32, 16384, 2560, 1280, 2
+    group_sizes, picked, dispatch_valid, dispatch_row, position, weights = routing(
+        jax.random.key(3), received_rows, topk, experts, capacity, 0.3
+    )
+    dst_row, write = scatter_plan(position, picked, dispatch_valid)
+    keys = jax.random.split(jax.random.key(5), 9)
+    h = jax.random.normal(keys[0], (capacity, inter)).astype(jnp.bfloat16)
+    w2 = (jax.random.normal(keys[1], (experts, inter, hidden)) / 32).astype(jnp.bfloat16)
+    received = jax.random.normal(keys[2], (received_rows, hidden)).astype(jnp.bfloat16)
+    w13 = (jax.random.normal(keys[3], (experts, hidden, 2 * inter)) / 48).astype(jnp.bfloat16)
+    combine_ct = jax.random.normal(keys[4], (received_rows, hidden)).astype(jnp.bfloat16)
+    up_ct = jax.random.normal(keys[5], (capacity, 2 * inter)).astype(jnp.bfloat16)
+    acc13 = tuple(jax.random.normal(k, (layers, experts, hidden, inter), jnp.float32) for k in keys[6:8])
+    acc2 = jax.random.normal(keys[8], (layers, experts, inter, hidden), jnp.float32)
+    layer = jnp.int32(1)
+    safe_row = jnp.minimum(dispatch_row, received_rows - 1)
+    row_index = jnp.where(dispatch_valid, safe_row, received_rows)
+    sums = {"acc": None, "layer": layer, "mode": mode}
+
+    def unfused_up(r, w, acc):
+        x = _dispatch_rows(r, safe_row, dispatch_valid, position, gather_sum)
+        return ragged_dot_accumulating_grad(x, w, group_sizes, acc, layer, mode)
+
+    def unfused_combine(h, w2, wts, acc):
+        y = ragged_dot_accumulating_grad(h, w2, group_sizes, acc, layer, mode)
+        if mode == "final":
+            return _combine_gather_sum(y, position.reshape(-1), picked, wts, y.dtype)
+        y, acc = y
+        return _combine_gather_sum(y, position.reshape(-1), picked, wts, y.dtype), acc
+
+    def fused_up(r, w, acc):
+        return dispatch_up(
+            r,
+            safe_row,
+            dispatch_valid,
+            w,
+            group_sizes,
+            position,
+            dst_row,
+            write,
+            "flydsl",
+            gather_a=True,
+            **{**sums, "acc": acc},
+        )
+
+    def gathered_up(r, w, acc):
+        return gathered_up_projection(r, row_index, position, w, group_sizes, gather_sum, **{**sums, "acc": acc})
+
+    def fused_combine(h, w2, wts, acc):
+        return down_combine(
+            h, w2, group_sizes, position, picked, wts, dst_row, write, "flydsl", **{**sums, "acc": acc}
+        )
+
+    def value_and_grads(f, ct, *args):
+        def run(*args):
+            out, vjp = jax.vjp(f, *args)
+            return out, vjp(ct)
+
+        return jax.tree.leaves(jax.jit(run)(*args))
+
+    def assert_same_bits(actual, expected):
+        assert len(actual) == len(expected)
+        for a, e in zip(actual, expected, strict=True):
+            np.testing.assert_array_equal(_bits(a), _bits(e))
+
+    # "accum": the cotangent of the returned sums is the running sum, which the backward updates in place.
+    up_cts = up_ct if mode == "final" else (up_ct, acc13)
+    combine_cts = combine_ct if mode == "final" else (combine_ct, acc2)
+    expected_up = value_and_grads(unfused_up, up_cts, received, w13, acc13)
+    assert any(np.any(np.asarray(e, np.float32) != 0) for e in expected_up)
+    assert_same_bits(value_and_grads(fused_up, up_cts, received, w13, acc13), expected_up)
+    assert_same_bits(value_and_grads(gathered_up, up_cts, received, w13, acc13), expected_up)
+    assert_same_bits(
+        value_and_grads(fused_combine, combine_cts, h, w2, weights, acc2),
+        value_and_grads(unfused_combine, combine_cts, h, w2, weights, acc2),
     )

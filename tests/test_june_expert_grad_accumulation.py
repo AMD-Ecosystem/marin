@@ -47,11 +47,22 @@ def _f32(x):
 
 def _wgrad_f32(a, b, offsets):
     groups = offsets.shape[0] - 1
+    # Padded rows as in _padded below: M is the contraction here.
+    pad = -a.shape[0] % 512
+    a, b = jnp.pad(a, ((0, pad), (0, 0))), jnp.pad(b, ((0, pad), (0, 0)))
     return jnp.einsum("mk,mn,mg->gkn", _f32(a), _f32(b), _groups(offsets, a.shape[0], groups))
 
 
-def _wgrad_accum(a, b, offsets, acc, layer, *, mode="accum", round_bf16=True):
-    dw = _wgrad_f32(a, b, offsets)
+def _gather(a, row_index):
+    # The kernels' row index: row r of A is a[row_index[r]], zeros outside [0, R).
+    if row_index is None:
+        return a
+    valid = (row_index >= 0) & (row_index < a.shape[0])
+    return jnp.where(valid[:, None], a[jnp.clip(row_index, 0, a.shape[0] - 1)], jnp.zeros((), a.dtype))
+
+
+def _wgrad_accum(a, b, offsets, acc, layer, *, mode="accum", round_bf16=True, a_row_index=None):
+    dw = _wgrad_f32(_gather(a, a_row_index), b, offsets)
     if round_bf16:
         dw = _f32(dw.astype(jnp.bfloat16))
     parts = tuple(acc) if isinstance(acc, tuple) else (acc,)
@@ -62,16 +73,56 @@ def _wgrad_accum(a, b, offsets, acc, layer, *, mode="accum", round_bf16=True):
     return new if isinstance(acc, tuple) else new[0]
 
 
+def _padded(f):
+    # ragged_dot pads its rows to a multiple of 512 and the epilogue paths call the kernels unpadded: XLA's CPU dot may
+    # sum in another order for another row count, which the kernels do not, so every stand-in runs on padded rows.
+    def op(a, *rest, **kwargs):
+        rows = a.shape[0]
+        pad = -rows % 512
+        return f(jnp.pad(a, ((0, pad), (0, 0))), *rest, **kwargs)[:rows]
+
+    return op
+
+
+@_padded
+def _nn_rows(a, b, o):
+    return jnp.einsum("mk,gkn,mg->mn", _f32(a), _f32(b), _groups(o, a.shape[0], b.shape[0])).astype(jnp.bfloat16)
+
+
+def _nn(a, b, o, row_index=None):
+    return _nn_rows(_gather(a, row_index), b, o)
+
+
+@_padded
+def _nt(a, b, o):
+    return jnp.einsum("mk,gnk,mg->mn", _f32(a), _f32(b), _groups(o, a.shape[0], b.shape[0])).astype(jnp.bfloat16)
+
+
+def _scatter(gemm):
+    # The row-scatter epilogue: dst[dst_row[r]] = bf16(f32(C[r]) * row_scale[r] + 0.0) for the computed rows.
+    def op(a, b, o, dst_row, *, row_scale=None, dst=None, dst_rows=None, store_c="all"):
+        c = gemm(a, b, o)
+        rows = _f32(c) if row_scale is None else _f32(c) * row_scale[:, None]
+        rows = (rows + jnp.float32(0.0)).astype(jnp.bfloat16)
+        if dst is None:
+            dst = jnp.zeros((dst_rows, c.shape[1]), jnp.bfloat16)
+        live = (dst_row >= 0) & (jnp.arange(c.shape[0]) < o[-1])
+        out = dst.at[jnp.where(live, dst_row, dst.shape[0])].set(rows, mode="drop", unique_indices=True)
+        return (None if store_c == "none" else c), out
+
+    return op
+
+
 # The jax-flydsl ops with their contracts (float32 accumulation, bf16 output), in jnp.
 FAKE_OPS = types.SimpleNamespace(
-    grouped_gemm_bf16_nn=lambda a, b, o: jnp.einsum(
-        "mk,gkn,mg->mn", _f32(a), _f32(b), _groups(o, a.shape[0], b.shape[0])
-    ).astype(jnp.bfloat16),
-    grouped_gemm_bf16_nt=lambda a, b, o: jnp.einsum(
-        "mk,gnk,mg->mn", _f32(a), _f32(b), _groups(o, a.shape[0], b.shape[0])
-    ).astype(jnp.bfloat16),
-    grouped_gemm_bf16_wgrad=lambda a, b, o: _wgrad_f32(a, b, o).astype(jnp.bfloat16),
+    grouped_gemm_bf16_nn=_nn,
+    grouped_gemm_bf16_nt=_nt,
+    grouped_gemm_bf16_wgrad=lambda a, b, o, a_row_index=None: _wgrad_f32(_gather(a, a_row_index), b, o).astype(
+        jnp.bfloat16
+    ),
     grouped_gemm_bf16_wgrad_accum=_wgrad_accum,
+    grouped_gemm_bf16_nn_scatter=_scatter(_nn),
+    grouped_gemm_bf16_nt_scatter=_scatter(_nt),
 )
 rd._flydsl_grouped_gemm_ops = lambda: FAKE_OPS
 rd._check_flydsl_operands = lambda *args: None
@@ -222,11 +273,18 @@ def test_stacked_options_give_the_all_off_step():
     # compute (its backward rounds once where the separate modules round at each op): up to ~9% in norm for the router's
     # in this toy model, whose bf16 gradients are ~6-20% from float32 ones either way. head_dim 64 as in the q/k
     # kernel's step test.
+    # The stack2 options on top (the dispatch gather inside the up-projection GEMM, the combine and dispatch backward as
+    # GEMM row-scatter epilogues, the Pallas gather-sums; the jnp stand-ins above for the gathered-A and scatter
+    # kernels) are exact rewrites, so they give the stack1 step bit for bit, including the expert gradient sums in
+    # every accumulator mode ("init" in the first microbatch, "accum" in the loop, "final" in the overlapped last one).
     _run(
         """
         off = dataclasses.replace(GA_CFG, head_dim=64)
         fused = dataclasses.replace(off, fused_norm_impl="pallas")
         on = dataclasses.replace(fused, qk_norm_rope="pallas", moe_routing_metadata="pallas")
+        stack2 = dataclasses.replace(
+            on, moe_gather_sum="pallas", moe_flydsl_gather_a=True, moe_scatter_epilogue="flydsl"
+        )
 
         def assert_close(grads, reference, rtol, label):
             for (path, a), b in zip(
@@ -245,5 +303,12 @@ def test_stacked_options_give_the_all_off_step():
             np.testing.assert_allclose(on_loss, loss, rtol=2e-2, err_msg=name)
             assert_close(on_grads, fused_grads, 2e-2, (name, "fused norm only"))
             assert_close(on_grads, grads, 0.15, (name, "all off"))
+            s2_loss, s2_grads = accumulated_grads(mesh, accumulation="flydsl", cfg=stack2, **kwargs)
+            assert np.array_equal(s2_loss, on_loss), (name, s2_loss, on_loss)
+            for (path, a), b in zip(
+                jax.tree_util.tree_leaves_with_path(on_grads), jax.tree.leaves(s2_grads), strict=True
+            ):
+                a, b = np.asarray(a), np.asarray(b)
+                assert np.array_equal(a.view(np.uint8), b.view(np.uint8)), (name, "stack2", jax.tree_util.keystr(path))
         """
     )
