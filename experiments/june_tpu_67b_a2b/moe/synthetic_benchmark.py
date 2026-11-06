@@ -228,7 +228,7 @@ def parse_args() -> argparse.Namespace:
         default="stacked",
         help="How batched_xla's cross-entropy backward builds the output projection's gradient: a float32 stack of "
         "vocab blocks cast after the loop, from a padded projection (stacked), or each block written into the [H, V] "
-        "result in place, without padding (in_place; same gradients, ~1.9 GiB less memory) "
+        "result in place, padding only the last block (in_place; same arithmetic, ~1.9 GiB less memory) "
         "(GrugModelConfig.ce_weight_grad).",
     )
     parser.add_argument("--profile-steps", type=int, default=0, help="Profile this many steps (0 disables).")

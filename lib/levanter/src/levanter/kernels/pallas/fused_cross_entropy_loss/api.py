@@ -159,7 +159,7 @@ except ImportError:
 IMPLEMENTATIONS["batched_xla"] = linear_softmax_cross_entropy_loss_batched_xla
 _CANONICAL_BACKEND_IMPLEMENTATIONS["batched_xla"] = linear_softmax_cross_entropy_loss_batched_xla
 # "batched_xla" whose streaming backward writes the weight gradient block by block into its [H, V] result
-# (batched_xla._backward_streaming_from_lse_in_place): same forward and gradients, less backward memory. It takes the
+# (batched_xla._backward_streaming_from_lse_in_place): same forward and arithmetic, less backward memory. It takes the
 # block sizes "batched_xla" would (inference, tuned table and autotune entry alike), so switching changes nothing else.
 IMPLEMENTATIONS["batched_xla_in_place_dw"] = partial(
     linear_softmax_cross_entropy_loss_batched_xla, in_place_weight_grad=True
