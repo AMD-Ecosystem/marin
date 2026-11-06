@@ -1844,7 +1844,9 @@ class Transformer(eqx.Module):
                 logsumexp_weight=logsumexp_weight,
                 dtype=loss_dtype,
                 implementation=(
-                    "batched_xla_in_place_dw" if self.config.ce_weight_grad == "in_place" else self.config.ce_implementation
+                    "batched_xla_in_place_dw"
+                    if self.config.ce_weight_grad == "in_place"
+                    else self.config.ce_implementation
                 ),
                 block_sizes=(
                     None if self.config.ce_v_block_size is None else BlockSizes(v_block_size=self.config.ce_v_block_size)

@@ -2835,12 +2835,23 @@ def test_xla_ce_packed_length_preserves_requested_gemm_rows(rows, backward_tile)
     assert max(row_counts) < rows + 256
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        batched_xla.BackwardOptions(),
+        batched_xla.BackwardOptions(weight_blocks_in_weight_dtype=True),
+        batched_xla.BackwardOptions(grad_x_in_gemm=True),
+        batched_xla.BackwardOptions(grad_x_in_gemm=True, weight_blocks_in_weight_dtype=True),
+    ],
+    ids=["default", "weight_dtype", "grad_x_gemm", "both"],
+)
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("v_dim", [512, 456, 100])
-def test_batched_xla_in_place_streaming_backward_matches_stacked(dtype, v_dim):
+def test_batched_xla_in_place_streaming_backward_matches_stacked(dtype, v_dim, options):
     """The in-place streaming backward writes each vocab block's weight gradient into the [H, V] result and pads only
     the last, partial block; both gradients equal the stacked, padded backward's bit for bit (V a multiple of the
-    block, not one, and narrower than one block)."""
+    block, not one, and narrower than one block), under the same ``BackwardOptions``: it sums the input gradient as
+    ``grad_x_in_gemm`` says, and ``weight_blocks_in_weight_dtype`` changes neither backward's values."""
     b_dim, h_dim, v_block = 64, 32, 128
     kx, kw, kl, kg = jax.random.split(jax.random.key(3), 4)
     x = jax.random.normal(kx, (b_dim, h_dim), jnp.float32).astype(dtype)
@@ -2850,7 +2861,7 @@ def test_batched_xla_in_place_streaming_backward_matches_stacked(dtype, v_dim):
     lse = jax.nn.logsumexp(logits, axis=-1)
     g_loss = jax.random.uniform(kg, (b_dim,), jnp.float32)
     g_lse = 0.1 * g_loss
-    kwargs = dict(v_block_size=v_block, logit_soft_cap=None, precision=None)
+    kwargs = dict(v_block_size=v_block, logit_soft_cap=None, precision=None, options=options)
 
     gx, gw = batched_xla._backward_streaming_from_lse(x, labels, w, lse, g_loss, g_lse, **kwargs)
     gx_in_place, gw_in_place = batched_xla._backward_streaming_from_lse_in_place(
