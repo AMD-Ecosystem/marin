@@ -57,9 +57,11 @@ from rigging.log_setup import configure_logging
 
 from experiments.june_tpu_67b_a2b.moe.heuristic_muonh import MoeMuonHHeuristic
 from experiments.june_tpu_67b_a2b.moe.model import (
+    AttentionSchedule,
     FusedNormImpl,
     GrugModelConfig,
     QbBalance,
+    QkNormRope,
     RematMode,
     RmsNormImpl,
     ScanReduction,
@@ -227,6 +229,22 @@ def parse_args() -> argparse.Namespace:
         "off keeps the separate modules (GrugModelConfig.fused_norm_impl).",
     )
     parser.add_argument(
+        "--qk-norm-rope",
+        choices=get_args(QkNormRope),
+        default="xla",
+        help="How attention normalizes, rotates (half-RoPE) and scales q and k: separate ops (xla), or one function "
+        "whose backward recomputes the norm statistic, in JAX ops under a custom VJP (custom_vjp) or in one "
+        "Pallas-Triton kernel per direction (pallas) (GrugModelConfig.qk_norm_rope).",
+    )
+    parser.add_argument(
+        "--attention-schedule",
+        choices=get_args(AttentionSchedule),
+        default="cond",
+        help="Stacked blocks: pick each layer's attention (long or sliding window) with a per-layer lax.cond (cond), "
+        "a trace-time schedule over groups of layers (static, same model), or use the sliding window in every layer "
+        "(all_short: a different model, only to time the conditional) (GrugModelConfig.attention_schedule).",
+    )
+    parser.add_argument(
         "--scan-unroll", type=int, default=1, help="Layers per iteration of the layer scan (lax.scan unroll)."
     )
     parser.add_argument(
@@ -387,6 +405,8 @@ def main() -> None:
         remat_prevent_cse=args.remat_prevent_cse,
         rms_norm_impl=args.rms_norm_impl,
         fused_norm_impl=args.fused_norm_impl,
+        qk_norm_rope=args.qk_norm_rope,
+        attention_schedule=args.attention_schedule,
         pooled_transport_capacity_factor=args.pooled_transport_capacity_factor,
         num_expert_waves=args.num_expert_waves,
         moe_token_blocks=args.moe_token_blocks,
@@ -486,6 +506,7 @@ def main() -> None:
         "overlap_last_microbatch=%s seq_len=%d "
         "window=%d mp=%s expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d "
         "token_blocks=%d gather_sum=%s ce_v_block=%s remat=%s remat_prevent_cse=%s rms_norm_impl=%s fused_norm_impl=%s "
+        "qk_norm_rope=%s attention_schedule=%s "
         "replicated_grads=%s router_stats=%s capacity_drops=%s qb_threshold=%s router_diagnostics=%s "
         "skip_zero_router_z_loss=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
         "zero1=%s gather_in_first_microbatch=%s watch_interval=%d pipelined_step_logging=%s flops_per_example=%.4e",
@@ -516,6 +537,8 @@ def main() -> None:
         model.remat_prevent_cse,
         model.rms_norm_impl,
         model.fused_norm_impl,
+        model.qk_norm_rope,
+        model.attention_schedule,
         args.replicated_grads,
         args.router_stats,
         model.capacity_drop_reduction,
