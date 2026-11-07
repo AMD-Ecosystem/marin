@@ -592,11 +592,12 @@ def main() -> None:
         watch=WatchConfig(interval=args.watch_interval),
     )
     # By default one fresh example per sequence, and a mixture block exactly as long as the dataset so nothing
-    # repeats. With --repeat-batches N the dataset cycles through N batches' worth of sequences, which the model
-    # can memorize, so the loss falls below ln(vocab_size) and convergence differences show.
+    # repeats (MixtureDataset caps the block at 2^16 sequences, so at most 65535 / batch steps). With
+    # --repeat-batches N the dataset holds only N batches' worth of sequences and the mixture's restart strategy
+    # cycles through them, so the model can memorize them, the loss falls below ln(vocab_size) and convergence
+    # differences show.
     distinct = args.steps if args.repeat_batches == 0 else min(args.repeat_batches, args.steps)
-    pool = synthetic_examples(distinct * batch_size, model.max_seq_len, model.vocab_size)
-    examples = [pool[i % len(pool)] for i in range(args.steps * batch_size)]
+    examples = synthetic_examples(distinct * batch_size, model.max_seq_len, model.vocab_size)
     data = LmDataConfig(
         components={"synthetic": DirectDatasetComponent(datasets={"train": ListAsyncDataset(examples)})},
         tokenizer="passthrough",
