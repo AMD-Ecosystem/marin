@@ -7,7 +7,8 @@ This is the Grug-code counterpart of ``experiments/grug/snowball_synthetic``: th
 model (``experiments/june_tpu_67b_a2b/moe/model.py``) and training loop, on the same shape, batch and portable
 kernels (reference or ``xla_flash`` attention, XLA ``ragged_dot``), so the two code paths can be compared on
 hardware that has no CUDA or TPU kernels. Every step sees fresh uniform-random tokens with no repeats, so the
-loss cannot fall below ln(vocab_size) and a lower value means something leaks the targets. No checkpoint is
+loss cannot fall below ln(vocab_size) and a lower value means something leaks the targets (``--repeat-batches``
+cycles through a small pool of batches instead, so the loss can fall, for convergence checks). No checkpoint is
 written. Like the Snowball harness, it logs the model FLOPs per example up front and ends with the median step
 time from step 2 on, tokens/s, model TFLOP/s and MFU, then each device's peak memory. It also logs each step's wall
 period (``throughput/wall_step_s``: the time between consecutive steps' hooks, which includes the host work between
@@ -151,6 +152,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument(
+        "--repeat-batches",
+        type=int,
+        default=0,
+        help="Draw the tokens from this many batches' worth of sequences, repeated over the run, so the loss can "
+        "fall (a convergence check); 0 = fresh tokens every step.",
+    )
     parser.add_argument("--mp", help="jmp policy override, e.g. 'p=f32,c=float16' (default: preset).")
     parser.add_argument("--expert-axis", type=int, default=1, help="Expert-parallel mesh axis size (1 = FSDP only).")
     parser.add_argument(
@@ -583,8 +591,12 @@ def main() -> None:
         log_xla_hlo=False,
         watch=WatchConfig(interval=args.watch_interval),
     )
-    # One fresh example per sequence, and a mixture block exactly as long as the dataset so nothing repeats.
-    examples = synthetic_examples(args.steps * batch_size, model.max_seq_len, model.vocab_size)
+    # By default one fresh example per sequence, and a mixture block exactly as long as the dataset so nothing
+    # repeats. With --repeat-batches N the dataset cycles through N batches' worth of sequences, which the model
+    # can memorize, so the loss falls below ln(vocab_size) and convergence differences show.
+    distinct = args.steps if args.repeat_batches == 0 else min(args.repeat_batches, args.steps)
+    pool = synthetic_examples(distinct * batch_size, model.max_seq_len, model.vocab_size)
+    examples = [pool[i % len(pool)] for i in range(args.steps * batch_size)]
     data = LmDataConfig(
         components={"synthetic": DirectDatasetComponent(datasets={"train": ListAsyncDataset(examples)})},
         tokenizer="passthrough",
