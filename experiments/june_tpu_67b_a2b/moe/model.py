@@ -20,6 +20,7 @@ from einops import rearrange
 from haliax.jax_utils import named_call
 from haliax.nn import ArrayStacked
 from jax import random, shard_map
+from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 from jax.sharding import get_abstract_mesh, reshard
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
@@ -55,6 +56,7 @@ from levanter.kernels.pallas.add_rms_norm import AddRmsNormImpl, add_rms_norm_bw
 from levanter.kernels.pallas.fused_cross_entropy_loss import BlockSizes
 from levanter.kernels.pallas.fused_cross_entropy_loss.batched_xla import BackwardOptions as CeBackwardOptions
 from levanter.kernels.pallas.fused_cross_entropy_loss.batched_xla import backward_options as ce_backward_options
+from levanter.kernels.pallas.gated_norm import GatedNormImpl, gated_norm_gate_bwd, gated_norm_gate_fwd, gated_norm_silu
 from levanter.kernels.pallas.qk_norm_rope import positions_or_arange, qk_norm_rope, rope_tables
 from levanter.sharding import partition_spec_of
 from levanter.tracker.histogram import Histogram, SummaryStats
@@ -76,6 +78,13 @@ CeBackwardWeightBlocks = Literal["float32", "weight_dtype"]
 # jax-aiter names its attention residuals (output, LSE, q/k/v) "context", as Transformer Engine does; a policy that
 # saves the name keeps the backward from re-running the attention forward.
 ATTENTION_REMAT_SAVE_NAME = "context"
+# GatedNorm's rank-128 down projection ``n w_down``: a remat policy that saves it skips the down GEMM when the backward
+# reruns the block (``GrugModelConfig.gated_norm_remat``).
+GATED_NORM_REMAT_SAVE_NAME = "gated_norm_hidden"
+GatedNormRemat = Literal["recompute", "save_hidden"]
+# The attention's head-gate logits ``x attn_gate`` ([B, S, num_heads]; ``GrugModelConfig.head_gate_remat``).
+HEAD_GATE_REMAT_SAVE_NAME = "attn_head_gate"
+HeadGateRemat = Literal["recompute", "save"]
 ScanReduction = Literal["per_layer", "after_scan"]
 CeWeightGrad = Literal["stacked", "in_place"]
 QbBalance = Literal["global", "per_node"]
@@ -251,6 +260,25 @@ class GrugModelConfig:
     bfloat16 rounding level (measured at [8, 4096, 2560] against a float32 run: the same error in ``h``, ``dx`` and
     the norm weight's gradient as "off", within 1.4x of it in the GatedNorm output and weight gradients). Ignores
     ``rms_norm_impl``; the q/k norms keep it."""
+    gated_norm_impl: GatedNormImpl = "xla"
+    """How the fused norm (``fused_norm_impl`` "xla" or "pallas") runs GatedNorm's gate. "xla": JAX ops, the backward
+    keeping the [B, S, D] gate. Under remat that gate has two users, so XLA writes it from the up-projection GEMM and
+    multiplies it into the output in a separate kernel, and in the backward writes the up projection's cotangent in one
+    kernel and reads it again in its GEMM. "pallas": the up projection, sigmoid and product in one Pallas-Triton kernel
+    that writes the output and the gate, and a backward kernel that forms the up projection's cotangent and its
+    rank-128 GEMM in one pass (``levanter.kernels.pallas.gated_norm``); the down projection and the weight-gradient
+    GEMMs stay in XLA (deterministic). Float32 between roundings to the activation dtype, so the gate and its gradients
+    differ from "xla" at bfloat16 rounding level. Needs ``fused_norm_impl`` "xla" or "pallas"."""
+    gated_norm_remat: GatedNormRemat = "recompute"
+    """Whether the per-block gradient checkpoint saves GatedNorm's rank-128 down projection ``n w_down`` (bfloat16
+    [B, S, 128], 8 MiB per norm per layer at 8 x 4096 tokens per device): "recompute" (the remat reruns the down GEMM)
+    or "save_hidden" (adds it to the ``remat_mode`` policy; the backward's rerun of the block skips the down GEMM).
+    Same values either way."""
+    head_gate_remat: HeadGateRemat = "recompute"
+    """Whether the per-block gradient checkpoint saves the attention's head-gate logits ``x attn_gate`` ([B, S,
+    num_heads], 1.3 MiB per layer at 8 x 4096 tokens per device in bfloat16): "recompute" (the backward's rerun of the
+    block reruns that N=num_heads GEMM over the full hidden width) or "save" (adds them to the ``remat_mode``
+    policy). Same values either way."""
     replicate_attn_weights: bool = False
     """If True, store w_q/w_k/w_v/w_o fully replicated (P(None, None)) instead
     of FSDP-sharded across the data axis. Attention weights are small (~128 KB
@@ -380,6 +408,14 @@ class GrugModelConfig:
             raise ValueError(f"unknown qk_norm_rope {self.qk_norm_rope!r}")
         if self.attention_schedule not in get_args(AttentionSchedule):
             raise ValueError(f"unknown attention_schedule {self.attention_schedule!r}")
+        if self.gated_norm_impl not in get_args(GatedNormImpl):
+            raise ValueError(f"unknown gated_norm_impl {self.gated_norm_impl!r}")
+        if self.gated_norm_impl == "pallas" and self.fused_norm_impl == "off":
+            raise ValueError('gated_norm_impl="pallas" needs fused_norm_impl "xla" or "pallas"')
+        if self.gated_norm_remat not in get_args(GatedNormRemat):
+            raise ValueError(f"unknown gated_norm_remat {self.gated_norm_remat!r}")
+        if self.head_gate_remat not in get_args(HeadGateRemat):
+            raise ValueError(f"unknown head_gate_remat {self.head_gate_remat!r}")
 
     @property
     def inferred_head_dim(self) -> int:
@@ -633,7 +669,8 @@ class CausalSelfAttention(eqx.Module):
         v_norm_sq = jnp.sum(aligned_v * aligned_v, axis=-1, keepdims=True)
         attn_out = attn_out - (dot / (v_norm_sq + 1e-6)) * aligned_v
         # Headwise gating: sigmoid(x @ attn_gate) produces one scalar per head.
-        gate = 2 * jax.nn.sigmoid(jnp.einsum("bsd,dn->bsn", x, self.attn_gate))[..., None]
+        gate_logits = checkpoint_name(jnp.einsum("bsd,dn->bsn", x, self.attn_gate), HEAD_GATE_REMAT_SAVE_NAME)
+        gate = 2 * jax.nn.sigmoid(gate_logits)[..., None]
         attn_out = gate * attn_out
         # Merge (heads, head_dim) back to a flat head dim. The head axis is sharded over ``model``
         # (tensor parallel), so pin the merged dim's sharding explicitly rather than relying on
@@ -700,8 +737,13 @@ def _gated_norm_gate(x: jax.Array, w_down: jax.Array, w_up: jax.Array) -> jax.Ar
     """``GatedNorm``'s gate ``sigmoid(silu(x w_down) w_up)``."""
     # TODO: silu activation here isn't explored, just cargo-culted from Qwen. Likely low-hanging ablation fruit
     # (e.g. compare no activation, relu, etc.).
-    gate_hidden = jax.nn.silu(jnp.einsum("...d,dr->...r", x, w_down))
+    gate_hidden = jax.nn.silu(_gated_norm_hidden(x, w_down))
     return jax.nn.sigmoid(jnp.einsum("...r,rd->...d", gate_hidden, w_up))
+
+
+def _gated_norm_hidden(x: jax.Array, w_down: jax.Array) -> jax.Array:
+    """GatedNorm's down projection, named for the remat policy (``GrugModelConfig.gated_norm_remat``)."""
+    return checkpoint_name(jnp.einsum("...d,dr->...r", x, w_down), GATED_NORM_REMAT_SAVE_NAME)
 
 
 def _per_device(fn, *args, out_specs):
@@ -744,7 +786,7 @@ def _weight_gradient(partials: jax.Array, weight: jax.Array) -> jax.Array:
     return reshard(jnp.sum(partials, axis=0).astype(weight.dtype), jax.typeof(weight).sharding.spec)
 
 
-def _norm_and_gate_fwd(x, residual, weight, w_down, w_up, eps, impl, return_h):
+def _norm_and_gate_fwd(x, residual, weight, w_down, w_up, eps, impl, gate_impl, return_h):
     def kernel(x, residual, weight):
         h, n, inv_rms = add_rms_norm_fwd(x, residual, weight, eps=eps, impl=impl)
         return (n, inv_rms[:, None]) if residual is None else (h, n, inv_rms[:, None])
@@ -754,24 +796,58 @@ def _norm_and_gate_fwd(x, residual, weight, w_down, w_up, eps, impl, return_h):
         n, inv_rms = _per_device(kernel, x, None, weight, out_specs=("rows", "rows"))
     else:
         h, n, inv_rms = _per_device(kernel, x, residual, weight, out_specs=("rows", "rows", "rows"))
-    gate, gate_vjp = jax.vjp(_gated_norm_gate, n, w_down, w_up)
-    out = n * gate.astype(n.dtype)
-    return (h, out) if return_h else out, (h, inv_rms, weight, n, gate, gate_vjp)
+    if gate_impl == "xla":
+        gate, gate_vjp = jax.vjp(_gated_norm_gate, n, w_down, w_up)
+        out = n * gate.astype(n.dtype)
+        gate_res = (gate, gate_vjp)
+    else:
+        a = _gated_norm_hidden(n, w_down).astype(n.dtype)
+        out, gate = _per_device(
+            lambda n, a, w_up: gated_norm_gate_fwd(n, a, w_up, impl=gate_impl), n, a, w_up, out_specs=("rows", "rows")
+        )
+        gate_res = (gate, a, w_down, w_up)
+    return (h, out) if return_h else out, (h, inv_rms, weight, n, gate_res)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7))
-def _norm_and_gate(x, residual, weight, w_down, w_up, eps: float, impl: AddRmsNormImpl, return_h: bool):
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8))
+def _norm_and_gate(
+    x, residual, weight, w_down, w_up, eps: float, impl: AddRmsNormImpl, gate_impl: GatedNormImpl, return_h: bool
+):
     """``fused_norm_and_gate``'s custom VJP."""
-    return _norm_and_gate_fwd(x, residual, weight, w_down, w_up, eps, impl, return_h)[0]
+    return _norm_and_gate_fwd(x, residual, weight, w_down, w_up, eps, impl, gate_impl, return_h)[0]
 
 
-def _norm_and_gate_bwd(eps, impl, return_h, residuals, cotangents):
+def _gate_bwd_pallas(n, d_out, a, gate, w_down, w_up, gate_impl):
+    """``(d_n_from_gate, d_w_down, d_w_up)`` through the gate kernels' backward, then XLA GEMMs for the rest (the
+    transposes of GatedNorm's own matmuls, so reduced weights get unreduced gradients as without the kernels)."""
+    dz, da = _per_device(
+        lambda n, a, gate, w_up, d_out: gated_norm_gate_bwd(n, a, gate, w_up, d_out, impl=gate_impl),
+        n,
+        a,
+        gate,
+        w_up,
+        d_out,
+        out_specs=("rows", "rows"),
+    )
+    _, down_vjp = jax.vjp(lambda n, w: jnp.einsum("...d,dr->...r", n, w).astype(n.dtype), n, w_down)
+    d_n_from_gate, d_w_down = down_vjp(da)
+    _, up_vjp = jax.vjp(lambda w: jnp.einsum("...r,rd->...d", gated_norm_silu(a), w).astype(n.dtype), w_up)
+    (d_w_up,) = up_vjp(dz)
+    return d_n_from_gate, d_w_down, d_w_up
+
+
+def _norm_and_gate_bwd(eps, impl, gate_impl, return_h, residuals, cotangents):
     del eps
-    h, inv_rms, weight, n, gate, gate_vjp = residuals
+    h, inv_rms, weight, n, gate_res = residuals
+    gate = gate_res[0]
     d_h, d_out = cotangents if return_h else (None, cotangents)
     # out = n * gate: the gate's cotangent goes back through GatedNorm's matmuls (its d_n term), n's own term is
     # d_out * gate; the RMS-norm backward adds both, and the residual's cotangent, in one pass.
-    d_n_from_gate, d_w_down, d_w_up = gate_vjp((d_out * n).astype(gate.dtype))
+    if gate_impl == "xla":
+        d_n_from_gate, d_w_down, d_w_up = gate_res[1]((d_out * n).astype(gate.dtype))
+    else:
+        _, a, w_down, w_up = gate_res
+        d_n_from_gate, d_w_down, d_w_up = _gate_bwd_pallas(n, d_out, a, gate, w_down, w_up, gate_impl)
 
     def kernel(h, inv_rms, weight, d_out, gate, d_n_from_gate, d_h):
         return add_rms_norm_bwd(h, inv_rms[:, 0], weight, d_out, gate=gate, d_n_extra=d_n_from_gate, d_h=d_h, impl=impl)
@@ -794,6 +870,7 @@ def fused_norm_and_gate(
     impl: AddRmsNormImpl,
     *,
     return_h: bool,
+    gate_impl: GatedNormImpl = "xla",
 ):
     """``out = gated(norm(h))`` with ``h = x + residual`` (``h = x`` without a residual); ``(h, out)`` if
     ``return_h``, else ``out``.
@@ -802,10 +879,11 @@ def fused_norm_and_gate(
     backward adds ``h``'s own cotangent (from the caller's later uses of ``h``) inside the norm's backward kernel, so
     callers that use ``x`` again should use the returned ``h`` instead. The norm's two kernels run per device under a
     ``shard_map`` over the activations' batch sharding; the GatedNorm's matmuls stay global, as in ``GatedNorm``. A
-    norm weight marked ``reduced`` gets an ``unreduced`` gradient, as without the fusion."""
+    norm weight marked ``reduced`` gets an ``unreduced`` gradient, as without the fusion. ``gate_impl`` is
+    ``GrugModelConfig.gated_norm_impl`` (its Pallas kernels run per device, like the norm's)."""
     reduced = bool(jax.typeof(norm.weight).sharding.spec.reduced)
     weight = norm.weight if reduced else unshard(norm.weight)
-    return _norm_and_gate(x, residual, weight, gated.w_down, gated.w_up, norm.eps, impl, return_h)
+    return _norm_and_gate(x, residual, weight, gated.w_down, gated.w_up, norm.eps, impl, gate_impl, return_h)
 
 
 class DenseMLP(eqx.Module):
@@ -1348,11 +1426,14 @@ class Block(eqx.Module):
     ):
         """The block's output and router stats, and with ``grad_acc`` (``moe_mlp``) the accumulator as a third output."""
         fused = self.attn.cfg.fused_norm_impl
+        gate_impl = self.attn.cfg.gated_norm_impl
         if fused == "off":
             attn_in = self.attn_gated_norm(self.rms_attn(x))
         else:
             # x comes back as h, so its cotangent from the residual path joins the norm's backward kernel.
-            x, attn_in = fused_norm_and_gate(x, None, self.rms_attn, self.attn_gated_norm, fused, return_h=True)
+            x, attn_in = fused_norm_and_gate(
+                x, None, self.rms_attn, self.attn_gated_norm, fused, return_h=True, gate_impl=gate_impl
+            )
 
         # Long layers use the full causal mask (and may PKO / drop RoPE); short layers use the sliding-window mask,
         # never PKO, and always RoPE.
@@ -1383,7 +1464,9 @@ class Block(eqx.Module):
             x = x + attn_out
             mlp_in = self.mlp_gated_norm(self.rms_mlp(x))
         else:
-            x, mlp_in = fused_norm_and_gate(x, attn_out, self.rms_mlp, self.mlp_gated_norm, fused, return_h=True)
+            x, mlp_in = fused_norm_and_gate(
+                x, attn_out, self.rms_mlp, self.mlp_gated_norm, fused, return_h=True, gate_impl=gate_impl
+            )
         token_valid = token_validity_from_attention_mask(
             short_mask,
             batch_size=x.shape[0],
@@ -1570,14 +1653,16 @@ class Transformer(eqx.Module):
         short_mask = AttentionMask(is_causal=True, sliding_window=cfg.sliding_window, segment_ids=segment_ids)
         long_mask = AttentionMask(is_causal=True, sliding_window=None, segment_ids=segment_ids)
 
-        if cfg.remat_mode == "save_moe":
-            remat_policy = jax.checkpoint_policies.save_only_these_names(*MOE_REMAT_SAVE_NAMES)
-        elif cfg.remat_mode == "save_moe_attn":
-            remat_policy = jax.checkpoint_policies.save_only_these_names(
-                *MOE_REMAT_SAVE_NAMES, ATTENTION_REMAT_SAVE_NAME
-            )
-        else:
-            remat_policy = None
+        saved_names = {
+            "recompute_all": (),
+            "save_moe": MOE_REMAT_SAVE_NAMES,
+            "save_moe_attn": (*MOE_REMAT_SAVE_NAMES, ATTENTION_REMAT_SAVE_NAME),
+        }[cfg.remat_mode]
+        if cfg.gated_norm_remat == "save_hidden":
+            saved_names = (*saved_names, GATED_NORM_REMAT_SAVE_NAME)
+        if cfg.head_gate_remat == "save":
+            saved_names = (*saved_names, HEAD_GATE_REMAT_SAVE_NAME)
+        remat_policy = jax.checkpoint_policies.save_only_these_names(*saved_names) if saved_names else None
         prevent_cse = self.blocks is not None if cfg.remat_prevent_cse is None else cfg.remat_prevent_cse
         checkpoint = functools.partial(eqx.filter_checkpoint, policy=remat_policy, prevent_cse=prevent_cse)
 
@@ -1758,7 +1843,10 @@ class Transformer(eqx.Module):
     def _norm_and_gate(self, x: jax.Array, norm: RMSNorm, gated: GatedNorm) -> jax.Array:
         if self.config.fused_norm_impl == "off":
             return gated(norm(x))
-        return fused_norm_and_gate(x, None, norm, gated, self.config.fused_norm_impl, return_h=False)
+        cfg = self.config
+        return fused_norm_and_gate(
+            x, None, norm, gated, cfg.fused_norm_impl, return_h=False, gate_impl=cfg.gated_norm_impl
+        )
 
     @named_call
     def logits(

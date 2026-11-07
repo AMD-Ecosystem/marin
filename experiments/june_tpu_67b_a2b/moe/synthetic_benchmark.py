@@ -63,7 +63,10 @@ from experiments.june_tpu_67b_a2b.moe.model import (
     CeBackwardGradX,
     CeBackwardWeightBlocks,
     FusedNormImpl,
+    GatedNormImpl,
+    GatedNormRemat,
     GrugModelConfig,
+    HeadGateRemat,
     QbBalance,
     QkNormRope,
     RematMode,
@@ -288,6 +291,28 @@ def parse_args() -> argparse.Namespace:
         "off keeps the separate modules (GrugModelConfig.fused_norm_impl).",
     )
     parser.add_argument(
+        "--gated-norm-impl",
+        choices=get_args(GatedNormImpl),
+        default="xla",
+        help="With a fused norm, run GatedNorm's up projection, sigmoid and product, and its gate backward, as JAX ops "
+        "(xla) or as two Pallas-Triton kernels that write no extra [B, S, D] tensors under remat (pallas) "
+        "(GrugModelConfig.gated_norm_impl).",
+    )
+    parser.add_argument(
+        "--gated-norm-remat",
+        choices=get_args(GatedNormRemat),
+        default="recompute",
+        help="Save GatedNorm's rank-128 down projection in the per-block checkpoint so the backward's rerun of the "
+        "block skips that GEMM (save_hidden), or rerun it (recompute) (GrugModelConfig.gated_norm_remat).",
+    )
+    parser.add_argument(
+        "--head-gate-remat",
+        choices=get_args(HeadGateRemat),
+        default="recompute",
+        help="Save the attention's head-gate logits in the per-block checkpoint so the backward's rerun of the block "
+        "skips that GEMM (save), or rerun it (recompute) (GrugModelConfig.head_gate_remat).",
+    )
+    parser.add_argument(
         "--qk-norm-rope",
         choices=get_args(QkNormRope),
         default="xla",
@@ -482,6 +507,9 @@ def main() -> None:
         remat_prevent_cse=args.remat_prevent_cse,
         rms_norm_impl=args.rms_norm_impl,
         fused_norm_impl=args.fused_norm_impl,
+        gated_norm_impl=args.gated_norm_impl,
+        gated_norm_remat=args.gated_norm_remat,
+        head_gate_remat=args.head_gate_remat,
         qk_norm_rope=args.qk_norm_rope,
         attention_schedule=args.attention_schedule,
         pooled_transport_capacity_factor=args.pooled_transport_capacity_factor,
@@ -592,7 +620,8 @@ def main() -> None:
         "overlap_last_microbatch=%s seq_len=%d "
         "window=%d mp=%s expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d "
         "token_blocks=%d gather_sum=%s routing_metadata=%s flydsl_gather_a=%s scatter_epilogue=%s ce_v_block=%s "
-        "remat=%s remat_prevent_cse=%s rms_norm_impl=%s fused_norm_impl=%s qk_norm_rope=%s attention_schedule=%s "
+        "remat=%s remat_prevent_cse=%s rms_norm_impl=%s fused_norm_impl=%s gated_norm_impl=%s gated_norm_remat=%s "
+        "head_gate_remat=%s qk_norm_rope=%s attention_schedule=%s "
         "replicated_grads=%s router_stats=%s capacity_drops=%s qb_threshold=%s router_diagnostics=%s "
         "skip_zero_router_z_loss=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s dispatch_barrier=%s "
         "zero1=%s gather_in_first_microbatch=%s expert_grad_accumulation=%s block_grad_accumulation=%s "
@@ -628,6 +657,9 @@ def main() -> None:
         model.remat_prevent_cse,
         model.rms_norm_impl,
         model.fused_norm_impl,
+        model.gated_norm_impl,
+        model.gated_norm_remat,
+        model.head_gate_remat,
         model.qk_norm_rope,
         model.attention_schedule,
         args.replicated_grads,
