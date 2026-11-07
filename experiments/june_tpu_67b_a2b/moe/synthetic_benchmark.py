@@ -47,6 +47,7 @@ from levanter.data.text.datasets import DirectDatasetComponent, LmDataConfig
 from levanter.data.text.examples import GrugLmExample
 from levanter.distributed import DistributedConfig
 from levanter.grug._moe.common import _TRANSPORT_CAPACITY_MOE_IMPLEMENTATIONS
+from levanter.grug._moe.ep_ring_filtered import MoeSendGather, MoeTokenSum
 from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
 from levanter.grug._moe.pallas_routing_metadata import MoeRoutingMetadata
 from levanter.grug._moe.scatter_epilogue import MoeScatterEpilogue
@@ -226,6 +227,21 @@ def parse_args() -> argparse.Namespace:
         help="ring_filtered only: run the expert-side combine and dispatch backward as separate gathers (off) or as "
         "row-scatter epilogues of jax-flydsl's grouped GEMMs plus a Pallas gather-sum of the other rows (flydsl), "
         "with the same results bit for bit (GrugModelConfig.moe_scatter_epilogue).",
+    )
+    parser.add_argument(
+        "--moe-send-gather",
+        choices=get_args(MoeSendGather),
+        default="xla",
+        help="ring_filtered only: build the forward send buffer with an XLA fusion (xla) or the Pallas row gather "
+        "(pallas), with the same results bit for bit (GrugModelConfig.moe_send_gather).",
+    )
+    parser.add_argument(
+        "--moe-token-sum",
+        choices=get_args(MoeTokenSum),
+        default="take",
+        help="ring_filtered only: sum each token's send-slot rows (forward combine, dispatch backward) with jnp.take "
+        "fill masks (take) or clamped indices whose validity test stays in the gather's fusion (clamped), with the same "
+        "results bit for bit (GrugModelConfig.moe_token_sum).",
     )
     parser.add_argument(
         "--ce-v-block-size",
@@ -520,6 +536,8 @@ def main() -> None:
         moe_routing_metadata=args.moe_routing_metadata,
         moe_flydsl_gather_a=args.moe_flydsl_gather_a,
         moe_scatter_epilogue=args.moe_scatter_epilogue,
+        moe_send_gather=args.moe_send_gather,
+        moe_token_sum=args.moe_token_sum,
         ce_v_block_size=args.ce_v_block_size,
         ce_weight_grad=args.ce_weight_grad,
         scan_unroll=args.scan_unroll,
@@ -619,7 +637,8 @@ def main() -> None:
         "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d microbatches=%d "
         "overlap_last_microbatch=%s seq_len=%d "
         "window=%d mp=%s expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d "
-        "token_blocks=%d gather_sum=%s routing_metadata=%s flydsl_gather_a=%s scatter_epilogue=%s ce_v_block=%s "
+        "token_blocks=%d gather_sum=%s routing_metadata=%s flydsl_gather_a=%s scatter_epilogue=%s send_gather=%s "
+        "token_sum=%s ce_v_block=%s "
         "remat=%s remat_prevent_cse=%s rms_norm_impl=%s fused_norm_impl=%s gated_norm_impl=%s gated_norm_remat=%s "
         "head_gate_remat=%s qk_norm_rope=%s attention_schedule=%s "
         "replicated_grads=%s router_stats=%s capacity_drops=%s qb_threshold=%s router_diagnostics=%s "
@@ -652,6 +671,8 @@ def main() -> None:
         model.moe_routing_metadata,
         model.moe_flydsl_gather_a,
         model.moe_scatter_epilogue,
+        model.moe_send_gather,
+        model.moe_token_sum,
         model.ce_v_block_size,
         args.remat_mode,
         model.remat_prevent_cse,
