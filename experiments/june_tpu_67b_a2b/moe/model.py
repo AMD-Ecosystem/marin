@@ -24,6 +24,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 from jax.sharding import get_abstract_mesh, reshard
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
+from levanter.grug._moe.ep_ring_dedup import MoeSendGather, MoeTokenSum
 from levanter.grug._moe.grad_accum import ExpertGradAccumulator
 from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
 from levanter.grug._moe.pallas_routing_metadata import MoeRoutingMetadata
@@ -193,6 +194,14 @@ class GrugModelConfig:
     up projection's data gradient those of the dispatch backward) plus a Pallas gather-sum of the other rows
     ("flydsl"). Same values bit for bit. "flydsl" needs jax-flydsl on an AMD GPU; "reference" is the same data flow on
     XLA GEMMs, for tests. Needs ``moe_implementation="ring_dedup"``."""
+    moe_send_gather: MoeSendGather = "xla"
+    """How ``ring_dedup``'s sender builds its forward send buffer from the tokens (F7): an XLA fusion ("xla") or the
+    Pallas-Triton row gather ("pallas"). Same values bit for bit. Needs ``moe_implementation="ring_dedup"``."""
+    moe_token_sum: MoeTokenSum = "take"
+    """How ``ring_dedup``'s sender sums each token's rows over its send slots, in the forward combine and the dispatch
+    backward (F6): ``jnp.take`` with a fill mask per slot ("take"; XLA computes each mask in a kernel of its own) or a
+    clamped index with the validity test inside the gather's fusion ("clamped"). Same values bit for bit. Needs
+    ``moe_implementation="ring_dedup"``."""
     ce_implementation: str | None = None
     """Fused cross-entropy backend selection (levanter fused_cross_entropy_loss). None keeps the
     backend default (GPU: full-logits ``xla`` path). Set ``"batched_xla"`` to use the blocked-vocab
@@ -1028,6 +1037,8 @@ class MoEMLP(eqx.Module):
                 routing_metadata=cfg.moe_routing_metadata,
                 flydsl_gather_a=cfg.moe_flydsl_gather_a,
                 scatter_epilogue=cfg.moe_scatter_epilogue,
+                send_gather=cfg.moe_send_gather,
+                token_sum=cfg.moe_token_sum,
             ),
             routed_moe=QBRoutedMoE(
                 num_experts_per_token=cfg.num_experts_per_token,
