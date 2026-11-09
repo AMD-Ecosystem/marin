@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from levanter.grug.sharding import compact_grug_mesh
+from levanter.kernels.pallas.fused_cross_entropy_loss import batched_xla
 
 from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig, MoEMLP, Transformer
 
@@ -42,11 +43,13 @@ _SMALL = GrugModelConfig(
 )
 
 
-def _loss_and_grads(cfg: GrugModelConfig):
+def _loss_and_grads(cfg: GrugModelConfig, dtype=None):
     tokens = jax.random.randint(jax.random.key(1), (4, cfg.max_seq_len), 0, cfg.vocab_size)
     loss_weight = jnp.ones(tokens.shape, jnp.float32)
     with jax.set_mesh(compact_grug_mesh(expert_axis_size=1)):
         model = Transformer.init(cfg, key=jax.random.key(0))
+        if dtype is not None:
+            model = jax.tree.map(lambda a: a.astype(dtype) if eqx.is_inexact_array(a) else a, model)
         params, static = eqx.partition(model, eqx.is_array)
 
         def loss(p):
@@ -68,6 +71,28 @@ def test_ce_v_block_size_keeps_loss_and_grads(v_block_size):
     if v_block_size < _SMALL.vocab_size:
         # Several vocabulary blocks: the block reached the loss, which now sums in a different order.
         assert any(not np.array_equal(g, base) for g, base in zip(grads, base_grads, strict=True))
+
+
+@pytest.mark.parametrize(
+    "grad_x, weight_blocks", [("add", "weight_dtype"), ("gemm", "float32"), ("gemm", "weight_dtype")]
+)
+def test_ce_backward_options_keep_loss_and_grads(monkeypatch, grad_x, weight_blocks):
+    """The ``batched_xla`` backward's options (run here on the CPU, past its GPU check): bf16 weight blocks change
+    nothing; grad_x summed inside float32 GEMMs changes the gradients by bf16 rounding only."""
+    monkeypatch.setattr(batched_xla, "_validate_input_contract", lambda *a: None)
+    base_cfg = dataclasses.replace(_SMALL, ce_implementation="batched_xla", ce_v_block_size=16)
+    bf16 = lambda cfg: _loss_and_grads(cfg, dtype=jnp.bfloat16)  # noqa: E731
+    base_loss, base_grads = bf16(base_cfg)
+    loss, grads = bf16(dataclasses.replace(base_cfg, ce_bwd_grad_x=grad_x, ce_bwd_weight_blocks=weight_blocks))
+    assert np.array_equal(loss, base_loss)
+    assert len(grads) == len(base_grads)
+    if grad_x == "add":
+        assert all(np.array_equal(g, base) for g, base in zip(grads, base_grads, strict=True))
+        return
+    assert any(not np.array_equal(g, base) for g, base in zip(grads, base_grads, strict=True))
+    for g, base in zip(grads, base_grads, strict=True):
+        g, base = np.asarray(g, np.float32), np.asarray(base, np.float32)
+        assert np.abs(g - base).max() <= 5e-2 * max(np.abs(base).max(), 1e-30)
 
 
 @pytest.mark.parametrize("gather_sum", ["xla", "pallas"])

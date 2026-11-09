@@ -61,6 +61,8 @@ from rigging.log_setup import configure_logging
 from experiments.june_tpu_67b_a2b.moe.heuristic_muonh import MoeMuonHHeuristic
 from experiments.june_tpu_67b_a2b.moe.model import (
     AttentionSchedule,
+    CeBackwardGradX,
+    CeBackwardWeightBlocks,
     FusedNormImpl,
     GrugModelConfig,
     QbBalance,
@@ -230,6 +232,22 @@ def parse_args() -> argparse.Namespace:
         "vocab blocks cast after the loop, from a padded projection (stacked), or each block written into the [H, V] "
         "result in place, padding only the last block (in_place; same arithmetic, ~1.9 GiB less memory) "
         "(GrugModelConfig.ce_weight_grad).",
+    )
+    parser.add_argument(
+        "--ce-bwd-grad-x",
+        choices=get_args(CeBackwardGradX),
+        default="add",
+        help="batched_xla cross-entropy backward: sum the input gradient over the vocabulary blocks with a separate "
+        "add kernel after each bf16 GEMM (add) or inside a float32 GEMM as its C operand, in place (gemm; differs in "
+        "the last bits) (GrugModelConfig.ce_bwd_grad_x).",
+    )
+    parser.add_argument(
+        "--ce-bwd-weight-blocks",
+        choices=get_args(CeBackwardWeightBlocks),
+        default="float32",
+        help="batched_xla cross-entropy backward: stack the output projection's per-block weight gradients in float32 "
+        "(float32) or in the weight's dtype (weight_dtype; the same values bit for bit) "
+        "(GrugModelConfig.ce_bwd_weight_blocks).",
     )
     parser.add_argument("--profile-steps", type=int, default=0, help="Profile this many steps (0 disables).")
     parser.add_argument("--profile-start", type=int, default=10, help="First profiled step.")
@@ -469,6 +487,8 @@ def main() -> None:
         ce_v_block_size=args.ce_v_block_size,
         ce_weight_grad=args.ce_weight_grad,
         scan_unroll=args.scan_unroll,
+        ce_bwd_grad_x=args.ce_bwd_grad_x,
+        ce_bwd_weight_blocks=args.ce_bwd_weight_blocks,
         replicated_grad_reduction=args.replicated_grads,
         replicated_grad_max_bytes=int(args.replicated_grads_max_mib * (1 << 20)),
         router_stats_reduction=args.router_stats,
@@ -568,7 +588,7 @@ def main() -> None:
         "replicated_grads=%s router_stats=%s capacity_drops=%s qb_threshold=%s router_diagnostics=%s "
         "skip_zero_router_z_loss=%s qb_balance=%s qb_sync_interval=%d carry_compute_params=%s "
         "zero1=%s gather_in_first_microbatch=%s expert_grad_accumulation=%s block_grad_accumulation=%s "
-        "ce_weight_grad=%s watch_interval=%d pipelined_step_logging=%s "
+        "ce_weight_grad=%s watch_interval=%d pipelined_step_logging=%s ce_bwd_grad_x=%s ce_bwd_weight_blocks=%s "
         "flops_per_example=%.4e",
         args.size,
         model.num_layers,
@@ -618,6 +638,8 @@ def main() -> None:
         model.ce_weight_grad,
         args.watch_interval,
         args.pipelined_step_logging,
+        model.ce_bwd_grad_x,
+        model.ce_bwd_weight_blocks,
         flops_per_example,
     )
     log_model_flops(flops_per_example, flops_summary)

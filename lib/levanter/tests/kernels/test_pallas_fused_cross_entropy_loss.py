@@ -1251,6 +1251,77 @@ def test_fused_cross_entropy_batched_xla_grad_tracing_non_gb10_path(
     jax.make_jaxpr(jax.grad(loss_fn, argnums=(0, 1)))(x, w)
 
 
+def _streaming_backward_inputs(batch: int = 64, hidden: int = 32, vocab: int = 200):
+    key_x, key_w, key_y, key_g = jax.random.split(jax.random.PRNGKey(41), 4)
+    x = jax.random.normal(key_x, (batch, hidden), dtype=jnp.bfloat16)
+    w = (0.5 * jax.random.normal(key_w, (hidden, vocab), dtype=jnp.float32)).astype(jnp.bfloat16)
+    labels = jax.random.randint(key_y, (batch,), 0, vocab, dtype=jnp.int32)
+    logits = jnp.dot(x.astype(jnp.float32), w.astype(jnp.float32))
+    lse = jax.nn.logsumexp(logits, axis=-1)
+    g_loss = jax.random.uniform(key_g, (batch,), dtype=jnp.float32)
+    g_lse = 0.1 * g_loss
+    return x, labels, w, lse, g_loss, g_lse
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        batched_xla.BackwardOptions(weight_blocks_in_weight_dtype=True),
+        batched_xla.BackwardOptions(grad_x_in_gemm=True),
+        batched_xla.BackwardOptions(grad_x_in_gemm=True, weight_blocks_in_weight_dtype=True),
+    ],
+)
+def test_batched_xla_streaming_backward_options(options: batched_xla.BackwardOptions):
+    """Weight blocks in the weight's dtype keep both gradients bit for bit; grad_x summed in float32 GEMMs keeps the
+    weight gradient bit for bit and moves grad_x only by the per-block bf16 rounding it skips."""
+    args = _streaming_backward_inputs()
+    kwargs = dict(v_block_size=16, logit_soft_cap=None, precision=jax.lax.Precision.HIGHEST)
+    gx0, gw0 = batched_xla._backward_streaming_from_lse(*args, **kwargs)
+    gx, gw = batched_xla._backward_streaming_from_lse(*args, **kwargs, options=options)
+    assert gx.dtype == gx0.dtype and gw.dtype == gw0.dtype
+    assert np.array_equal(np.asarray(gw), np.asarray(gw0))
+    if not options.grad_x_in_gemm:
+        assert np.array_equal(np.asarray(gx), np.asarray(gx0))
+        return
+    x, labels, w, lse, g_loss, g_lse = args
+    # float32 gradient of sum(g_loss * loss + g_lse * lse) for the same bf16 inputs.
+    logits = jnp.dot(x.astype(jnp.float32), w.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST)
+    probs = jnp.exp(logits - lse[:, None])
+    dlogits = probs * (g_loss + g_lse)[:, None] - jax.nn.one_hot(labels, w.shape[1]) * g_loss[:, None]
+    gx_true = np.asarray(jnp.dot(dlogits, w.astype(jnp.float32).T, precision=jax.lax.Precision.HIGHEST))
+    scale = np.abs(gx_true).max()
+    err0 = np.abs(np.asarray(gx0, np.float32) - gx_true).max() / scale
+    err = np.abs(np.asarray(gx, np.float32) - gx_true).max() / scale
+    assert err <= 2e-2
+    assert err <= err0 + 4e-3
+
+
+def test_batched_xla_backward_options_are_fixed_when_the_loss_is_traced(monkeypatch: pytest.MonkeyPatch):
+    """The options in effect when the loss is traced reach its custom backward, and do not leak into later traces
+    (the dispatch's jit cache keys on them)."""
+    monkeypatch.setattr(batched_xla, "_validate_input_contract", lambda *a: None)
+    x, labels, w, *_ = _streaming_backward_inputs()
+    block_sizes = BlockSizes(b_block_size=1024, h_block_size=512, v_block_size=16)
+
+    def grads():
+        def loss(x_raw, w_raw):
+            per_example, _ = batched_xla.linear_softmax_cross_entropy_loss_batched_xla(
+                x_raw, labels, w_raw, block_sizes=block_sizes, dtype=jnp.float32
+            )
+            return per_example.sum()
+
+        return [np.asarray(g, np.float32) for g in jax.grad(loss, argnums=(0, 1))(x, w)]
+
+    base = grads()
+    with batched_xla.backward_options(batched_xla.BackwardOptions(grad_x_in_gemm=True)):
+        in_gemm = grads()
+    after = grads()
+    assert all(np.array_equal(a, b) for a, b in zip(after, base))
+    assert np.array_equal(in_gemm[1], base[1])
+    assert not np.array_equal(in_gemm[0], base[0])
+    np.testing.assert_allclose(in_gemm[0], base[0], atol=2e-2 * np.abs(base[0]).max())
+
+
 def test_pallas_autotune_used_when_tuned_match_missing(monkeypatch: pytest.MonkeyPatch):
     x = jnp.ones((4, 8), dtype=jnp.float32)
     w = jnp.ones((8, 16), dtype=jnp.float32)
