@@ -92,6 +92,8 @@ SNOWBALL_HIDDEN_DIM = 2560
 # The width heuristic would otherwise derive seq_len // 2 and give the medium preset a shorter window than Snowball's.
 SNOWBALL_SLIDING_WINDOW = 2048
 POOLED_WAVE_MOE_IMPL = "fixed_pooled_wave_all_to_all"
+# Former backend names the harness still accepts, so existing study configurations keep running.
+RENAMED_MOE_IMPLS = {"ring_dedup": "ring_filtered"}
 # Steps 0 and 1 are excluded from the summary, as in the Snowball harness: step 0 compiles.
 FIRST_TIMED_STEP = 2
 
@@ -175,7 +177,11 @@ def parse_args() -> argparse.Namespace:
         "(default: one process, no jax.distributed).",
     )
     parser.add_argument("--attention", choices=get_args(GrugAttentionImplementation), default="reference")
-    parser.add_argument("--moe-impl", default="ring", help="MoE dispatch backend (default: ring).")
+    parser.add_argument(
+        "--moe-impl",
+        default="ring",
+        help="MoE dispatch backend (default: ring). ring_dedup is accepted as the former name of ring_filtered.",
+    )
     parser.add_argument(
         "--capacity-factor", type=float, help="EP receiver capacity factor (default: GrugModelConfig's)."
     )
@@ -463,7 +469,10 @@ def parse_args() -> argparse.Namespace:
         help="Exit with status 1 if a step takes longer than this many seconds (0 disables). "
         "The first step and watch steps have no timeout.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.moe_impl in RENAMED_MOE_IMPLS:
+        args.moe_impl = RENAMED_MOE_IMPLS[args.moe_impl]
+    return args
 
 
 def synthetic_examples(count: int, seq_len: int, vocab_size: int, seed: int = 0) -> list[GrugLmExample]:
