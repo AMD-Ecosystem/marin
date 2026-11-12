@@ -1717,9 +1717,21 @@ def _bytes_per_token(tokenizer: MarinTokenizer) -> np.ndarray:
     return np.array([byte_length_of_token(tokenizer, i) for i in range(len(tokenizer.get_vocab()))], np.float64)
 
 
-def _loaded_step_eval(config: GrugRunConfig, mesh: Mesh) -> _LoadedStepEval:
+def _step_eval_byte_count(config: GrugRunConfig) -> float | None:
+    """The held-out set's target bytes for ``eval/bpb``, or None without ``compute_bpb``. Call it outside the mesh
+    context: building a real-data example runs a small jitted function with a CPU sharding, which JAX rejects under
+    the GPU mesh."""
+    step_eval = config.step_eval
+    if step_eval is None or not step_eval.compute_bpb:
+        return None
+    sequences = _check_step_eval(config)
+    examples = step_eval.dataset.as_sync_dataset().get_batch(range(sequences))
+    return eval_byte_count(examples, _bytes_per_token(config.data.the_tokenizer))
+
+
+def _loaded_step_eval(config: GrugRunConfig, mesh: Mesh, byte_count: float | None) -> _LoadedStepEval:
     """``config.step_eval``'s held-out set as one global batch sharded like a train batch (each process loads its own
-    rows), and its byte count."""
+    rows), with ``byte_count`` from ``_step_eval_byte_count``."""
     step_eval = config.step_eval
     assert step_eval is not None
     sequences = _check_step_eval(config)
@@ -1740,9 +1752,6 @@ def _loaded_step_eval(config: GrugRunConfig, mesh: Mesh) -> _LoadedStepEval:
         allow_nondivisible_batch_size=False,
     )
     batch = next(iter(loader))
-    byte_count = None
-    if step_eval.compute_bpb:
-        byte_count = eval_byte_count(examples.get_batch(range(sequences)), _bytes_per_token(config.data.the_tokenizer))
     num_train_steps = config.trainer.trainer.num_train_steps
     return _LoadedStepEval(batch, functools.partial(step_eval.runs_at, num_train_steps=num_train_steps), byte_count)
 
@@ -1951,6 +1960,7 @@ def _run_grug_local(config: GrugRunConfig, *, step_hooks: Sequence[Callable[[cal
         microbatches=config.trainer.microbatches,
         batch_shards=_batch_shards(mesh),
     )
+    step_eval_byte_count = _step_eval_byte_count(config)
     with set_mesh(mesh):
         batch_schedule = trainer.batch_schedule
 
@@ -2018,7 +2028,7 @@ def _run_grug_local(config: GrugRunConfig, *, step_hooks: Sequence[Callable[[cal
         flops_per_example, flops_summary = _compute_flops(model_config=config.model)
         levanter.tracker.log_summary(flops_summary)
 
-        step_eval = None if config.step_eval is None else _loaded_step_eval(config, mesh)
+        step_eval = None if config.step_eval is None else _loaded_step_eval(config, mesh, step_eval_byte_count)
         eval_cfg = config.eval
         evaluator = None
         if eval_cfg is not None:
