@@ -239,13 +239,12 @@ class GrugModelConfig:
     backward skips re-running expert dispatch and its EP collectives; "save_moe_attn" also keeps the
     attention residuals the attention backend names (jax-aiter's ``gpu_aiter_flash``), so backward
     does not re-run the attention forward either."""
-    remat_prevent_cse: bool | None = None
-    """``prevent_cse`` of the per-block gradient checkpoints. True (JAX's default) wraps the saved residuals in
-    optimization barriers, which XLA removes only after fusion, so the backward's slices of them stay unfused copies.
-    False drops the barriers, so XLA fuses those slices; inside the stacked-blocks ``lax.scan`` the scan already keeps
-    the backward from reusing forward values (JAX's guidance for ``jax.checkpoint`` under ``scan``), but with unstacked
-    blocks XLA may CSE the recomputation with the forward, keeping its activations alive. None (the default) picks
-    False for the stacked blocks and True for the unstacked ones."""
+    remat_prevent_cse: bool = True
+    """``prevent_cse`` of the stacked blocks' per-layer gradient checkpoints. True (JAX's default) wraps the saved
+    residuals in optimization barriers, which XLA removes only after fusion, so the backward's slices of them stay
+    unfused copies. False drops the barriers so XLA fuses those slices; the layer scan already keeps the backward from
+    reusing forward values (JAX's guidance for ``jax.checkpoint`` under ``scan``). Unstacked blocks always keep True:
+    without a scan, XLA could CSE their recomputation with the forward and keep its activations alive."""
     rms_norm_impl: RmsNormImpl = "barrier"
     """How the RMS norms (the weighted ``RMSNorm`` layers and the q/k ``rms_norm``) keep AD from changing the rounding
     of their float32 statistics. "barrier" puts an optimization barrier on the variance, which splits the reduction
@@ -1674,7 +1673,7 @@ class Transformer(eqx.Module):
         if cfg.head_gate_remat == "save":
             saved_names = (*saved_names, HEAD_GATE_REMAT_SAVE_NAME)
         remat_policy = jax.checkpoint_policies.save_only_these_names(*saved_names) if saved_names else None
-        prevent_cse = self.blocks is not None if cfg.remat_prevent_cse is None else cfg.remat_prevent_cse
+        prevent_cse = self.blocks is not None or cfg.remat_prevent_cse
         checkpoint = functools.partial(eqx.filter_checkpoint, policy=remat_policy, prevent_cse=prevent_cse)
 
         gathered_blocks = None
