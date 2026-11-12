@@ -288,11 +288,9 @@ def test_triton_ragged_dot_value_and_gradients_match_reference_with_device_block
     _assert_close_to_reference(drhs, expected_drhs, 1e-2)
 
 
-@pytest.mark.parametrize("implementation", ["xla", "megablox"])
+@pytest.mark.parametrize("implementation", ["xla"])
 def test_ragged_dot_zeroes_rows_past_the_last_group(implementation):
-    """Rows outside every group come back as zeros, so callers may leave padding rows ungrouped."""
-    if implementation == "megablox" and ragged_dot_module._gmm_megablox is None:
-        pytest.skip("megablox is not available")
+    """Rows outside every group come back as zeros on this path (megablox leaves them unspecified)."""
     lhs, rhs, sizes = _layout_operands("fwd", jnp.float32, _GROUP_SIZE_CASES["rows_past_last_group"])
     active = sum(_GROUP_SIZE_CASES["rows_past_last_group"])
 
