@@ -173,6 +173,12 @@ are split across their replicas. A save also bounds the host memory it stages: o
 share fits under `max_staged_host_bytes` returns while the commits drain, and a larger save
 rolls through it.
 
+When several processes save to a local or NFS path, each OCDBT manifest commit takes a lock
+file that every other writer waits on. A save that does not fit in `max_staged_host_bytes`
+batches each staging wave into one atomic manifest commit, after one process publishes the
+array metadata. A save that fits, and every save that is not using lock files, commits each
+chunk as soon as it is staged, which overlaps staging with storage I/O.
+
 | Parameter                                  | Description                                                                            | Default |
 |--------------------------------------------|----------------------------------------------------------------------------------------|---------|
 | `checkpointer.write.max_write_replicas`    | Cap on how many replicas of an array write part of it. `1` disables replica splitting. | 1024    |
