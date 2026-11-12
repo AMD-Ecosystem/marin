@@ -112,7 +112,9 @@ def _zero_rows_past_groups(out: jax.Array, group_sizes: jax.Array) -> jax.Array:
 def _ragged_dot_megablox_impl(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array) -> jax.Array:
     if _gmm_megablox is None:
         raise NotImplementedError("megablox GMM is not available (TPU-only)")
-    out = _gmm_megablox(
+    # Rows past the groups are left unspecified on TPU, as upstream: zeroing them slowed the standalone GMM, and the
+    # ring paths read only valid rows.
+    return _gmm_megablox(
         lhs,
         rhs,
         group_sizes,
@@ -120,7 +122,6 @@ def _ragged_dot_megablox_impl(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.A
         tiling=_megablox_tiling,
         interpret=jax.default_backend() == "cpu",
     )
-    return _zero_rows_past_groups(out, group_sizes)
 
 
 def _dot_f32(a: jax.Array, b: jax.Array, *, trans_a: bool = False, trans_b: bool = False) -> jax.Array:
