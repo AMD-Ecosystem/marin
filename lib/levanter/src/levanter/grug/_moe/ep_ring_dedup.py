@@ -47,6 +47,7 @@ from levanter.grug._moe.ep_ring import (
     _gather_sum_slots,
     _select_local_assignments,
     _take_valid_rows,
+    _use_pallas_gather,
 )
 from levanter.grug._moe.flydsl_gather import gathered_up_projection
 from levanter.grug._moe.grad_accum import ExpertGradAccumulator, from_local_view, local_view
@@ -104,7 +105,7 @@ def _send_rows(
 
 
 def _send_rows_fwd(x, slot_token, slot_valid, slots, send_gather, token_sum):
-    if send_gather == "pallas":
+    if _use_pallas_gather(send_gather, x.shape[-1]):
         rows = gather_valid_rows(x, slot_token, slot_valid)
     else:
         rows = _take_valid_rows(x, slot_token, slot_valid)
@@ -136,7 +137,7 @@ def _return_rows_fwd(rows, slot_token, slot_valid, slots, backward, token_sum):
 
 def _return_rows_bwd(backward, token_sum, residuals, g):
     slot_token, slot_valid = residuals
-    if backward == "pallas":
+    if _use_pallas_gather(backward, g.shape[-1]):
         d_rows = gather_valid_rows(g, slot_token, slot_valid)
     else:
         d_rows = _take_valid_rows(g, slot_token, slot_valid)

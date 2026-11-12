@@ -23,7 +23,12 @@ from levanter.grug._moe.common import (
     CapacityDrops,
 )
 from levanter.grug._moe.ep_common import _assignment_sources, _prefix_cap_counts
-from levanter.grug._moe.pallas_gather_sum import MoeGatherSum, gather_sum_rows, gather_valid_rows
+from levanter.grug._moe.pallas_gather_sum import (
+    MoeGatherSum,
+    gather_sum_rows,
+    gather_valid_rows,
+    pallas_gather_supported,
+)
 
 RingAssignmentSelection: TypeAlias = Literal["top_k", "rank_scatter"]
 """How the ring backends order a shard's accepted assignments by expert.
@@ -91,6 +96,11 @@ def _gather_sum_slots(rows: Float[Array, "P H"], slots: Int[Array, "T K"]) -> Fl
     return out.astype(rows.dtype)
 
 
+def _use_pallas_gather(backward: MoeGatherSum, hidden: int) -> bool:
+    # Widths the kernel cannot tile fall back to the XLA gathers, which give the same bits.
+    return backward == "pallas" and pallas_gather_supported(hidden)
+
+
 def _take_valid_rows(
     x: Float[Array, "T H"], slot_token: Int[Array, "P"], slot_valid: Bool[Array, "P"]
 ) -> Float[Array, "P H"]:
@@ -118,7 +128,7 @@ def _dispatch_rows_fwd(x, slot_token, slot_valid, slots, backward):
 
 
 def _dispatch_rows_bwd(backward, slots, g):
-    d_x = gather_sum_rows(g, slots) if backward == "pallas" else _gather_sum_slots(g, slots)
+    d_x = gather_sum_rows(g, slots) if _use_pallas_gather(backward, g.shape[-1]) else _gather_sum_slots(g, slots)
     return d_x, None, None, None
 
 
@@ -142,7 +152,7 @@ def _combine_rows_fwd(rows, slot_token, slot_valid, slots, backward):
 
 def _combine_rows_bwd(backward, residuals, g):
     slot_token, slot_valid = residuals
-    if backward == "pallas":
+    if _use_pallas_gather(backward, g.shape[-1]):
         d_rows = gather_valid_rows(g, slot_token, slot_valid)
     else:
         d_rows = _take_valid_rows(g, slot_token, slot_valid)

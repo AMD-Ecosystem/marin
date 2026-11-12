@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from haliax.nn.ragged_dot import GradAccumulation
 from jaxtyping import Array, Float, Int
 
-from levanter.grug._moe.ep_ring import _gather_sum_slots, _take_valid_rows
+from levanter.grug._moe.ep_ring import _gather_sum_slots, _take_valid_rows, _use_pallas_gather
 from levanter.grug._moe.grad_accum import accumulate_reference
 from levanter.grug._moe.pallas_gather_sum import MoeGatherSum, gather_sum_rows
 
@@ -152,7 +152,11 @@ def _gathered_up_projection_bwd(gather_sum, mode, residuals, cotangent):
         d_rows = _rd._zero_rows_past_groups_in_place(ops.grouped_gemm_bf16_nt(d_out, w13, offsets), group_sizes)
     d_w = weight_grad(ops, source, d_out, w13, group_sizes, acc, layer, mode, row_index=row_index)
     # The dispatch backward of ``ep_ring._dispatch_rows``.
-    d_source = gather_sum_rows(d_rows, slots) if gather_sum == "pallas" else _gather_sum_slots(d_rows, slots)
+    d_source = (
+        gather_sum_rows(d_rows, slots)
+        if _use_pallas_gather(gather_sum, d_rows.shape[-1])
+        else _gather_sum_slots(d_rows, slots)
+    )
     if mode in ("init", "accum"):
         # The weight's gradient went into the accumulator.
         return d_source, None, None, None, None, d_w, None
