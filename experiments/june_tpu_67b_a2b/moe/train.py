@@ -1893,6 +1893,12 @@ def _train_loop(
     return state
 
 
+def _loggable_config(config: GrugRunConfig) -> GrugRunConfig:
+    """``config`` without the step eval, for ``log_configuration``: it deep-copies the config, and the step eval's
+    held-out dataset reads a cache whose reader holds thread locks."""
+    return dataclasses.replace(config, step_eval=None)
+
+
 def _run_grug_local(config: GrugRunConfig, *, step_hooks: Sequence[Callable[[callbacks.StepInfo], object]] = ()) -> None:
     """Entry point for the grug template training loop.
 
@@ -1902,7 +1908,7 @@ def _run_grug_local(config: GrugRunConfig, *, step_hooks: Sequence[Callable[[cal
     # Read before ``initialize`` fills it in from the batch size and levanter's own mesh, whose batch axis can differ.
     requested_per_device_parallelism = trainer.per_device_parallelism
     trainer.initialize()
-    levanter.tracker.log_configuration(config)
+    levanter.tracker.log_configuration(_loggable_config(config))
 
     run_id = trainer.id
     if run_id is None:
