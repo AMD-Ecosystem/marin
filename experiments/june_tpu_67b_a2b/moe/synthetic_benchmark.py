@@ -13,6 +13,10 @@ time from step 2 on, tokens/s, model TFLOP/s and MFU, then each device's peak me
 period (``throughput/wall_step_s``: the time between consecutive steps' hooks, which includes the host work between
 steps that ``throughput/duration`` leaves out) and their median from step 2 on.
 
+With ``--eval-every N`` every N-th step (and the last) also runs a forward-only held-out loss inside the train step
+(``GrugStepEvalConfig``) on ``--eval-microbatches`` microbatches of separate random sequences (seed 1), so its loss is
+about ln(vocab_size). The headline then covers the train-only steps, and a further line gives the eval steps' cost.
+
 Example, 8 GPUs, full 67B shape, expert parallelism over all 8, profile of steps 10-12::
 
     RAGGED_DOT_IMPL=xla python experiments/june_tpu_67b_a2b/moe/synthetic_benchmark.py \\
@@ -50,11 +54,15 @@ from experiments.june_tpu_67b_a2b.moe.slurm_run_config import (
     log_run_config,
     report_memory,
     shared_run_id,
+    step_eval_sequences,
 )
-from experiments.june_tpu_67b_a2b.moe.train import GrugRunConfig, _compute_flops, _run_grug_local
+from experiments.june_tpu_67b_a2b.moe.train import GrugRunConfig, GrugStepEvalConfig, _compute_flops, _run_grug_local
 
 # The spurix launcher replaces this module's report_memory with one that logs through this logger.
 logger = logging.getLogger("june_synthetic_benchmark")
+# The training examples' seed and the held-out ones': no held-out sequence is a training sequence.
+TRAIN_SEED = 0
+EVAL_SEED = 1
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -67,7 +75,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def synthetic_examples(count: int, seq_len: int, vocab_size: int, seed: int = 0) -> list[GrugLmExample]:
+def synthetic_examples(count: int, seq_len: int, vocab_size: int, seed: int) -> list[GrugLmExample]:
     rng = np.random.default_rng(seed)
     loss_weight = np.ones(seq_len, dtype=np.float32)
     loss_weight[-1] = 0
@@ -93,7 +101,7 @@ def build_run_config(args: argparse.Namespace) -> GrugRunConfig:
         load_checkpoint=False,  # never resume a reused --run-id; every benchmark starts from step 0
     )
     # One fresh example per sequence, and a mixture block exactly as long as the dataset so nothing repeats.
-    examples = synthetic_examples(args.steps * batch_size, model.max_seq_len, model.vocab_size)
+    examples = synthetic_examples(args.steps * batch_size, model.max_seq_len, model.vocab_size, TRAIN_SEED)
     data = LmDataConfig(
         components={"synthetic": DirectDatasetComponent(datasets={"train": ListAsyncDataset(examples)})},
         tokenizer="passthrough",
@@ -107,7 +115,18 @@ def build_run_config(args: argparse.Namespace) -> GrugRunConfig:
         optimizer=AdamConfig(learning_rate=args.learning_rate, warmup=0.0),
         trainer=build_grug_trainer(args, trainer, save_checkpoints=False),
         eval=None,
+        step_eval=step_eval_config(args, batch_size, model.max_seq_len, model.vocab_size),
     )
+
+
+def step_eval_config(
+    args: argparse.Namespace, batch_size: int, seq_len: int, vocab_size: int
+) -> GrugStepEvalConfig | None:
+    sequences = step_eval_sequences(args, batch_size)
+    if not sequences:
+        return None
+    held_out = ListAsyncDataset(synthetic_examples(sequences, seq_len, vocab_size, EVAL_SEED))
+    return GrugStepEvalConfig(held_out, every=args.eval_every, microbatches_per_eval=args.eval_microbatches)
 
 
 def main() -> None:
@@ -121,7 +140,7 @@ def main() -> None:
     flops_per_example, flops_summary = _compute_flops(model_config=model)
     log_run_config(args, model, trainer, batch_size, flops_per_example)
     log_model_flops(flops_per_example, flops_summary)
-    step_times = StepTimes()
+    step_times = StepTimes(config.step_eval, trainer.num_train_steps)
     _run_grug_local(config, step_hooks=[step_times])
     step_times.log_summary(batch_size, model.max_seq_len, flops_per_example)
     report_memory()

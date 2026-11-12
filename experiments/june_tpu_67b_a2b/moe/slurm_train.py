@@ -8,8 +8,9 @@ The run counterpart of ``synthetic_benchmark.py``: the same model, mesh and perf
 (``slurm_run_config.py``), so a configuration timed by the benchmark trains at the same speed. On top it reads its
 tokens from a flat Levanter cache (for example the FineWeb-Edu cache ``make_fineweb_mini.py`` writes), sizes the
 optimizer's warmup and decay to a token budget, saves checkpoints and resumes from the latest one, and can hold out
-part of the cache for a loss eval. It logs the same headline, memory and FLOP lines as the benchmark, then
-"trained steps A-B: T tokens, final loss L".
+part of the cache for a loss eval inside the train step (``--eval-every``, ``--eval-microbatches``;
+``GrugStepEvalConfig``), which logs ``eval/loss`` and ``eval/bpb``. It logs the same headline, memory and FLOP lines
+as the benchmark, then "trained steps A-B: T tokens, final loss L".
 
 Data: the cache is one token stream of documents laid out as [BOS, text, EOS], cut into ``--seq-len`` windows
 across document boundaries (Levanter's ``TokenSeqDataset``), block-shuffled with ``--data-seed``. Attention runs
@@ -43,9 +44,10 @@ from pathlib import Path
 import jax
 import numpy as np
 from fray.cluster import ResourceConfig
+from haliax import Axis
 from levanter.callbacks import StepInfo
 from levanter.checkpoint import CheckpointerConfig
-from levanter.data.text.datasets import DatasetComponent, LmDataConfig
+from levanter.data.text.datasets import DatasetComponent, LmDataConfig, NamedLmDataset
 from levanter.data.text.formats import TextLmDatasetFormat
 from levanter.optim.config import AdamConfig, OptimizerConfig
 from levanter.store.cache import CacheLedger, TreeCache
@@ -68,8 +70,9 @@ from experiments.june_tpu_67b_a2b.moe.slurm_run_config import (
     log_run_config,
     report_memory,
     shared_run_id,
+    step_eval_sequences,
 )
-from experiments.june_tpu_67b_a2b.moe.train import GrugEvalConfig, GrugRunConfig, _compute_flops, _run_grug_local
+from experiments.june_tpu_67b_a2b.moe.train import GrugRunConfig, GrugStepEvalConfig, _compute_flops, _run_grug_local
 
 logger = logging.getLogger("june_slurm_train")
 
@@ -110,14 +113,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Start even if the budget needs more windows than the cache holds (Levanter then repeats data).",
     )
-    data.add_argument(
-        "--eval-sequences",
-        type=int,
-        default=0,
-        help="Hold out this many windows of the cache for a loss eval (0: no eval); a multiple of the eval batch "
-        "(--batch-size / --microbatches).",
-    )
-    data.add_argument("--eval-every", type=int, default=500, help="Steps between evals.")
     run = parser.add_argument_group("budget and optimizer")
     run.add_argument(
         "--train-tokens",
@@ -246,7 +241,7 @@ def check_data_budget(
         seq_len,
         usable,
         usable * seq_len / 1e9,
-        args.eval_sequences,
+        step_eval_sequences(args, batch_size),
         args.train_tokens,
         steps,
         batch_size,
@@ -284,23 +279,16 @@ def optimizer_config(args: argparse.Namespace, *, batch_size: int, seq_len: int,
     )
 
 
-def eval_config(args: argparse.Namespace, batch_size: int) -> GrugEvalConfig | None:
-    if not args.eval_sequences:
+def step_eval_config(data: LmDataConfig, args: argparse.Namespace, seq_len: int) -> GrugStepEvalConfig | None:
+    """The eval inside the train step on the windows ``real_data_config`` held out, with bits per byte."""
+    if args.eval_every <= 0:
         return None
-    # One microbatch's rows: the eval forward is not microbatched and must fit next to the train state.
-    eval_batch_size = batch_size // args.microbatches
-    if args.eval_sequences % eval_batch_size:
-        raise ValueError(
-            f"--eval-sequences {args.eval_sequences} must be a multiple of the eval batch {eval_batch_size}"
-        )
-    return GrugEvalConfig(
-        eval_batch_size=eval_batch_size,
-        steps_per_eval=args.eval_every,
-        max_eval_batches=None,
-        prefix="eval",
-        eval_current=True,
-        eval_ema=False,
-        compute_bpb=True,
+    named = data.validation_sets(Axis("position", seq_len))[TRAIN_COMPONENT]
+    # The held-out windows as GrugLmExamples, which the NamedLmDataset wrapper converts to Levanter's LmExample.
+    assert isinstance(named, NamedLmDataset)
+    held_out = named.dataset
+    return GrugStepEvalConfig(
+        held_out, every=args.eval_every, microbatches_per_eval=args.eval_microbatches, compute_bpb=True
     )
 
 
@@ -325,12 +313,13 @@ def build_run_config(args: argparse.Namespace) -> GrugRunConfig:
             f"gives at {batch_size} x {seq_len} tokens per step"
         )
     cache = open_cache(args.data_cache_dir)
-    train_windows = training_windows(cache, seq_len, args.eval_sequences)
+    eval_sequences = step_eval_sequences(args, batch_size)
+    train_windows = training_windows(cache, seq_len, eval_sequences)
     data = real_data_config(
         args.data_cache_dir,
         args.tokenizer,
         model.vocab_size,
-        eval_sequences=args.eval_sequences,
+        eval_sequences=eval_sequences,
         train_windows=train_windows,
     )
     check_cache_tokens(cache, data.the_tokenizer, model.vocab_size)
@@ -370,7 +359,8 @@ def build_run_config(args: argparse.Namespace) -> GrugRunConfig:
             data_seed=args.data_seed,
             z_loss_weight=args.z_loss_weight,
         ),
-        eval=eval_config(args, batch_size),
+        eval=None,
+        step_eval=step_eval_config(data, args, seq_len),
     )
 
 
@@ -403,7 +393,7 @@ def main() -> None:
     log_model_flops(flops_per_example, flops_summary)
     if jax.process_index() == 0:
         logger.info("optimizer: %s", config.optimizer)
-    step_times = StepTimes()
+    step_times = StepTimes(config.step_eval, trainer.num_train_steps)
     last = LastLoss()
     _run_grug_local(config, step_hooks=[step_times, last])
     step_times.log_summary(batch_size, model.max_seq_len, flops_per_example)

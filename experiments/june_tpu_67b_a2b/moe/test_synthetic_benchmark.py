@@ -45,10 +45,10 @@ BEST7_ARGV = (
 ).split()
 
 
-def captured_benchmark_run(monkeypatch) -> GrugRunConfig:
-    """The GrugRunConfig the benchmark's main() hands to the training loop for BEST7_ARGV."""
+def captured_benchmark_run(monkeypatch, *extra: str) -> GrugRunConfig:
+    """The GrugRunConfig the benchmark's main() hands to the training loop for BEST7_ARGV plus ``extra``."""
     runs: list[GrugRunConfig] = []
-    monkeypatch.setattr(sys, "argv", ["synthetic_benchmark.py", *BEST7_ARGV])
+    monkeypatch.setattr(sys, "argv", ["synthetic_benchmark.py", *BEST7_ARGV, *extra])
     monkeypatch.setattr(synthetic_benchmark, "_run_grug_local", lambda config, **kwargs: runs.append(config))
     synthetic_benchmark.main()
     (run,) = runs
@@ -151,6 +151,7 @@ def test_best7_command_line_builds_the_timed_run(monkeypatch):
     assert run.optimizer == AdamConfig(learning_rate=3e-4, warmup=0.0)
     assert run.resources == ResourceConfig()
     assert run.eval is None
+    assert run.step_eval is None
 
     # Fresh uniform-random tokens for every sequence of every step, with a mixture block as long as the data.
     (name,) = run.data.components
@@ -163,3 +164,24 @@ def test_best7_command_line_builds_the_timed_run(monkeypatch):
     loss_weight = np.ones(4096, dtype=np.float32)
     loss_weight[-1] = 0
     np.testing.assert_array_equal(examples[-1].loss_weight, loss_weight)
+
+
+def test_eval_flags_add_a_held_out_set_and_leave_the_timed_run(monkeypatch):
+    # Two microbatches' worth (2 x 512 / 4) of fresh random sequences from another seed than the training ones; the
+    # model, trainer and training data are best7's.
+    best7 = captured_benchmark_run(monkeypatch)
+    run = captured_benchmark_run(monkeypatch, "--eval-every", "10", "--eval-microbatches", "2")
+
+    assert (run.model, run.trainer, run.optimizer, run.eval) == (best7.model, best7.trainer, best7.optimizer, None)
+    step_eval = run.step_eval
+    assert step_eval is not None
+    assert (step_eval.every, step_eval.microbatches_per_eval, step_eval.compute_bpb) == (10, 2, False)
+    held_out = step_eval.dataset.data
+    assert len(held_out) == 2 * BATCH // 4
+    expected = np.random.default_rng(1).integers(0, 128_256, (2, 4096), dtype=np.int32)
+    np.testing.assert_array_equal(np.stack([held_out[0].tokens, held_out[1].tokens]), expected)
+    (name,) = run.data.components
+    train_tokens = {example.tokens.tobytes() for example in run.data.components[name].datasets["train"].data}
+    assert not train_tokens & {example.tokens.tobytes() for example in held_out}
+    # Steps 10, 20, ... and the last step evaluate.
+    assert [s for s in range(25) if step_eval.runs_at(s, 25)] == [10, 20, 24]

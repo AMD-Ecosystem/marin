@@ -106,6 +106,25 @@ def test_budget_beyond_the_cache_is_refused(tmp_path):
     slurm_train.build_run_config(slurm_train.parse_args([*argv, "--allow-data-repeat"]))
 
 
+def test_eval_holds_out_whole_microbatches_for_the_step_eval(tmp_path):
+    # best7's 4 microbatches of a 16-sequence batch: --eval-microbatches 2 holds out 8 windows, which the eval inside
+    # the train step evaluates with bits per byte; Levanter's standalone eval is off.
+    windows = 6 * 16 + 8
+    argv = train_argv(
+        tmp_path, windows * 256 + 100, *SMALL_STEP, "--train-tokens", str(6 * 4096), "--optimizer", "muonh"
+    )
+    run = slurm_train.build_run_config(slurm_train.parse_args([*argv, "--eval-every", "4", "--eval-microbatches", "2"]))
+    assert run.eval is None
+    step_eval = run.step_eval
+    assert step_eval is not None
+    assert (step_eval.every, step_eval.microbatches_per_eval, step_eval.compute_bpb) == (4, 2, True)
+    assert len(step_eval.dataset.as_sync_dataset()) == 8
+    assert run.data.num_validation_sequences == {slurm_train.TRAIN_COMPONENT: 8}
+    # Without --eval-every nothing is held out, whatever --eval-microbatches says.
+    run = slurm_train.build_run_config(slurm_train.parse_args([*argv, "--eval-microbatches", "2"]))
+    assert run.step_eval is None and run.data.num_validation_sequences is None
+
+
 DATA_PATH_SCRIPT = """
 import os
 
