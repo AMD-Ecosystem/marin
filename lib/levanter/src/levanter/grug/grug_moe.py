@@ -54,6 +54,7 @@ from levanter.grug._moe.ep_fixed_all_to_all import _moe_mlp_ep_fixed_a2a_local
 from levanter.grug._moe.ep_fixed_pooled_wave_all_to_all import _moe_mlp_ep_fixed_pooled_wave_a2a_local
 from levanter.grug._moe.ep_ragged_all_to_all import _moe_mlp_ep_ragged_a2a_local
 from levanter.grug._moe.ep_ring import (
+    RingAssignmentSelection,
     _gather_dispatch_combine,
     _moe_mlp_ep_ring_local,
     _scatter_add_dispatch_combine,
@@ -548,6 +549,7 @@ class MoEExpertMlp(eqx.Module):
     dispatch_barrier: bool = eqx.field(static=True, default=False)
     gather_sum: MoeGatherSum = eqx.field(static=True, default="xla")
     routing_metadata: MoeRoutingMetadata = eqx.field(static=True, default="xla")
+    ring_selection: RingAssignmentSelection = eqx.field(static=True, default="top_k")
     flydsl_gather_a: bool = eqx.field(static=True, default=False)
     scatter_epilogue: MoeScatterEpilogue = eqx.field(static=True, default="off")
     send_gather: MoeSendGather = eqx.field(static=True, default="xla")
@@ -572,6 +574,7 @@ class MoEExpertMlp(eqx.Module):
         dispatch_barrier: bool = False,
         gather_sum: MoeGatherSum = "xla",
         routing_metadata: MoeRoutingMetadata = "xla",
+        ring_selection: RingAssignmentSelection = "top_k",
         flydsl_gather_a: bool = False,
         scatter_epilogue: MoeScatterEpilogue = "off",
         send_gather: MoeSendGather = "xla",
@@ -603,6 +606,7 @@ class MoEExpertMlp(eqx.Module):
             dispatch_barrier=dispatch_barrier,
             gather_sum=gather_sum,
             routing_metadata=routing_metadata,
+            ring_selection=ring_selection,
             flydsl_gather_a=flydsl_gather_a,
             scatter_epilogue=scatter_epilogue,
             send_gather=send_gather,
@@ -644,6 +648,7 @@ class MoEExpertMlp(eqx.Module):
             dispatch_barrier=self.dispatch_barrier,
             gather_sum=self.gather_sum,
             routing_metadata=self.routing_metadata,
+            ring_selection=self.ring_selection,
             grad_acc=grad_acc,
             flydsl_gather_a=self.flydsl_gather_a,
             scatter_epilogue=self.scatter_epilogue,
@@ -674,6 +679,7 @@ def moe_mlp(
     dispatch_barrier: bool = False,
     gather_sum: MoeGatherSum = "xla",
     routing_metadata: MoeRoutingMetadata = "xla",
+    ring_selection: RingAssignmentSelection = "top_k",
     grad_acc: ExpertGradAccumulator | None = None,
     flydsl_gather_a: bool = False,
     scatter_epilogue: MoeScatterEpilogue = "off",
@@ -731,6 +737,9 @@ def moe_mlp(
     counts) with two Pallas-Triton counting-sort kernels per side instead of XLA fusions, with the same values
     (`ring_dedup` only).
 
+    `ring_selection` chooses how `ring`, `ring_gather_combine` and `ring_dedup` order each shard's accepted
+    assignments; see `RingAssignmentSelection`. Other implementations reject any value but the default `top_k`.
+
     `flydsl_gather_a=True` lets the jax-flydsl up-projection GEMM gather `ring_dedup`'s dispatch rows in its A loads
     (forward and weight gradient) instead of building the expert-ordered copy, with the same results bit for bit
     (`ring_dedup` with `ragged_dot`'s flydsl implementation only).
@@ -761,6 +770,13 @@ def moe_mlp(
     if gather_sum != "xla" and resolved_implementation != "ring_dedup":
         raise ValueError(
             f"gather_sum={gather_sum!r} requires ring_dedup, got implementation={resolved_implementation!r}"
+        )
+    if ring_selection not in get_args(RingAssignmentSelection):
+        raise ValueError(f"Unknown ring_selection {ring_selection!r}")
+    if ring_selection != "top_k" and resolved_implementation not in ("ring", "ring_gather_combine", "ring_dedup"):
+        raise ValueError(
+            f"ring_selection={ring_selection!r} applies only to the ring backends; "
+            f"got implementation={resolved_implementation!r}"
         )
     if routing_metadata not in get_args(MoeRoutingMetadata):
         raise ValueError(f"routing_metadata must be one of {get_args(MoeRoutingMetadata)}, got {routing_metadata!r}")
@@ -895,9 +911,17 @@ def moe_mlp(
             raise ValueError(f"{resolved_implementation} requires pooled_transport_capacity_factor")
 
         if resolved_implementation == "ring":
-            shard_local_fn = partial(_moe_mlp_ep_ring_local, make_dispatch_combine=_scatter_add_dispatch_combine)
+            shard_local_fn = partial(
+                _moe_mlp_ep_ring_local,
+                make_dispatch_combine=_scatter_add_dispatch_combine,
+                ring_selection=ring_selection,
+            )
         elif resolved_implementation == "ring_gather_combine":
-            shard_local_fn = partial(_moe_mlp_ep_ring_local, make_dispatch_combine=_gather_dispatch_combine)
+            shard_local_fn = partial(
+                _moe_mlp_ep_ring_local,
+                make_dispatch_combine=_gather_dispatch_combine,
+                ring_selection=ring_selection,
+            )
         elif resolved_implementation == "ring_dedup":
             shard_local_fn = partial(
                 _moe_mlp_ep_ring_dedup_local,
@@ -907,6 +931,7 @@ def moe_mlp(
                 dispatch_barrier=dispatch_barrier,
                 gather_sum=gather_sum,
                 routing_metadata=routing_metadata,
+                ring_selection=ring_selection,
                 flydsl_gather_a=flydsl_gather_a,
                 scatter_epilogue=scatter_epilogue,
                 send_gather=send_gather,
@@ -1064,6 +1089,7 @@ __all__ = [
     "MoeImplementation",
     "PspecAxis",
     "QBRoutedMoE",
+    "RingAssignmentSelection",
     "QbThresholdImpl",
     "RouterStats",
     "moe_mlp",

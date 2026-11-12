@@ -47,6 +47,7 @@ from levanter.grug.grug_moe import (
     MoeImplementation,
     QBRoutedMoE,
     QbThresholdImpl,
+    RingAssignmentSelection,
     RouterStats,
     reduce_moe_routing_stats,
     validate_moe_implementation,
@@ -180,6 +181,10 @@ class GrugModelConfig:
     """How ``ring_dedup`` runs the backward's expert-side dispatch gather-sum and sender-side combine gather: XLA
     fusions ("xla") or a Pallas-Triton row-gather kernel ("pallas"). Both give the same values bit for bit; off GPU the
     kernel runs in the Pallas interpreter. Needs ``moe_implementation="ring_dedup"``."""
+    ring_selection: RingAssignmentSelection = "top_k"
+    """How the ring backends order each shard's accepted assignments. ``rank_scatter`` was faster on MI355X and
+    slower on H100, GB200 and TPU v4. ``ring_dedup`` with ``moe_routing_metadata="pallas"`` builds its routing maps
+    without either."""
     moe_routing_metadata: MoeRoutingMetadata = "xla"
     """How ``ring_dedup`` builds its integer routing maps from the top-k expert ids (send slots, expert rows, group
     sizes, drop counts): XLA fusions ("xla") or two Pallas-Triton counting-sort kernels per side ("pallas"). Both give
@@ -1034,6 +1039,7 @@ class MoEMLP(eqx.Module):
                 dispatch_barrier=cfg.moe_dispatch_barrier,
                 gather_sum=cfg.moe_gather_sum,
                 routing_metadata=cfg.moe_routing_metadata,
+                ring_selection=cfg.ring_selection,
                 flydsl_gather_a=cfg.moe_flydsl_gather_a,
                 scatter_epilogue=cfg.moe_scatter_epilogue,
                 send_gather=cfg.moe_send_gather,

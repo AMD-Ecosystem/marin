@@ -40,7 +40,12 @@ def routing(key, received_rows: int, topk: int, local_experts: int, capacity: in
     hit = jax.random.bernoulli(k_hit, hit_prob, (assignments,))
     local_expert = jnp.where(hit, jax.random.randint(k_expert, (assignments,), 0, local_experts), 0)
     group_sizes, _, picked, dispatch_valid = _select_local_assignments(
-        local_expert, hit, local_experts=local_experts, logical_capacity=capacity, physical_capacity=capacity
+        local_expert,
+        hit,
+        local_experts=local_experts,
+        logical_capacity=capacity,
+        physical_capacity=capacity,
+        selection="rank_scatter",
     )
     picked = jnp.where(dispatch_valid, picked, assignments)
     dispatch_row = jnp.where(dispatch_valid, picked // topk, received_rows)

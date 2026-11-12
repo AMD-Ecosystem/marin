@@ -41,6 +41,7 @@ from levanter.grug._moe.common import (
 )
 from levanter.grug._moe.ep_common import _assignment_sources, _combine_gather_sum
 from levanter.grug._moe.ep_ring import (
+    RingAssignmentSelection,
     _combine_rows,
     _dispatch_rows,
     _gather_sum_slots,
@@ -163,6 +164,7 @@ def _moe_mlp_ep_ring_dedup_local(
     dispatch_barrier: bool = False,
     gather_sum: MoeGatherSum = "xla",
     routing_metadata: MoeRoutingMetadata = "xla",
+    ring_selection: RingAssignmentSelection = "top_k",
     flydsl_gather_a: bool = False,
     scatter_epilogue: MoeScatterEpilogue = "off",
     send_gather: MoeSendGather = "xla",
@@ -242,6 +244,7 @@ def _moe_mlp_ep_ring_dedup_local(
         dispatch_barrier=dispatch_barrier,
         gather_sum=gather_sum,
         routing_metadata=routing_metadata,
+        ring_selection=ring_selection,
         flydsl_gather_a=flydsl_gather_a,
         scatter_epilogue=scatter_epilogue,
         send_gather=send_gather,
@@ -310,6 +313,7 @@ def _ring_dedup_block(
     dispatch_barrier: bool,
     gather_sum: MoeGatherSum,
     routing_metadata: MoeRoutingMetadata,
+    ring_selection: RingAssignmentSelection,
     flydsl_gather_a: bool,
     scatter_epilogue: MoeScatterEpilogue,
     send_gather: MoeSendGather = "xla",
@@ -360,6 +364,7 @@ def _ring_dedup_block(
                 capacity_factor=capacity_factor,
                 expert_capacity=expert_capacity,
                 routing_metadata=routing_metadata,
+                ring_selection=ring_selection,
             )
         )
         if scatter_epilogue != "off":
@@ -550,6 +555,7 @@ def _expert_routing(
     capacity_factor: float,
     expert_capacity: int,
     routing_metadata: MoeRoutingMetadata,
+    ring_selection: RingAssignmentSelection,
 ) -> tuple[
     Float[Array, "R K"],
     Int[Array, "Elocal"],
@@ -596,6 +602,7 @@ def _expert_routing(
             local_experts=local_experts,
             logical_capacity=logical_capacity,
             physical_capacity=expert_capacity,
+            selection=ring_selection,
         )
         picked = jnp.where(dispatch_valid, picked, received_assignments)
         position = _assignment_sources(picked, send_size=received_assignments)

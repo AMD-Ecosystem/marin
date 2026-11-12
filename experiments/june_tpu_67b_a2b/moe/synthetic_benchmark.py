@@ -51,7 +51,7 @@ from levanter.grug._moe.pallas_gather_sum import MoeGatherSum
 from levanter.grug._moe.pallas_routing_metadata import MoeRoutingMetadata
 from levanter.grug._moe.scatter_epilogue import MoeScatterEpilogue
 from levanter.grug.attention import GrugAttentionImplementation
-from levanter.grug.grug_moe import QbThresholdImpl
+from levanter.grug.grug_moe import QbThresholdImpl, RingAssignmentSelection
 from levanter.optim.config import AdamConfig
 from levanter.tracker.json_logger import JsonLoggerConfig
 from levanter.trainer import TrainerConfig
@@ -204,6 +204,12 @@ def parse_args() -> argparse.Namespace:
         help="ring_dedup only: run the backward's expert-side dispatch gather-sum and sender-side combine gather as "
         "XLA fusions (xla) or in a Pallas-Triton row-gather kernel (pallas), with the same results bit for bit "
         "(GrugModelConfig.moe_gather_sum).",
+    )
+    parser.add_argument(
+        "--ring-selection",
+        choices=get_args(RingAssignmentSelection),
+        default="top_k",
+        help="How ring, ring_gather_combine and ring_dedup order each shard's assignments (default: top_k).",
     )
     parser.add_argument(
         "--moe-routing-metadata",
@@ -533,6 +539,7 @@ def main() -> None:
         moe_dispatch_barrier=args.moe_dispatch_barrier,
         moe_gather_sum=args.moe_gather_sum,
         moe_routing_metadata=args.moe_routing_metadata,
+        ring_selection=args.ring_selection,
         moe_flydsl_gather_a=args.moe_flydsl_gather_a,
         moe_scatter_epilogue=args.moe_scatter_epilogue,
         moe_send_gather=args.moe_send_gather,

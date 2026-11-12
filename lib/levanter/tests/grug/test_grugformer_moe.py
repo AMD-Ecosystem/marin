@@ -2877,7 +2877,9 @@ def test_select_local_assignments_matches_top_k_selection(logical_capacity, phys
         local_experts=local_experts, logical_capacity=jnp.int32(logical_capacity), physical_capacity=physical_capacity
     )
 
-    sizes, dropped, picked, valid = _select_local_assignments(local_expert, local_mask, **kwargs)
+    sizes, dropped, picked, valid = _select_local_assignments(
+        local_expert, local_mask, selection="rank_scatter", **kwargs
+    )
     want_sizes, want_dropped, want_picked, want_valid = _top_k_local_assignments(local_expert, local_mask, **kwargs)
 
     np.testing.assert_array_equal(sizes, want_sizes)
