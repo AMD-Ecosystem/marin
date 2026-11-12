@@ -719,8 +719,12 @@ class StepTimes:
 
     With ``step_eval``, the steps it runs at (``GrugStepEvalConfig.runs_at``) are kept apart: the headline covers the
     train-only steps, so it stays comparable with runs without an eval, and a separate line gives the eval steps'
-    cost. The first eval step this process runs compiles the eval variant and is reported on its own; the run's last
-    step is left out of the eval steps' mean (its wall period ends with the loop).
+    cost. Each eval step is timed together with the step before it, and both are left out of the train-only steps:
+    with pipelined logging a step's metrics arrive only once the next step is done, so the eval's time lands in the
+    previous step's period, and the first eval step's flush of the pipeline leaves a near-empty one. An eval step's
+    wall time is the pair's wall time minus one train-only mean wall step. The first eval step this process runs
+    compiles the eval variant and is reported on its own; the run's last step is left out of the eval steps' mean (its
+    wall period ends with the loop).
     """
 
     def __init__(self, step_eval: GrugStepEvalConfig | None, num_train_steps: int) -> None:
@@ -729,8 +733,10 @@ class StepTimes:
         self.step_durations: list[float] = []
         self.wall_steps: list[float] = []
         self.timed_steps: list[int] = []
+        # Wall periods of an eval step and the step before it, summed; the first eval step's apart.
         self.eval_wall_steps: dict[int, float] = {}
         self.first_eval: tuple[int, float] | None = None
+        self._before_eval: tuple[bool, float | None] | None = None
         self._seen = 0
         self._last_hook_time: float | None = None
 
@@ -751,10 +757,17 @@ class StepTimes:
             levanter.tracker.log({"throughput/wall_step_s": wall_step}, step=info.step)
         self._last_hook_time = now
         if self._is_eval(info.step):
+            before, self._before_eval = self._before_eval, None
+            pair = (before[1] or 0.0) if before is not None else 0.0
+            pair += wall_step if wall_step is not None else info.step_duration
             if self.first_eval is None:
-                self.first_eval = (info.step, wall_step or info.step_duration)
-            elif timed and wall_step is not None and info.step != self.num_train_steps - 1:
-                self.eval_wall_steps[info.step] = wall_step
+                self.first_eval = (info.step, pair)
+            elif before is not None and before[0] and wall_step is not None and info.step != self.num_train_steps - 1:
+                self.eval_wall_steps[info.step] = pair
+            return
+        if self._is_eval(info.step + 1):
+            # Held for the eval step's pair (see the class docstring).
+            self._before_eval = (timed, wall_step)
             return
         if not timed:
             return
@@ -788,12 +801,13 @@ class StepTimes:
             logger.info("median wall step over steps %d-%d: %.3f s", first, last, statistics.median(self.wall_steps))
         if self.step_eval is None or self.first_eval is None:
             return
-        compile_step, compile_wall = self.first_eval
+        compile_step, compile_pair = self.first_eval
+        train_mean = statistics.fmean(self.wall_steps) if self.wall_steps else 0.0
+        compile_wall = compile_pair - train_mean
         if not self.eval_wall_steps or not self.wall_steps:
             logger.info("eval steps: 0 measured; first (compiling) step %d: %.3f s", compile_step, compile_wall)
             return
-        train_mean = statistics.fmean(self.wall_steps)
-        eval_mean = statistics.fmean(self.eval_wall_steps.values())
+        eval_mean = statistics.fmean(self.eval_wall_steps.values()) - train_mean
         extra = eval_mean - train_mean
         logger.info(
             "eval steps: %d measured (steps %s), mean wall step %.3f s; first (compiling) step %d: %.3f s; "

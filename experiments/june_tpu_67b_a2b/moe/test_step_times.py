@@ -29,22 +29,28 @@ def run_hooks(monkeypatch, step_times: StepTimes, walls: dict[int, float]) -> No
     step_times(StepInfo(SimpleNamespace(step=STEPS), loss=1.0, step_duration=0.0), force=True)
 
 
-def test_eval_steps_are_reported_apart_from_the_train_steps(monkeypatch, caplog):
+@pytest.mark.parametrize("pipelined", [False, True])
+def test_eval_steps_are_reported_apart_from_the_train_steps(monkeypatch, caplog, pipelined):
     # Eval every 4 steps: 4 compiles the eval variant, 8 is measured, 11 (the last) is left out. Steps 0 and 1 are
-    # the timing warmup. The headline covers train steps 2-10 only.
+    # the timing warmup. The headline covers train steps 2-9 without 3 and 7, the steps before an eval, whose wall
+    # periods are timed with it, and 10, the step before the last. Pipelined, each period holds the next step's time,
+    # and the first eval step's flush of the pipeline leaves a near-empty period before it.
     step_eval = GrugStepEvalConfig(ListAsyncDataset([]), every=4)
     walls = {step: TRAIN_WALL for step in range(STEPS)}
-    walls.update({0: 60.0, 4: COMPILE_WALL, 8: EVAL_WALL, 11: 0.01})
+    if pipelined:
+        walls.update({0: 60.0, 3: 0.0, 4: COMPILE_WALL + TRAIN_WALL, 7: EVAL_WALL, 10: EVAL_WALL, 11: 0.01})
+    else:
+        walls.update({0: 60.0, 4: COMPILE_WALL, 8: EVAL_WALL, 11: 0.01})
     step_times = StepTimes(step_eval, STEPS)
     run_hooks(monkeypatch, step_times, walls)
 
-    assert step_times.timed_steps == [2, 3, 5, 6, 7, 9, 10]
-    assert step_times.wall_steps == [TRAIN_WALL] * 7
-    assert step_times.eval_wall_steps == {8: EVAL_WALL}
-    assert step_times.first_eval == (4, COMPILE_WALL)
+    assert step_times.timed_steps == [2, 5, 6, 9]
+    assert step_times.wall_steps == [TRAIN_WALL] * 4
+    assert step_times.eval_wall_steps == {8: pytest.approx(EVAL_WALL + TRAIN_WALL)}
+    assert step_times.first_eval == (4, pytest.approx(COMPILE_WALL + TRAIN_WALL))
     with caplog.at_level(logging.INFO, logger=slurm_run_config.logger.name):
         step_times.log_summary(batch_size=8, seq_len=16, flops_per_example=1e6)
-    headlines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("median step over steps 2-10:")]
+    headlines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("median step over steps 2-9:")]
     assert len(headlines) == 1
     (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("eval steps:")]
     assert line == (
@@ -59,6 +65,7 @@ def test_without_eval_steps_every_timed_step_is_a_train_step(monkeypatch, caplog
     walls = {step: TRAIN_WALL for step in range(STEPS)}
     step_times = StepTimes(step_eval, STEPS)
     run_hooks(monkeypatch, step_times, walls)
-    expected = list(range(2, STEPS)) if step_eval is None else list(range(2, STEPS - 1))
+    # With the eval, the last step and the one before it (timed with it) are left out.
+    expected = list(range(2, STEPS)) if step_eval is None else list(range(2, STEPS - 2))
     assert step_times.timed_steps == expected
     assert step_times.eval_wall_steps == {}

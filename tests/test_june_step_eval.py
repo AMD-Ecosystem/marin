@@ -362,7 +362,7 @@ for name in ("experiments.june_tpu_67b_a2b.moe.train", "june_slurm_run"):
     logging.getLogger(name).addHandler(records)
 with tempfile.TemporaryDirectory() as log_dir:
     sys.argv = [
-        "synthetic_benchmark.py", "--size", "tiny", "--steps", "8", "--batch-size", "32", "--microbatches", "2",
+        "synthetic_benchmark.py", "--size", "tiny", "--steps", "10", "--batch-size", "32", "--microbatches", "2",
         "--expert-axis", "2", "--replica-axis", "2", "--moe-impl", "ring_dedup", "--pooled-transport-capacity-factor",
         "4.0", "--capacity-factor", "8.0", "--carry-compute-params", "--zero1",
         "--gather-in-first-microbatch", "--overlap-last-microbatch", "--block-grad-accumulation", "in_scan",
@@ -373,14 +373,15 @@ with tempfile.TemporaryDirectory() as log_dir:
     synthetic_benchmark.main()
 text = "\n".join(records.lines)
 evals = [line for line in records.lines if line.startswith("eval at step")]
-assert [line.split()[3] for line in evals] == ["3", "6", "7"], evals
+assert [line.split()[3] for line in evals] == ["3", "6", "9"], evals
 for line in evals:
     loss = float(line.split("'eval/loss': ")[1].split(",")[0])
     # Uniform random tokens: about ln(128), the tiny preset's vocabulary.
     assert abs(loss - np.log(128)) < 0.5, line
 headline = [line for line in records.lines if line.startswith("median step over steps")]
-# Steps 2..7 are timed; 3, 6 and 7 are eval steps: the headline covers the train-only steps 2, 4, 5.
-assert len(headline) == 1 and headline[0].startswith("median step over steps 2-5:"), headline
+# Steps 2..9 are timed; 3, 6 and 9 are eval steps, each timed with the step before it: the headline covers the
+# train-only steps 4 and 7.
+assert len(headline) == 1 and headline[0].startswith("median step over steps 4-7:"), headline
 summary = [line for line in records.lines if line.startswith("eval steps:")]
 assert len(summary) == 1 and "1 measured (steps 6)" in summary[0] and "first (compiling) step 3" in summary[0], summary
 assert "an eval every 3 steps" in summary[0], summary
