@@ -145,6 +145,23 @@ def test_router_stats_after_scan_match_per_layer():
 
 
 @pytest.mark.timeout(600)
+@pytest.mark.parametrize("router_z_loss_coef", [0.0, 0.1], ids=["no_z_loss", "z_loss"])
+def test_router_stats_after_scan_honor_router_diagnostics(router_z_loss_coef):
+    # Without router_diagnostics the after-scan path computes and reduces only what the per-layer path does: the
+    # router z-loss when it is weighted, and no expert counts or probability sums.
+    cfg = dataclasses.replace(BASE, router_diagnostics=False, router_z_loss_coef=router_z_loss_coef)
+    with use_cpu_devices(4):
+        loss, metrics, _, _ = run(cfg)
+        a_loss, a_metrics, _, _ = run(dataclasses.replace(cfg, router_stats_reduction="after_scan"))
+    np.testing.assert_allclose(a_loss, loss, rtol=1e-6)
+    assert a_metrics.keys() == metrics.keys()
+    assert "train/router/routing_counts_per_layer" not in a_metrics
+    assert ("train/router/router_z_loss" in a_metrics) == (router_z_loss_coef != 0)
+    for name in a_metrics.keys() & {"qb_beta_per_layer", "train/router/router_z_loss"}:
+        np.testing.assert_allclose(np.asarray(a_metrics[name]), np.asarray(metrics[name]), rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.timeout(600)
 @pytest.mark.multidevice
 def test_per_node_qb_thresholds_and_bias():
     with use_cpu_devices(4):

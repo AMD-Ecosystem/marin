@@ -142,34 +142,37 @@ def moe_routing_stats_local(
     *,
     batch_axes: tuple[str, ...],
     num_experts: int,
+    stats: RouterStats = "all",
 ) -> dict[str, jax.Array]:
-    """Return shard-local routing metric sufficient statistics.
+    """Return shard-local routing metric sufficient statistics (only the router z-loss's for ``stats="z_loss"``,
+    nothing for ``"none"``).
 
     Call :func:`reduce_moe_routing_stats` after stacking these outputs over
     layers to combine their cross-device reductions into one collective.
     """
+    if stats == "none":
+        return {}
 
     def _local(sel: jax.Array, probs: jax.Array, logits: jax.Array, valid: jax.Array) -> dict[str, jax.Array]:
         valid_f = valid.astype(jnp.float32)
-        counts = _expert_assignment_counts(sel, valid, num_experts)
         log_partition = jsp.special.logsumexp(logits.astype(jnp.float32), axis=-1)
-        return {
-            "routing_counts_local": counts[None, :],
-            "router_prob_sum_local": jnp.sum(probs.astype(jnp.float32) * valid_f[:, None], axis=0)[None, :],
+        out = {
             "router_z_sq_sum_local": jnp.sum(log_partition**2 * valid_f)[None],
             "valid_tokens_local": jnp.sum(valid_f)[None],
         }
+        if stats == "all":
+            out["routing_counts_local"] = _expert_assignment_counts(sel, valid, num_experts)[None, :]
+            out["router_prob_sum_local"] = jnp.sum(probs.astype(jnp.float32) * valid_f[:, None], axis=0)[None, :]
+        return out
 
+    out_specs = {"router_z_sq_sum_local": P(batch_axes), "valid_tokens_local": P(batch_axes)}
+    if stats == "all":
+        out_specs |= {"routing_counts_local": P(batch_axes, None), "router_prob_sum_local": P(batch_axes, None)}
     return shard_map(
         _local,
         mesh=mesh,
         in_specs=(P(batch_axes, None), P(batch_axes, None), P(batch_axes, None), P(batch_axes)),
-        out_specs={
-            "routing_counts_local": P(batch_axes, None),
-            "router_prob_sum_local": P(batch_axes, None),
-            "router_z_sq_sum_local": P(batch_axes),
-            "valid_tokens_local": P(batch_axes),
-        },
+        out_specs=out_specs,
     )(selected_experts, router_probs, router_logits, token_valid)
 
 
@@ -181,26 +184,24 @@ def reduce_moe_routing_stats(
 ) -> dict[str, jax.Array]:
     """Reduce scan-stacked routing metric partials after the layer scan.
 
-    ``qb_beta_local`` and ``qb_beta_weight_local`` are optionally reduced as
-    valid-token-weighted QB thresholds; histogram QB callers instead provide
-    an already-reduced ``qb_beta``.
+    Reduces whichever statistics the layers computed (:data:`RouterStats`). ``qb_beta_local`` and
+    ``qb_beta_weight_local`` are optionally reduced as valid-token-weighted QB thresholds; histogram QB callers
+    instead provide an already-reduced ``qb_beta``.
     """
-    counts = jnp.sum(stacked["routing_counts_local"], axis=1)
-    prob_sum = jnp.sum(stacked["router_prob_sum_local"], axis=1)
-    z_sq_sum = jnp.sum(stacked["router_z_sq_sum_local"], axis=1)
-    valid_tokens = jnp.maximum(jnp.sum(stacked["valid_tokens_local"], axis=1), 1.0)
-    total_assignments = jnp.maximum(jnp.sum(counts, axis=-1, keepdims=True), 1.0)
-    assignment_fraction = counts / total_assignments
-    routing_entropy = -jnp.sum(assignment_fraction * jnp.log(assignment_fraction + 1e-6), axis=-1)
-    load_balancing_loss = num_experts * jnp.sum(
-        assignment_fraction * num_experts_per_token * (prob_sum / valid_tokens[:, None]), axis=-1
-    )
-    out = {
-        "routing_counts": counts,
-        "routing_entropy": routing_entropy,
-        "load_balancing_loss": load_balancing_loss,
-        "router_z_loss": z_sq_sum / valid_tokens,
-    }
+    out = {}
+    if "router_z_sq_sum_local" in stacked:
+        valid_tokens = jnp.maximum(jnp.sum(stacked["valid_tokens_local"], axis=1), 1.0)
+        out["router_z_loss"] = jnp.sum(stacked["router_z_sq_sum_local"], axis=1) / valid_tokens
+    if "routing_counts_local" in stacked:
+        counts = jnp.sum(stacked["routing_counts_local"], axis=1)
+        prob_sum = jnp.sum(stacked["router_prob_sum_local"], axis=1)
+        total_assignments = jnp.maximum(jnp.sum(counts, axis=-1, keepdims=True), 1.0)
+        assignment_fraction = counts / total_assignments
+        out["routing_counts"] = counts
+        out["routing_entropy"] = -jnp.sum(assignment_fraction * jnp.log(assignment_fraction + 1e-6), axis=-1)
+        out["load_balancing_loss"] = num_experts * jnp.sum(
+            assignment_fraction * num_experts_per_token * (prob_sum / valid_tokens[:, None]), axis=-1
+        )
     if "qb_beta_local" in stacked:
         qb_weights = stacked["qb_beta_weight_local"].astype(jnp.float32)
         out["qb_beta"] = jnp.sum(stacked["qb_beta_local"] * qb_weights[:, :, None], axis=1) / jnp.maximum(
@@ -408,6 +409,7 @@ class QBRoutedMoE(eqx.Module):
                     mesh,
                     batch_axes=self.batch_axes,
                     num_experts=router.shape[1],
+                    stats=self.router_stats,
                 )
             else:
                 router_stats = moe_routing_stats(
