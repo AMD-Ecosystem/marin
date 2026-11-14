@@ -18,7 +18,9 @@ Same architecture, parameters and checkpoint layout as ``experiments/june_tpu_67
   and the head-gate logits;
 - the blocks always run in one array-stacked ``lax.scan`` whose checkpoint has ``prevent_cse=False``;
 - the small replicated block weights' gradients are reduced once after the layer scan, and the scan routes the
-  trainer's microbatch reductions and ZeRO-1 gathers (``parallel.LayerRouting``).
+  trainer's microbatch reductions and ZeRO-1 gathers (``parallel.LayerRouting``);
+- fork overlay: the scan can hand the expert weights' gradient sums to the MoE's FlyDSL weight-gradient kernels
+  (``LayerRouting.expert_acc``).
 
 ``Transformer.init`` raises for config values this copy does not implement.
 """
@@ -37,6 +39,7 @@ from jax.sharding import PartitionSpec as P
 from jax.sharding import get_abstract_mesh, reshard
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 from levanter.grug._moe.common import MoeDispatchCounts
+from levanter.grug._moe.grad_accum import ExpertGradAccumulator
 from levanter.grug._moe.routing_top_k import routing_top_k
 from levanter.grug.attention import AttentionMask, align_kv_heads, attention, token_validity_from_attention_mask
 from levanter.grug.grug_moe import (
@@ -371,9 +374,10 @@ class MoEMLP(eqx.Module):
 
     @named_call
     def __call__(
-        self, x: Float[Array, "B S D"], token_valid: Bool[Array, "B S"]
-    ) -> tuple[Float[Array, "B S D"], dict[str, jax.Array]]:
-        """The routed output and this layer's per-shard routing statistics (see ``reduce_moe_routing_stats``)."""
+        self, x: Float[Array, "B S D"], token_valid: Bool[Array, "B S"], grad_acc: ExpertGradAccumulator | None = None
+    ):
+        """The routed output and this layer's per-shard routing statistics (see ``reduce_moe_routing_stats``), and with
+        ``grad_acc`` (the expert gradient sums, ``moe_mlp``) the accumulator as a third output."""
         cfg = self.cfg
         k = cfg.num_experts_per_token
         mesh = get_abstract_mesh()
@@ -413,7 +417,7 @@ class MoEMLP(eqx.Module):
                 num_experts=cfg.num_experts,
             )
         with jax.named_scope("moe_experts"):
-            routed_flat, counts = self.expert_mlp(
+            result = self.expert_mlp(
                 x_flat,
                 selected_experts.astype(jnp.int32),
                 combine_weights,
@@ -421,7 +425,11 @@ class MoEMLP(eqx.Module):
                 mesh=mesh,
                 report_capacity_overflow=True,
                 local_capacity_drops=True,
+                grad_acc=grad_acc,
             )
+            if grad_acc is not None:
+                result, grad_acc = result
+            routed_flat, counts = result
         assert isinstance(counts, MoeDispatchCounts)
         # In float32 the drop counts join the other statistics' float32 all-reduce after the layer scan instead of
         # taking an int32 one of their own. A layer drops at most its b * s * k assignments, so they stay exact.
@@ -430,6 +438,8 @@ class MoEMLP(eqx.Module):
         stats["routing_receiver_drops_local"] = counts.receiver_dropped.astype(drops_dtype)
         stats["skipped_assignments"] = counts.padding_skipped.astype(jnp.float32)
         routed = reshard(rearrange(routed_flat, "(b s) d -> b s d", b=b, s=s), _batch_spec())
+        if grad_acc is not None:
+            return routed, stats, grad_acc
         return routed, stats
 
 
@@ -468,7 +478,9 @@ class Block(eqx.Module):
         long_mask: AttentionMask,
         use_long_mask: Bool[Array, ""],
         position_ids: jax.Array | None,
-    ) -> tuple[Float[Array, "B S D"], dict[str, jax.Array]]:
+        grad_acc: ExpertGradAccumulator | None = None,
+    ):
+        """The block's output and router stats, and with ``grad_acc`` (``MoEMLP``) the accumulator as a third output."""
         cfg = self.attn.cfg
         # x comes back as h, so its cotangent from the residual path joins the norm's backward kernel.
         x, attn_in = fused_norm_and_gate(x, None, self.rms_attn, self.attn_gated_norm, return_h=True)
@@ -481,10 +493,10 @@ class Block(eqx.Module):
         )
         x, mlp_in = fused_norm_and_gate(x, attn_out, self.rms_mlp, self.mlp_gated_norm, return_h=True)
         token_valid = token_validity_from_attention_mask(short_mask, batch_size=x.shape[0], sequence_length=x.shape[1])
-        mlp_out, router_stats = self.mlp(mlp_in, token_valid)
+        mlp_out, router_stats, *acc_out = self.mlp(mlp_in, token_valid, grad_acc)
         if self.shared is not None:
             mlp_out = mlp_out + self.shared(mlp_in, activation=ActivationFunctionEnum.silu)
-        return x + mlp_out, router_stats
+        return x + mlp_out, router_stats, *acc_out
 
 
 class Transformer(eqx.Module):
@@ -562,27 +574,43 @@ class Transformer(eqx.Module):
             prevent_cse=False,
         )
 
+        expert_acc = routing.expert_acc
+        # The expert gradient sums: carried in modes "init"/"accum", read from the closure in mode "final".
+        carried_acc = None
+        if expert_acc is not None:
+            if expert_acc.mode == "final" and routing.grad_offsets is None:
+                raise ValueError('expert_acc mode "final" goes with grad_offsets (the same sums)')
+            if expert_acc.mode != "final":
+                carried_acc = expert_acc.without_layer()
+
         def scan_layer(carry, layer_inputs):
-            hidden, buffers, sums = carry
+            hidden, buffers, sums, acc = carry
             layer, use_long_mask, offsets, sinks, gather_sinks, index = layer_inputs
             if gather_sinks is not None:
                 layer, buffers = apply_gathers(layer, gather_sinks, buffers, index)
+            layer_acc = None if expert_acc is None else (expert_acc if acc is None else acc).at_layer(index)
             args = (hidden, short_mask, long_mask, use_long_mask, position_ids)
+            if layer_acc is not None:
+                args = (*args, layer_acc)
             if sums is None and offsets is None:
-                hidden, stats = checkpoint(layer)(*args)
+                hidden, stats, *acc_out = checkpoint(layer)(*args)
             else:
-                hidden, stats, *rest = checkpoint(call_routed)(layer, sums, offsets, sinks, index, *args)
-                sums = rest[0] if rest else None
-            return (hidden, buffers, sums), stats
+                offsets_added = layer_acc is not None and layer_acc.mode == "final"
+                hidden, stats, *rest = checkpoint(call_routed)(layer, sums, offsets, sinks, offsets_added, index, *args)
+                acc_out = rest[:1] if layer_acc is not None else []
+                sums = rest[-1] if sums is not None else None
+            if acc is not None:
+                acc = acc_out[0].without_layer()
+            return (hidden, buffers, sums, acc), stats
 
         # The layer index locates each layer's rows in the gathers and sums; without them the scan does not carry it.
-        routed = any(x is not None for x in (routing.gather_sinks, routing.grad_sums, routing.grad_offsets))
+        routed = any(x is not None for x in (routing.gather_sinks, routing.grad_sums, routing.grad_offsets, expert_acc))
         layer_indices = jnp.arange(cfg.num_layers, dtype=jnp.int32) if routed else None
         # The small replicated weights' gradients wait for one reduction after the scan.
         stacked = mark_replicated_reduced(self.stacked_blocks.stacked)
-        (hidden, buffers, sums), stacked_stats = jax.lax.scan(
+        (hidden, buffers, sums, carried_acc), stacked_stats = jax.lax.scan(
             scan_layer,
-            (hidden, routing.gather_buffers, routing.grad_sums),
+            (hidden, routing.gather_buffers, routing.grad_sums, carried_acc),
             xs=(
                 stacked,
                 _long_layer_schedule(cfg.num_layers),
@@ -604,6 +632,8 @@ class Transformer(eqx.Module):
         if "router_z_loss" in reduced:
             router_metrics["router_z_loss_per_layer"] = reduced["router_z_loss"]
         hidden = fused_norm_and_gate(hidden, None, self.final_norm, self.final_gated_norm, return_h=False)
+        if carried_acc is not None:
+            routing = routing._replace(expert_acc=carried_acc)
         return hidden, router_metrics, routing._replace(gather_buffers=buffers, grad_sums=sums)
 
     @named_call

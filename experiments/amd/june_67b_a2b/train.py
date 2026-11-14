@@ -13,7 +13,9 @@ reuses June's data, eval, FLOP, checkpoint-restore and dispatch helpers. What di
 - the state carries a compute-dtype copy of the parameters, which the step differentiates; checkpoints leave it out
   and a restore rebuilds it;
 - the loop dispatches step N+1 before it fetches, checks and logs step N (``_train_loop``), and the step computes the
-  loss's finiteness itself, so the host fetches each step's metrics in one transfer.
+  loss's finiteness itself, so the host fetches each step's metrics in one transfer;
+- fork overlay: with the MoE's FlyDSL expert kernels (``RAGGED_DOT_IMPL=flydsl``) on an expert axis of two or more,
+  the expert weights' gradient sums are folded in by the weight-gradient kernel (``_in_kernel_expert_sums``).
 """
 
 from __future__ import annotations
@@ -44,8 +46,10 @@ from levanter.callbacks.watch import WatchConfig, compute_watch_stats
 from levanter.checkpoint import Checkpointer
 from levanter.data.text.datasets import LmDataConfig
 from levanter.eval import cb_tagged_evaluate
+from levanter.grug._moe import flydsl_expert
+from levanter.grug._moe.grad_accum import ExpertGradAccumulator
 from levanter.grug.attention import AttentionMask, token_validity_from_attention_mask
-from levanter.grug.sharding import compact_grug_mesh
+from levanter.grug.sharding import _mesh_axis_size, compact_grug_mesh
 from levanter.optim.config import AdamConfig, OptimizerConfig
 from levanter.schedule import IntSchedule
 from levanter.trainer import TrainerConfig
@@ -414,14 +418,37 @@ def _unreduced_rows(x: jax.Array) -> jax.Array:
     return local_to_unreduced(x, leading=1)
 
 
-def _grads_into_sums(fn, primals: tuple, sums):
-    """Differentiate ``fn(*primals, sums) -> ((loss, sums_out), aux)``, whose layer scan adds each layer's gradients
-    into ``sums`` in its backward (``LayerRouting.grad_sums``): seeding the cotangent of ``sums_out`` with ``sums``
-    starts the backward from them. Returns ``(loss, aux, gradients of primals, new sums)``; the summed weights' own
-    gradients are zero."""
-    (loss, _), vjp_fn, aux = jax.vjp(fn, *primals, sums, has_aux=True)
-    *grads, sums = vjp_fn((jnp.ones_like(loss), sums))
-    return loss, aux, tuple(grads), sums
+def _grads_into_sums(fn, primals: tuple, sums, expert_sums: tuple | None = None, mode: str = "accum"):
+    """Differentiate ``fn(*primals, sums, acc) -> ((loss, (sums_out, acc_out)), aux)``, whose layer scan adds each
+    layer's gradients into ``sums`` in its backward (``LayerRouting.grad_sums``) and, with ``expert_sums``, the expert
+    weights' into those through the MoE kernels (``acc``, an ``ExpertGradAccumulator`` in mode ``mode``; None without
+    them): seeding the cotangents of ``sums_out`` and ``acc_out`` with the sums starts the backward from them. Returns
+    ``(loss, aux, gradients of primals, new sums, new expert sums or None)``; the summed weights' own gradients are
+    zero."""
+    acc = None if expert_sums is None else ExpertGradAccumulator(*expert_sums, mode=mode)
+    (loss, _), vjp_fn, aux = jax.vjp(fn, *primals, sums, acc, has_aux=True)
+    *grads, sums, acc_ct = vjp_fn((jnp.ones_like(loss), (sums, acc)))
+    new_expert = None if acc_ct is None else (acc_ct.w_gate, acc_ct.w_up, acc_ct.w_down)
+    return loss, aux, tuple(grads), sums, new_expert
+
+
+_EXPERT_WEIGHTS = ("w_gate", "w_up", "w_down")
+
+
+def _expert_leaves(tree) -> tuple:
+    expert_mlp = tree.stacked_blocks.stacked.mlp.expert_mlp
+    return tuple(getattr(expert_mlp, name) for name in _EXPERT_WEIGHTS)
+
+
+def _with_expert(tree, values):
+    """``tree`` with its stacked expert weight entries replaced by ``values``."""
+    return eqx.tree_at(_expert_leaves, tree, tuple(values), is_leaf=lambda x: x is None)
+
+
+def _in_kernel_expert_sums() -> bool:
+    """Whether the MoE's weight-gradient kernels fold the expert weights' gradients into their sums: with the FlyDSL
+    expert kernels (``RAGGED_DOT_IMPL=flydsl``) on an expert axis of two or more. Fork overlay."""
+    return flydsl_expert.expert_gemm() is not None and _mesh_axis_size(get_abstract_mesh(), "expert") > 1
 
 
 def _zero_accumulator(marked_param):
@@ -507,7 +534,14 @@ def _microbatched_loss_and_grads(
         return cross_entropy + aux, (cross_entropy, aux, terms.router_metrics)
 
     marked = mark_batch_reduced(params)
-    summed = summed_in_scan(params)
+    # Every stacked block weight's sum is kept as [L, S, ...]; with in-kernel sums the expert weights' go to the MoE's
+    # kernels (LayerRouting.expert_acc) rather than through _grad_into_sum.
+    local = summed_in_scan(params)
+    in_kernel = _in_kernel_expert_sums()
+    summed = _with_expert(local, (False,) * len(_EXPERT_WEIGHTS)) if in_kernel else local
+
+    def expert_sums(tree):
+        return _expert_leaves(tree) if in_kernel else None
 
     def body(carry, xs):
         grad_sum, loss_sum, cross_entropy_sum, aux_sum = carry
@@ -516,23 +550,25 @@ def _microbatched_loss_and_grads(
         # so only one per-microbatch gradient tree is live at a time.
         grad_sum, microbatch, token_share = jax.lax.optimization_barrier((grad_sum, microbatch, token_share))
 
-        def fn(p, sums):
-            terms = loss_terms(p, microbatch, LayerRouting(grad_sums=sums))
+        def fn(p, sums, acc):
+            terms = loss_terms(p, microbatch, LayerRouting(grad_sums=sums, expert_acc=acc))
             loss, aux = weighted(terms, token_share)
-            return (loss, terms.routing.grad_sums), aux
+            return (loss, (terms.routing.grad_sums, terms.routing.expert_acc)), aux
 
-        loss, (cross_entropy, aux, router_metrics), (grads,), sums = _grads_into_sums(
-            fn, (marked,), _block_sums(grad_sum, summed)
+        loss, (cross_entropy, aux, router_metrics), (grads,), sums, experts = _grads_into_sums(
+            fn, (marked,), _block_sums(grad_sum, summed), expert_sums(grad_sum)
         )
-        grad_sum = jax.tree.map(lambda acc, g, s: acc if s else acc + g.astype(jnp.float32), grad_sum, grads, summed)
+        grad_sum = jax.tree.map(lambda acc, g, s: acc if s else acc + g.astype(jnp.float32), grad_sum, grads, local)
         grad_sum = _with_block_sums(grad_sum, sums, summed)
+        if in_kernel:
+            grad_sum = _with_expert(grad_sum, experts)
         carry = (grad_sum, loss_sum + loss, cross_entropy_sum + cross_entropy, aux_sum + aux)
         return carry, router_metrics
 
     zero = jnp.zeros((), jnp.float32)
     init_sums = jax.tree.map(_zero_accumulator, marked)
     init = (
-        _with_block_sums(init_sums, jax.tree.map(_local_rows, _block_sums(init_sums, summed)), summed),
+        _with_block_sums(init_sums, jax.tree.map(_local_rows, _block_sums(init_sums, local)), local),
         zero,
         zero,
         zero,
@@ -558,15 +594,20 @@ def _microbatched_loss_and_grads(
             buffers,
         )
 
-        def first_fn(p, sinks):
-            # The buffers are written, not differentiated: the gathered weights' gradients leave through the sinks.
-            terms = loss_terms(p, first_microbatch, LayerRouting(gather_sinks=sinks, gather_buffers=buffers))
+        def first_fn(p, sinks, sums, acc):
+            # The buffers are written, not differentiated: the gathered weights' gradients leave through the sinks
+            # (with in-kernel sums, the expert weights' go into the sums and the sinks get zeros).
+            del sums
+            routing = LayerRouting(gather_sinks=sinks, gather_buffers=buffers, expert_acc=acc)
+            terms = loss_terms(p, first_microbatch, routing)
             loss, aux = weighted(terms, first_share)
-            return loss, (*aux, terms.routing.gather_buffers)
+            return (loss, (None, terms.routing.expert_acc)), (*aux, terms.routing.gather_buffers)
 
-        (first_loss, (first_cross_entropy, first_aux, first_router_metrics, gathered_blocks)), grads = (
-            jax.value_and_grad(first_fn, argnums=(0, 1), has_aux=True)(first_params, gather_sinks)
+        # The kernels write every layer of the sums ("init"), so their starting value is never read.
+        first_loss, first_aux_out, grads, _, first_experts = _grads_into_sums(
+            first_fn, (first_params, gather_sinks), None, expert_sums(init[0]), "init"
         )
+        first_cross_entropy, first_aux, first_router_metrics, gathered_blocks = first_aux_out
         first_grads, sink_grads = grads
         stacked_grads = jax.tree.map(
             lambda g, sink_grad: g if sink_grad is None else sink_grad,
@@ -587,7 +628,9 @@ def _microbatched_loss_and_grads(
         # output projection's right after the cross-entropy), they would be live through the layer backward.
         first_grads = jax.lax.optimization_barrier(first_grads)
         sums = jax.tree.map(lambda g: g.astype(jnp.float32), first_grads)
-        sums = _with_block_sums(sums, jax.tree.map(_local_rows, _block_sums(sums, summed)), summed)
+        sums = _with_block_sums(sums, jax.tree.map(_local_rows, _block_sums(sums, local)), local)
+        if in_kernel:
+            sums = _with_expert(sums, first_experts)
         init = (sums, first_loss, first_cross_entropy, first_aux)
     if jax.tree.leaves(head)[0].shape[0] > 0:
         (grad_sum, loss, cross_entropy_loss, aux_loss), stacked_router_metrics = jax.lax.scan(body, init, head)
@@ -610,6 +653,13 @@ def _microbatched_loss_and_grads(
     offsets = jax.tree.map(
         lambda acc, pl: acc if pl else None, grad_sum.stacked_blocks.stacked, per_layer.stacked_blocks.stacked
     )
+    last_acc = None
+    if in_kernel:
+        stacked_per_layer = jax.tree.leaves(per_layer.stacked_blocks.stacked)
+        if not all(_expert_leaves(per_layer)) or sum(stacked_per_layer) != len(_EXPERT_WEIGHTS):
+            raise ValueError("in-kernel expert gradient sums need exactly the expert weights reduced per layer")
+        # The kernels read the sums, which the offsets hold too, and add them themselves ("final").
+        last_acc = ExpertGradAccumulator(*_expert_leaves(grad_sum), mode="final")
 
     def sink(p, target, pl):
         # A zero in the gradient's sharding, for an expert weight whose gradient shards more than the weight.
@@ -622,14 +672,14 @@ def _microbatched_loss_and_grads(
     # The other summed weights carry their sums through the last microbatch's scan, which adds its gradients.
     last_summed = jax.tree.map(lambda s, pl: s and not pl, summed, per_layer)
 
-    def last_fn(p, block_sinks, sums):
-        terms = loss_terms(
-            p, last_microbatch, LayerRouting(grad_offsets=offsets, grad_sinks=block_sinks, grad_sums=sums)
-        )
+    def last_fn(p, block_sinks, sums, acc):
+        del acc  # The "final" sums are only read, from the closure.
+        routing = LayerRouting(grad_offsets=offsets, grad_sinks=block_sinks, grad_sums=sums, expert_acc=last_acc)
+        terms = loss_terms(p, last_microbatch, routing)
         loss, aux = weighted(terms, last_share)
-        return (loss, terms.routing.grad_sums), aux
+        return (loss, (terms.routing.grad_sums, None)), aux
 
-    last_loss, (last_cross_entropy, last_aux, last_router_metrics), (last_grads, sink_grads), last_sums = (
+    last_loss, (last_cross_entropy, last_aux, last_router_metrics), (last_grads, sink_grads), last_sums, _ = (
         _grads_into_sums(last_fn, (last_params, sinks), _block_sums(grad_sum, last_summed))
     )
     # The sinks' gradients are the reduce-scattered expert gradients; the weights' own are zero.
