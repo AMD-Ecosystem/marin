@@ -35,6 +35,7 @@ GrugAttentionImplementation = Literal[
     "torch_order",  # Torch eager's order: FP32 scores and softmax, normalized weights cast to BF16; materializes S x S.
     "gpu_pallas_triton_flash",  # Pallas-Triton flash kernel with block skipping; for AMD (ROCm) GPUs.
     "gpu_triton_flash",  # Triton flash kernel with block skipping, through jax_triton; for AMD (ROCm) GPUs.
+    "gpu_aiter_flash",  # ROCm jax-aiter flash_attn_func (asm v3 / CK); needs jax_aiter. Fork overlay until #10859.
 ]
 
 ContextAttentionLayout = Literal["zigzag", "contiguous"]
@@ -573,6 +574,10 @@ def attention(
         if not isinstance(mask, AttentionMask):
             raise NotImplementedError("gpu_triton_flash needs an AttentionMask, not a dense mask or None.")
         return triton_flash_attention(q, k, v, mask)
+    if implementation == "gpu_aiter_flash":
+        from levanter.grug.attention._aiter_flash import aiter_flash_attention  # noqa: PLC0415
+
+        return aiter_flash_attention(q, k, v, mask)
     if implementation == "tpu_splash":
         if isinstance(mask, jax.Array):
             raise NotImplementedError("Dense masks are not supported for splash attention.")
