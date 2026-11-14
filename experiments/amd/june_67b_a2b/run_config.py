@@ -24,6 +24,7 @@ from levanter.callbacks.profiler import ProfileOptionsConfig, ProfilerConfig, Xp
 from levanter.callbacks.watch import WatchConfig
 from levanter.checkpoint import CheckpointerConfig
 from levanter.distributed import DistributedConfig
+from levanter.grug._moe import flydsl_expert
 from levanter.grug.attention import GrugAttentionImplementation
 from levanter.tracker import TrackerConfig
 from levanter.trainer import TrainerConfig
@@ -211,8 +212,9 @@ def log_run_config(
     logger.info(
         "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d microbatches=%d zero1=%s "
         "seq_len=%d window=%d mp=%s "
-        "expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s watch_interval=%d "
-        "flops_per_example=%.4e",
+        "expert_axis=%d replica_axis=%d attention=%s moe=%s expert_kernels=%s expert_grad_sums=%s "
+        "capacity=%s pooled_capacity=%s "
+        "watch_interval=%d flops_per_example=%.4e",
         args.size,
         model.num_layers,
         model.hidden_dim,
@@ -230,6 +232,14 @@ def log_run_config(
         args.replica_axis,
         model.attention_implementation,
         model.moe_implementation,
+        # Fork overlay: "flydsl" with RAGGED_DOT_IMPL=flydsl (gathered A rows, scatter epilogues, in-kernel sums).
+        flydsl_expert.expert_gemm() or "ring_filtered",
+        # in_kernel when train._in_kernel_expert_sums() holds on a microbatched step; in_scan otherwise.
+        (
+            "in_kernel"
+            if flydsl_expert.expert_gemm() is not None and args.expert_axis > 1 and args.microbatches > 1
+            else "in_scan"
+        ),
         model.capacity_factor,
         model.pooled_transport_capacity_factor,
         args.watch_interval,
