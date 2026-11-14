@@ -16,11 +16,15 @@ Every hidden-width data movement is a gather whose transpose is another gather, 
 forward nor the backward uses a hidden-width scatter-add. The routing-weight gradient comes from
 the down projection's backward (``_down_project_combine``), so the backward never needs the expert
 outputs: remat neither saves them nor recomputes the down projection.
+
+Fork overlay: when ``ragged_dot`` runs jax-flydsl (``RAGGED_DOT_IMPL=flydsl``) the expert side runs the FlyDSL kernels
+of ``flydsl_expert`` instead (gathered A rows, scatter epilogues, and expert weight gradients summed in the kernel
+with an ``ExpertGradAccumulator``), with the same values and gradients.
 """
 
 import math
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import Any, NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -35,6 +39,7 @@ from levanter.grug._moe.common import (
     _scaled_capacity,
     CapacityDrops,
 )
+from levanter.grug._moe import flydsl_expert
 from levanter.grug._moe.ep_common import _assignment_sources, _combine_gather_sum_impl
 from levanter.grug._moe.ep_ring import (
     XLA_ROW_GATHERS,
@@ -44,6 +49,7 @@ from levanter.grug._moe.ep_ring import (
     _select_local_assignments,
     _take_valid_rows,
 )
+from levanter.grug._moe.grad_accum import ExpertGradAccumulator, from_local_view, local_view
 from levanter.grug._moe.pallas_gather_sum import gather_sum_rows, gather_valid_rows, pallas_gather_supported
 from levanter.grug._moe.pallas_routing_metadata import (
     ExpertRows,
@@ -257,7 +263,11 @@ def _moe_mlp_ep_ring_filtered_local(
     transport_capacity_factor: float,
     token_sharding_axes: tuple[str, ...],
     reduce_drops: bool = True,
-) -> tuple[Float[Array, "Tlocal H"], CapacityDrops]:
+    grad_acc: ExpertGradAccumulator | None = None,
+) -> (
+    tuple[Float[Array, "Tlocal H"], CapacityDrops]
+    | tuple[Float[Array, "Tlocal H"], CapacityDrops, ExpertGradAccumulator]
+):
     """Filtered all-to-all dispatch, ring's grouped expert MLP, expert-side combine.
 
     ``transport_capacity_factor`` limits each (sender, destination) pair to a multiple of the
@@ -270,6 +280,9 @@ def _moe_mlp_ep_ring_filtered_local(
     can drop on another. ``capacity_factor`` keeps ring's meaning: each expert shard
     runs at most ``capacity_factor * Tlocal * K`` assignments, allocated in local-expert order
     (receiver drops).
+
+    With ``grad_acc`` (this shard's block of an ``ExpertGradAccumulator``, layer set) the expert matmuls fold their
+    weight gradients into it and it comes back as a third output; it needs the FlyDSL expert kernels.
     """
     tokens, topk = selected_experts_local.shape
     hidden_dim = x_local.shape[1]
@@ -281,6 +294,9 @@ def _moe_mlp_ep_ring_filtered_local(
     ep_size = num_experts // local_experts
     sender_gathers, expert_gathers = _row_gathers(hidden_dim)
     routing = _routing_maps(destinations=ep_size, local_experts=local_experts)
+    gemm = flydsl_expert.expert_gemm()
+    if grad_acc is not None and gemm is None:
+        raise ValueError("grad_acc needs the FlyDSL expert kernels (RAGGED_DOT_IMPL=flydsl)")
 
     hit_fraction = destination_hit_fraction(num_experts=num_experts, local_experts=local_experts, topk=topk)
     pair_capacity = min(tokens, max(1, math.ceil(transport_capacity_factor * hit_fraction * tokens)))
@@ -359,18 +375,62 @@ def _moe_mlp_ep_ring_filtered_local(
         dispatch_valid = jnp.arange(expert_capacity, dtype=jnp.int32) < jnp.sum(group_sizes, dtype=jnp.int32)
         dispatch_row = jnp.where(dispatch_valid, picked // topk, send_rows)
 
-        x_dispatch = _dispatch_rows(
-            received_x, jnp.minimum(dispatch_row, send_rows - 1), dispatch_valid, position, expert_gathers
-        )
-        x_dispatch = tree_checkpoint_name(x_dispatch, _CHECKPOINT_DISPATCH_INPUT)
+        if gemm is None:
+            x_dispatch = _dispatch_rows(
+                received_x, jnp.minimum(dispatch_row, send_rows - 1), dispatch_valid, position, expert_gathers
+            )
+            x_dispatch = tree_checkpoint_name(x_dispatch, _CHECKPOINT_DISPATCH_INPUT)
+        else:
+            dst_row, write = tree_checkpoint_name(
+                flydsl_expert.scatter_plan(position, picked, dispatch_valid), _CHECKPOINT_ROUTING
+            )
+            # The up projection reads the received rows through dispatch_row (the sentinel send_rows reads zeros), so
+            # they, not an expert-ordered copy, are the saved dispatch input.
+            received_x = tree_checkpoint_name(received_x, _CHECKPOINT_DISPATCH_INPUT)
 
     with jax.named_scope("moe_up_down"):
-        w13_out = tree_checkpoint_name(ragged_dot(x_dispatch, moe_w13_local, group_sizes), _CHECKPOINT_EXPERT_HIDDEN)
         moe_dim = moe_w2_local.shape[1]
+        if gemm is None:
+            w13_out = ragged_dot(x_dispatch, moe_w13_local, group_sizes)
+        else:
+            w13_out, grad_acc = _acc_result(
+                flydsl_expert.dispatch_up(
+                    received_x,
+                    dispatch_row,
+                    moe_w13_local,
+                    group_sizes,
+                    position,
+                    dst_row,
+                    write,
+                    gemm,
+                    **_acc_args(grad_acc, "w13"),
+                ),
+                grad_acc,
+                "w13",
+            )
+        w13_out = tree_checkpoint_name(w13_out, _CHECKPOINT_EXPERT_HIDDEN)
         gate, up = jnp.split(w13_out, [moe_dim], axis=-1)
-        expert_combined = _down_project_combine(
-            activation_fn(gate) * up, moe_w2_local, group_sizes, received_weights, position, picked
-        )
+        if gemm is None:
+            expert_combined = _down_project_combine(
+                activation_fn(gate) * up, moe_w2_local, group_sizes, received_weights, position, picked
+            )
+        else:
+            expert_combined, grad_acc = _acc_result(
+                flydsl_expert.down_project_combine(
+                    activation_fn(gate) * up,
+                    moe_w2_local,
+                    group_sizes,
+                    received_weights,
+                    position,
+                    picked,
+                    dst_row,
+                    write,
+                    gemm,
+                    **_acc_args(grad_acc, "w2"),
+                ),
+                grad_acc,
+                "w2",
+            )
 
     with jax.named_scope("combine"):
         returned = jax.lax.all_to_all(
@@ -384,4 +444,37 @@ def _moe_mlp_ep_ring_filtered_local(
         drops = jnp.stack([sender_dropped, receiver_dropped])
         # Summed over the token shards here, or returned as this shard's [1] counts for the caller to sum.
         drops = jax.lax.psum(drops, token_sharding_axes) if reduce_drops else drops[:, None]
-    return out_local, CapacityDrops(sender_dropped=drops[0], receiver_dropped=drops[1])
+    counts = CapacityDrops(sender_dropped=drops[0], receiver_dropped=drops[1])
+    if grad_acc is None:
+        return out_local, counts
+    return out_local, counts, grad_acc
+
+
+def _acc_args(grad_acc: ExpertGradAccumulator | None, which: str) -> dict[str, Any]:
+    """The ``acc``/``layer``/``mode`` keywords of the up (``which="w13"``, w_gate | w_up as two column halves) or down
+    (``"w2"``) projection that folds its weight gradient into this shard's block of ``grad_acc``."""
+    if grad_acc is None:
+        return {}
+    if which == "w13":
+        acc: Any = (local_view(grad_acc.w_gate), local_view(grad_acc.w_up))
+    else:
+        acc = local_view(grad_acc.w_down)
+    return {"acc": acc, "layer": grad_acc.layer, "mode": grad_acc.mode}
+
+
+def _acc_result(
+    result: Any, grad_acc: ExpertGradAccumulator | None, which: str
+) -> tuple[jax.Array, ExpertGradAccumulator | None]:
+    """``(output, grad_acc)`` from what a projection called with ``_acc_args(grad_acc, which)`` returned: the output,
+    or with modes "init"/"accum" the output and the updated accumulator block."""
+    if grad_acc is None or grad_acc.mode == "final":
+        return cast(jax.Array, result), grad_acc
+    out, acc = cast(tuple[jax.Array, Any], result)
+    if which == "w13":
+        w_gate, w_up = acc
+        return out, ExpertGradAccumulator(
+            from_local_view(w_gate), from_local_view(w_up), grad_acc.w_down, grad_acc.layer, grad_acc.mode
+        )
+    return out, ExpertGradAccumulator(
+        grad_acc.w_gate, grad_acc.w_up, from_local_view(acc), grad_acc.layer, grad_acc.mode
+    )
