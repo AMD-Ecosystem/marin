@@ -9,6 +9,10 @@ tokens, so the loss cannot fall below ln(vocab_size). No checkpoint is written. 
 front and ends with the median step time from step 2 on, tokens/s, model TFLOP/s and MFU, the median wall step
 (the time between consecutive steps' hooks, host work included), then each device's peak memory.
 
+Fork overlay: with ``--eval-every N`` every N-th step from step 0 (and the last) also runs a forward-only held-out loss
+inside the train step on ``--eval-microbatches`` microbatches of separate random sequences (seed 1), so its loss is
+about ln(vocab_size). The headline then covers the train-only steps, and a further line gives the eval steps' cost.
+
 Example, two 8-GPU MI355X nodes, expert parallelism within each node and data parallelism across them::
 
     srun -N2 --ntasks-per-node=1 python experiments/amd/june_67b_a2b/synthetic_benchmark.py \\
@@ -38,14 +42,20 @@ from experiments.amd.june_67b_a2b.run_config import (
     build_grug_trainer,
     build_model,
     build_trainer,
+    eval_config,
     global_batch_size,
     initialize_distributed,
     log_run_config,
     shared_run_id,
+    step_eval_sequences,
 )
 from experiments.amd.june_67b_a2b.train import GrugRunConfig, _run_grug_local
 from experiments.june_tpu_67b_a2b.moe.synthetic_benchmark import log_model_flops, report_memory, synthetic_examples
 from experiments.june_tpu_67b_a2b.moe.train import _compute_flops
+
+# The training examples' seed and the held-out ones': no held-out sequence is a training sequence.
+TRAIN_SEED = 0
+EVAL_SEED = 1
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -75,9 +85,15 @@ def build_run_config(args: argparse.Namespace) -> GrugRunConfig:
         checkpointer=CheckpointerConfig(base_path=str(args.log_dir / run_id / "checkpoints")),
     )
     # One fresh example per sequence, and a mixture block exactly as long as the dataset so nothing repeats.
-    examples = synthetic_examples(args.steps * batch_size, model.max_seq_len, model.vocab_size)
+    examples = synthetic_examples(args.steps * batch_size, model.max_seq_len, model.vocab_size, TRAIN_SEED)
+    datasets = {"train": ListAsyncDataset(examples)}
+    held_out = step_eval_sequences(args, batch_size)
+    if held_out:
+        datasets["validation"] = ListAsyncDataset(
+            synthetic_examples(held_out, model.max_seq_len, model.vocab_size, EVAL_SEED)
+        )
     data = LmDataConfig(
-        components={"synthetic": DirectDatasetComponent(datasets={"train": ListAsyncDataset(examples)})},
+        components={"synthetic": DirectDatasetComponent(datasets=datasets)},
         tokenizer="passthrough",
         vocab_size=model.vocab_size,
         mixture_block_size=len(examples),
@@ -88,7 +104,8 @@ def build_run_config(args: argparse.Namespace) -> GrugRunConfig:
         resources=ResourceConfig(),
         optimizer=AdamConfig(learning_rate=args.learning_rate, warmup=0.0),
         trainer=build_grug_trainer(args, trainer, save_checkpoints=False),
-        eval=None,
+        # Random tokens have no bytes to count, so no bits per byte.
+        eval=eval_config(args, batch_size, compute_bpb=False),
     )
 
 
@@ -103,7 +120,7 @@ def main() -> None:
     flops_per_example, flops_summary = _compute_flops(model_config=model)
     log_run_config(args, model, trainer, batch_size, flops_per_example)
     log_model_flops(flops_per_example, flops_summary)
-    step_times = StepTimes()
+    step_times = StepTimes(config.eval, trainer.num_train_steps)
     _run_grug_local(config, step_hooks=[step_times])
     step_times.log_summary(batch_size, model.max_seq_len, flops_per_example)
     report_memory()
