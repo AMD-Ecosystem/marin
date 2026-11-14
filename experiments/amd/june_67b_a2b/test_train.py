@@ -18,6 +18,7 @@ import pytest
 from jax.sharding import PartitionSpec as P
 from levanter.callbacks.state_adapter import StateCallbackRunner
 from levanter.checkpoint import Checkpointer, CheckpointInterval, load_checkpoint, save_checkpoint
+from levanter.grug._moe import flydsl_expert
 from levanter.grug.attention import AttentionMask
 from levanter.grug.grug_moe import MOE_DROPPED_ASSIGNMENTS_METRIC, MOE_SKIPPED_PADDING_ASSIGNMENTS_METRIC
 from levanter.grug.sharding import compact_grug_mesh
@@ -475,3 +476,30 @@ def test_zero1_matches_microbatching_and_crosses_the_replicas_once(accumulation_
     assert float(metrics["train/loss"]) == zero1.losses[1]
     for a, b in zip(jax.tree.leaves(resumed.params), jax.tree.leaves(zero1.states[1].params), strict=True):
         np.testing.assert_array_equal(np.asarray(a), b)
+
+
+@pytest.mark.parametrize("zero1", [False, True])
+def test_in_kernel_expert_gradient_sums_match_the_scan_sums(accumulation_runs, monkeypatch, zero1):
+    """Fork overlay: with the FlyDSL expert kernels (their XLA reference form on CPU) the expert weights' gradient
+    sums are written ("init", the ZeRO-1 first microbatch), added ("accum") and read with the per-layer reduction
+    ("final", the last microbatch) by the MoE's weight-gradient kernels instead of the layer scan, with the same
+    arithmetic: two steps match bit for bit."""
+    (baseline,) = accumulation_runs((2, zero1, MIXED_POLICY))
+    monkeypatch.setattr(flydsl_expert, "expert_gemm", lambda: "reference")
+    with jax.set_mesh(_accumulation_mesh()):
+        state = jax.jit(
+            lambda k: train.initial_state(
+                ACCUMULATION_CONFIG, optimizer=OPTIMIZER, mp=MIXED_POLICY, key=k, ema_beta=None, zero1=zero1
+            )
+        )(jax.random.key(0))
+        train_step = train._make_train_step(
+            OPTIMIZER, MIXED_POLICY, z_loss_weight=1e-3, ema_beta=None, microbatches=2, zero1=zero1
+        )
+        assert train._in_kernel_expert_sums()
+        losses = []
+        for want in baseline.states:
+            state, metrics, _ = train_step(state, PADDED_BATCH)
+            losses.append(float(metrics["train/loss"]))
+            for a, b in zip(jax.tree.leaves(state.params), jax.tree.leaves(want.params), strict=True):
+                np.testing.assert_array_equal(np.asarray(a), b)
+    assert losses == baseline.losses

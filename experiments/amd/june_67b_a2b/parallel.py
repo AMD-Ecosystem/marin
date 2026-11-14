@@ -14,7 +14,9 @@ layer scan:
 - ``LayerRouting``, read by ``Transformer``'s layer scan: per-layer reductions with the earlier microbatches' sums
   added (``grad_offsets``), reduce-scatters into the ZeRO-1 shard (``grad_sinks``), all-gathers of the ZeRO-1 shard
   into the compute copy (``gather_sinks``, ``gather_buffers``) and gradient sums added in the backward of the scan
-  (``grad_sums``).
+  (``grad_sums``);
+- fork overlay: ``LayerRouting.expert_acc`` hands the expert weights' gradient sums to the MoE, whose FlyDSL
+  weight-gradient kernels fold each layer's gradient into them (``levanter.grug._moe.grad_accum``).
 """
 
 import functools
@@ -26,6 +28,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jax.sharding import get_abstract_mesh, reshard
+from levanter.grug._moe.grad_accum import ExpertGradAccumulator
 from levanter.grug.sharding import _mesh_axis_size
 
 from experiments.june_tpu_67b_a2b.moe.model import _BATCH_AXES
@@ -50,6 +53,12 @@ class LayerRouting(NamedTuple):
     writes it into the buffer, a full-size stack the scan carries and returns. ``grad_sums``: float32 sums like
     ``grad_offsets`` that the scan carries and whose backward adds each layer's gradient in place
     (``_grad_into_sum``); differentiate with ``jax.vjp``, seeding the returned sums' cotangent with the sums.
+
+    ``expert_acc`` (fork overlay): the float32 sums of the stacked expert weights' gradients, in ``grad_sums``'s
+    layout, for the MoE's weight-gradient kernels. In modes "init" and "accum" the scan carries and returns them, each
+    layer setting or adding its gradients; differentiate as for ``grad_sums``, and leave the expert weights out of
+    ``grad_sums``. In mode "final" every layer reads them and its expert weights' cotangents arrive with the sums
+    added, so ``grad_offsets`` (holding the same sums) only reduces them.
     """
 
     grad_offsets: Any = None
@@ -57,6 +66,7 @@ class LayerRouting(NamedTuple):
     gather_sinks: Any = None
     gather_buffers: Any = None
     grad_sums: Any = None
+    expert_acc: ExpertGradAccumulator | None = None
 
 
 def _axis_names(entry) -> tuple[str, ...]:
@@ -237,64 +247,73 @@ def unreduced_to_local(x: jax.Array, *, leading: int = 0) -> jax.Array:
     )(x)
 
 
-def _offset_total(offset: jax.Array, cotangent: jax.Array) -> jax.Array:
+def _offset_total(offset: jax.Array | None, cotangent: jax.Array) -> jax.Array:
+    if offset is None:
+        return cotangent
     return (local_to_unreduced(offset) + cotangent.astype(jnp.float32)).astype(cotangent.dtype)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(2, 3))
-def _reduce_with_offset(weight: jax.Array, offset: jax.Array, reduced_spec: P, weight_spec: P) -> jax.Array:
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4))
+def _reduce_with_offset(
+    weight: jax.Array, offset: jax.Array, reduced_spec: P, weight_spec: P, offset_added: bool
+) -> jax.Array:
     """``weight`` (one layer's slice, sharded as ``weight_spec``) marked ``reduced`` as ``reduced_spec``; in the
     backward its gradient plus ``offset`` is reduced across devices into ``weight_spec``, inside the backward of the
     layer scan.
 
     ``offset`` is the float32 sum of the earlier microbatches' unreduced gradients for this layer. The backward adds
     the layer's unreduced gradient to it in float32, casts the total to the gradient's dtype and reshards it to
-    ``weight_spec``: an all-reduce over the reduced axes. ``offset`` gets no gradient."""
-    del offset, weight_spec
+    ``weight_spec``: an all-reduce over the reduced axes. ``offset`` gets no gradient. With ``offset_added`` the
+    gradient already holds the offset (the expert weight-gradient kernel added it, ``ExpertGradAccumulator`` mode
+    "final"), so the backward only reduces it."""
+    del offset, weight_spec, offset_added
     return reshard(weight, reduced_spec)
 
 
-def _reduce_with_offset_fwd(weight, offset, reduced_spec, weight_spec):
+def _reduce_with_offset_fwd(weight, offset, reduced_spec, weight_spec, offset_added):
     del weight_spec
-    return reshard(weight, reduced_spec), offset
+    return reshard(weight, reduced_spec), None if offset_added else offset
 
 
-def _reduce_with_offset_bwd(reduced_spec, weight_spec, offset, cotangent):
-    del reduced_spec
+def _reduce_with_offset_bwd(reduced_spec, weight_spec, offset_added, offset, cotangent):
+    del reduced_spec, offset_added
     return reshard(_offset_total(offset, cotangent), weight_spec), None
 
 
 _reduce_with_offset.defvjp(_reduce_with_offset_fwd, _reduce_with_offset_bwd)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4))
-def _reduce_into_sink(weight: jax.Array, offset: jax.Array, sink: jax.Array, reduced_spec: P, sink_spec: P):
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5))
+def _reduce_into_sink(
+    weight: jax.Array, offset: jax.Array, sink: jax.Array, reduced_spec: P, sink_spec: P, offset_added: bool
+):
     """``_reduce_with_offset`` with the reduced gradient sharded as ``sink_spec``, which shards more than the weight
     does (ZeRO-1: the expert dimension over the replicas as well), so the reduction is a reduce-scatter.
 
     A custom VJP's backward must return a cotangent of its input's type, so the gradient cannot leave as the weight's:
     it leaves as that of ``sink``, a zero input sharded as ``sink_spec`` that the forward ignores; the weight's
     cotangent is zero. The caller differentiates with respect to the sinks."""
-    del offset, sink, sink_spec
+    del offset, sink, sink_spec, offset_added
     return reshard(weight, reduced_spec)
 
 
-def _reduce_into_sink_fwd(weight, offset, sink, reduced_spec, sink_spec):
+def _reduce_into_sink_fwd(weight, offset, sink, reduced_spec, sink_spec, offset_added):
     del sink, sink_spec
-    return reshard(weight, reduced_spec), offset
+    return reshard(weight, reduced_spec), None if offset_added else offset
 
 
-def _reduce_into_sink_bwd(reduced_spec, sink_spec, offset, cotangent):
-    del reduced_spec
+def _reduce_into_sink_bwd(reduced_spec, sink_spec, offset_added, offset, cotangent):
+    del reduced_spec, offset_added
     return None, None, reshard(_offset_total(offset, cotangent), sink_spec)
 
 
 _reduce_into_sink.defvjp(_reduce_into_sink_fwd, _reduce_into_sink_bwd)
 
 
-def _apply_grad_offsets(layer, offsets, sinks):
+def _apply_grad_offsets(layer, offsets, sinks, offsets_added: bool):
     """Route the layer weights that have an offset in ``offsets`` (None elsewhere) through ``_reduce_with_offset``, or
-    through ``_reduce_into_sink`` where ``sinks`` has a sink for them."""
+    through ``_reduce_into_sink`` where ``sinks`` has a sink for them. ``offsets_added``: their gradients arrive with
+    the offsets already added (``ExpertGradAccumulator`` mode "final")."""
 
     def apply(offset, weight, sink=None):
         if offset is None:
@@ -304,8 +323,8 @@ def _apply_grad_offsets(layer, offsets, sinks):
         offset_spec = jax.typeof(offset).sharding.spec
         reduced_spec = P(*offset_spec.partitions[1:], reduced=frozenset(_axis_names(offset_spec.partitions[0])))
         if sink is None:
-            return _reduce_with_offset(weight, offset, reduced_spec, jax.typeof(weight).sharding.spec)
-        return _reduce_into_sink(weight, offset, sink, reduced_spec, jax.typeof(sink).sharding.spec)
+            return _reduce_with_offset(weight, offset, reduced_spec, jax.typeof(weight).sharding.spec, offsets_added)
+        return _reduce_into_sink(weight, offset, sink, reduced_spec, jax.typeof(sink).sharding.spec, offsets_added)
 
     if sinks is None:
         return jax.tree.map(apply, offsets, layer, is_leaf=lambda x: x is None)
@@ -403,13 +422,14 @@ def _sum_block_grads(layer, sums, index: jax.Array):
     return layer_out, sums_out
 
 
-def call_routed(layer, sums, offsets, sinks, index: jax.Array, *args):
+def call_routed(layer, sums, offsets, sinks, offsets_added: bool, index: jax.Array, *args):
     """``layer(*args)`` with its weights in ``sums`` routed through ``_grad_into_sum`` (then the sums appended to the
-    outputs) and those in ``offsets`` through ``_reduce_with_offset`` or ``_reduce_into_sink``. Called inside the
-    layer's checkpoint, so the checkpoint's inputs are the layer's own slices, which the backward reads in place."""
+    outputs) and those in ``offsets`` through ``_reduce_with_offset`` or ``_reduce_into_sink`` (``offsets_added``:
+    see ``_apply_grad_offsets``). Called inside the layer's checkpoint, so the checkpoint's inputs are the layer's own
+    slices, which the backward reads in place."""
     if sums is not None:
         layer, sums = _sum_block_grads(layer, sums, index)
     if offsets is not None:
-        layer = _apply_grad_offsets(layer, offsets, sinks)
+        layer = _apply_grad_offsets(layer, offsets, sinks, offsets_added)
     outputs = layer(*args)
     return outputs if sums is None else (*outputs, sums)
