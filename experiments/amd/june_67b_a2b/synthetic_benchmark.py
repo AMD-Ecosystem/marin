@@ -14,6 +14,10 @@ Example, two 8-GPU MI355X nodes, expert parallelism within each node and data pa
     srun -N2 --ntasks-per-node=1 python experiments/amd/june_67b_a2b/synthetic_benchmark.py \\
         --size full --steps 30 --gpus-per-node 8 --expert-axis 8 --replica-axis 2 --batch-size 512 \\
         --microbatches 4 --zero1 --attention gpu_pallas_triton_flash --watch-interval 0
+
+On the AMD fork (amd/snowball-mi355x), the "best7" configuration is the same command with
+``--attention gpu_aiter_flash`` (jax-aiter) and ``RAGGED_DOT_IMPL=flydsl FLYDSL_GPU_ARCH=gfx950`` in the
+environment (jax-flydsl), which also turns on the MoE's FlyDSL expert kernels; see the README.
 """
 
 import argparse

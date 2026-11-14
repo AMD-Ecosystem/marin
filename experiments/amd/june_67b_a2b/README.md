@@ -56,6 +56,28 @@ bytes) and room for the latency-hiding scheduler
 (`--xla_gpu_memory_limit_slop_factor=200`); without them the per-layer
 collectives run one after another and hide little.
 
+### Fork overlay: best7
+
+On the AMD fork (`amd/snowball-mi355x`, rebuilt as upstream main plus the open
+PRs plus an overlay) the selected MI355X configuration, "best7", is the
+command above with jax-aiter attention and jax-flydsl's grouped GEMMs:
+
+```bash
+RAGGED_DOT_IMPL=flydsl FLYDSL_GPU_ARCH=gfx950 JA_MHA_BWD_ATOMIC_FP32=1 \
+    python experiments/amd/june_67b_a2b/synthetic_benchmark.py --size full --steps 30 --gpus-per-node 8 \
+    --expert-axis 8 --replica-axis 2 --batch-size 512 --microbatches 4 --zero1 \
+    --attention gpu_aiter_flash --watch-interval 0
+```
+
+`RAGGED_DOT_IMPL=flydsl` also switches `ring_filtered`'s expert side to the
+FlyDSL kernels (`levanter.grug._moe.flydsl_expert`: gathered A rows, scatter
+epilogues for the combine and the dispatch backward) and, with two or more
+microbatches, folds the expert weights' gradient sums into the weight-gradient
+kernel; the run log's `expert_kernels=flydsl expert_grad_sums=in_kernel`
+confirms it. The environment and
+XLA flags behind our numbers are those of the spurix studies
+(`radvultr-june-best7-2n`).
+
 `--size tiny` runs on CPU in a few seconds:
 
 ```bash
