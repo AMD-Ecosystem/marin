@@ -1240,7 +1240,13 @@ def _run_grug_local(config: GrugRunConfig, *, step_hooks: Sequence[Callable[[cal
         profiler_enabled = profiler_cfg.is_enabled and profiler_num_steps > 0
 
         log_every = max(1, config.trainer.log_every)
-        iterator = LoadingTimeTrackerIterator(train_loader.iter_from_step(int(state.step)))
+        start_step = int(state.step)
+        logger.info(
+            "data: starting at step %d, sequence %d of the train mixture",
+            start_step,
+            batch_schedule.global_data_offset_by_step(start_step),
+        )
+        iterator = LoadingTimeTrackerIterator(train_loader.iter_from_step(start_step))
 
         state_callbacks = StateCallbackRunner[GrugTrainState | _HostStepState](
             step_getter=lambda s: s.step,
