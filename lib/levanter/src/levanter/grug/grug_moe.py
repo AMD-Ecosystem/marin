@@ -16,7 +16,7 @@ Implementation overview:
 
 from collections.abc import Callable
 from functools import partial
-from typing import cast
+from typing import Any, cast
 
 import equinox as eqx
 import jax
@@ -59,6 +59,7 @@ from levanter.grug._moe.ep_ring import (
     _scatter_add_dispatch_combine,
 )
 from levanter.grug._moe.ep_ring_filtered import _moe_mlp_ep_ring_filtered_local
+from levanter.grug._moe.grad_accum import ExpertGradAccumulator
 from levanter.grug._moe.local import _moe_mlp_local
 from levanter.grug._moe.routing_top_k import routing_top_k
 from levanter.grug.sharding import (
@@ -506,7 +507,9 @@ class MoEExpertMlp(eqx.Module):
         mesh: jax.sharding.AbstractMesh | None = None,
         report_capacity_overflow: bool = False,
         local_capacity_drops: bool = False,
-    ) -> Float[Array, "T D"] | tuple[Float[Array, "T D"], MoeDispatchCounts]:
+        grad_acc: ExpertGradAccumulator | None = None,
+    ) -> Any:
+        """``moe_mlp`` with these weights; with ``grad_acc`` it returns ``(result, grad_acc)``."""
         w_gate_up = jnp.concatenate([self.w_gate, self.w_up], axis=-1)
         return moe_mlp(
             x,
@@ -525,6 +528,7 @@ class MoEExpertMlp(eqx.Module):
             expert_chunks=self.expert_chunks,
             num_expert_waves=self.num_expert_waves,
             combine_in_fp32=self.combine_in_fp32,
+            grad_acc=grad_acc,
         )
 
 
@@ -547,7 +551,8 @@ def moe_mlp(
     expert_chunks: int = 1,
     num_expert_waves: int = 1,
     combine_in_fp32: bool = False,
-) -> Float[Array, "T D"] | tuple[Float[Array, "T D"], MoeDispatchCounts]:
+    grad_acc: ExpertGradAccumulator | None = None,
+) -> Any:
     """Functional routed MoE MLP core used by Grug modules and benchmarks.
 
     This helper handles dispatch/permute/unpermute (+EP collectives) from
@@ -592,6 +597,10 @@ def moe_mlp(
     `combine_in_fp32=True` weights and sums the expert outputs in float32 (float32 combine weights, and on the
     ring paths a float32 psum-scatter), casting to `x`'s dtype once at the end. Only the `ring`,
     `ring_gather_combine` and local `scatter` paths support it. Off, they cast the weights to `x`'s dtype first.
+
+    Fork overlay: `grad_acc` (an `ExpertGradAccumulator` with its layer set) folds the expert weight gradients into
+    float32 sums inside the FlyDSL weight-gradient kernel (`ring_filtered` on an expert axis of two or more, with
+    `RAGGED_DOT_IMPL=flydsl`); the call then returns `(result, grad_acc)`, `result` being what it returns without it.
     """
     resolved_implementation = resolve_moe_implementation(implementation)
     if local_capacity_drops and not report_capacity_overflow:
@@ -599,6 +608,15 @@ def moe_mlp(
 
     if mesh is None:
         mesh = _current_mesh()
+    if grad_acc is not None:
+        if grad_acc.layer is None:
+            raise ValueError("grad_acc needs its layer set (ExpertGradAccumulator.at_layer)")
+        if resolved_implementation != "ring_filtered" or not (
+            _mesh_has_axis(mesh, "expert") and _mesh_axis_size(mesh, "expert") > 1
+        ):
+            raise NotImplementedError(
+                f"grad_acc needs ring_filtered on an expert axis of size two or more, got {resolved_implementation!r}"
+            )
 
     if isinstance(activation, ActivationFunctionEnum):
         activation_fn: Callable[[jax.Array], jax.Array] = activation.to_jax_fn()
@@ -718,11 +736,15 @@ def moe_mlp(
                 combine_in_fp32=combine_in_fp32,
             )
         elif resolved_implementation == "ring_filtered":
-            shard_local_fn = partial(
+            ring_filtered_fn = partial(
                 _moe_mlp_ep_ring_filtered_local,
                 transport_capacity_factor=pooled_transport_capacity_factor,
                 reduce_drops=not local_capacity_drops,
             )
+            shard_local_fn = ring_filtered_fn
+            if grad_acc is not None:
+                # The accumulator rides last, after the weights, as a keyword of the local function.
+                shard_local_fn = lambda *a, **kw: ring_filtered_fn(*a[:-1], grad_acc=a[-1], **kw)  # noqa: E731
         elif resolved_implementation == "ragged_all_to_all":
             shard_local_fn = _moe_mlp_ep_ragged_a2a_local
         elif resolved_implementation == "fixed_all_to_all":
@@ -749,6 +771,18 @@ def moe_mlp(
         w_up_gate = _reshard_for_shard_map(w_up_gate, mesh, w_up_gate_spec)
         w_down = _reshard_for_shard_map(w_down, mesh, w_down_spec)
 
+        in_specs = (token_spec, token_spec, token_spec, token_spec, w_up_gate_spec, w_down_spec)
+        out_specs = (token_spec, CapacityDrops(sender_dropped=drops_spec, receiver_dropped=drops_spec))
+        args = (x, selected_experts, combine_weights, token_valid, w_up_gate, w_down)
+        if grad_acc is not None:
+            acc_specs = ExpertGradAccumulator(
+                jax.typeof(grad_acc.w_gate).sharding.spec,
+                jax.typeof(grad_acc.w_up).sharding.spec,
+                jax.typeof(grad_acc.w_down).sharding.spec,
+                P(),
+                grad_acc.mode,
+            )
+            in_specs, out_specs, args = (*in_specs, acc_specs), (*out_specs, acc_specs), (*args, grad_acc)
         shard_fn = shard_map(
             partial(
                 shard_local_fn,
@@ -758,21 +792,13 @@ def moe_mlp(
                 token_sharding_axes=token_sharding_axes,
             ),
             mesh=mesh,
-            in_specs=(
-                token_spec,
-                token_spec,
-                token_spec,
-                token_spec,
-                w_up_gate_spec,
-                w_down_spec,
-            ),
-            out_specs=(token_spec, CapacityDrops(sender_dropped=drops_spec, receiver_dropped=drops_spec)),
+            in_specs=in_specs,
+            out_specs=out_specs,
             check_vma=False,
         )
-        out, drops = shard_fn(x, selected_experts, combine_weights, token_valid, w_up_gate, w_down)
-        if report_capacity_overflow:
-            return out, dispatch_counts(drops)
-        return out
+        out, drops, *acc_out = shard_fn(*args)
+        result = (out, dispatch_counts(drops)) if report_capacity_overflow else out
+        return result if grad_acc is None else (result, acc_out[0])
 
     # Fallback path for no expert axis (or expert axis size 1) keeps routing
     # semantics without EP collectives. JAX 0.9 requires shard_map in_specs to
