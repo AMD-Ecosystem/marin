@@ -4,7 +4,7 @@
 """Command line to ``GrugRunConfig`` for the AMD June scripts (no Fray or Iris).
 
 The options cover the model size, the mesh, the batch and its microbatches, ZeRO-1, the attention kernel, profiling
-and logging, and (fork overlay) the held-out eval inside the train step. The kernels and the loop are fixed in the
+and logging, and (fork overlay) the held-out step eval. The kernels and the loop are fixed in the
 model and trainer code, so there are no options for them. A script adds its own options on top: the synthetic
 benchmark its step count and flat Adam, ``slurm_train.py`` its data, budget, optimizer and checkpoints.
 """
@@ -124,14 +124,14 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
         help="Exit with status 1 if a step takes longer than this many seconds (0 disables). "
         "The first step, watch steps and the first eval step have no timeout.",
     )
-    step_eval = parser.add_argument_group("held-out eval inside the train step (GrugEvalConfig)")
+    step_eval = parser.add_argument_group("held-out step eval (GrugEvalConfig)")
     step_eval.add_argument(
         "--eval-every",
         type=int,
         default=0,
-        help="Every this many steps from step 0, and on the last step, run the train step's eval variant: a "
-        "forward-only held-out loss on the compute-dtype weights the step already holds, no extra weight memory "
-        "(0: no eval). Needs --microbatches >= 2.",
+        help="Every this many steps from step 0, and on the last step, run the step eval before the train step: a "
+        "forward-only held-out loss on the compute-dtype weights the step starts from (0: no eval). Needs "
+        "--microbatches >= 2.",
     )
     step_eval.add_argument(
         "--eval-microbatches",
@@ -312,13 +312,13 @@ class StepTimes:
     The wall period (``throughput/wall_step_s``) is the time between consecutive steps' hooks, which includes the
     host work between steps that ``throughput/duration`` leaves out.
 
-    With an eval inside the train step (``eval_cfg``), the steps it runs at (``eval_runs_at``) are kept apart: the
+    With the step eval (``eval_cfg``), the steps it runs at (``eval_runs_at``) are kept apart: the
     headline covers the train-only steps, so it stays comparable with runs without an eval, and a separate line gives
     the eval steps' cost. Each eval step is timed together with the step before it, and both are left out of the
     train-only steps: with pipelined logging a step's metrics arrive only once the next step is done, so the eval's
     time lands in the previous step's period, and the first eval step's flush of the pipeline leaves a near-empty one.
     An eval step's wall time is the pair's wall time minus one train-only mean wall step. The first eval step this
-    process runs compiles the eval variant and is reported on its own; the run's last step is left out of the eval
+    process runs compiles the eval and is reported on its own; the run's last step is left out of the eval
     steps' mean (its wall period ends with the loop).
     """
 

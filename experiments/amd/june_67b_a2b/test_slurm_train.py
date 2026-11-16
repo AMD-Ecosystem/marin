@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The AMD copy's real-data run (fork overlay): its config against the benchmark's, the token budget, the held-out
-split for the eval inside the train step, and the data path on four CPU devices."""
+split for the step eval, and the data path on four CPU devices."""
 
 import dataclasses
 import json
@@ -136,7 +136,7 @@ def test_budget_beyond_the_cache_is_refused(tmp_path):
 
 def test_eval_holds_out_whole_microbatches_for_the_step_eval(tmp_path):
     # best7's 4 microbatches of a 16-sequence batch: --eval-microbatches 2 holds out 8 windows, which June's
-    # GrugEvalConfig evaluates inside the train step with bits per byte.
+    # GrugEvalConfig evaluates as the step eval with bits per byte.
     windows = 6 * 16 + 8
     argv = train_argv(
         tmp_path, windows * 256 + 100, *SMALL_STEP, "--train-tokens", str(6 * 4096), "--optimizer", "muonh"

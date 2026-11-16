@@ -29,7 +29,7 @@ def run_hooks(monkeypatch, step_times: StepTimes, walls: dict[int, float]) -> No
 
 
 def test_eval_steps_are_reported_apart_from_the_train_steps(monkeypatch, caplog):
-    # Eval every 4 steps: 0 compiles the eval variant (and 1 the plain one: both are the timing warmup), 4 and 8 are
+    # Eval every 4 steps: 0 compiles the train step and the eval (it and 1 are the timing warmup), 4 and 8 are
     # measured, 11 (the last) is left out. The headline covers train steps 2-9 without 3 and 7, the steps before an
     # eval, whose wall periods are timed with it, and 10, the step before the last.
     walls = {step: TRAIN_WALL for step in range(STEPS)}
