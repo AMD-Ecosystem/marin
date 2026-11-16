@@ -16,10 +16,11 @@ reuses June's data, eval, FLOP, checkpoint-restore and dispatch helpers. What di
   loss's finiteness itself, so the host fetches each step's metrics in one transfer;
 - fork overlay: with the MoE's FlyDSL expert kernels (``RAGGED_DOT_IMPL=flydsl``) on an expert axis of two or more,
   the expert weights' gradient sums are folded in by the weight-gradient kernel (``_in_kernel_expert_sums``);
-- fork overlay: with two or more microbatches, June's ``GrugEvalConfig`` runs inside the train step
-  (``_check_step_eval``): on its steps the loop dispatches a second compiled variant of the step that also computes a
-  forward-only held-out loss on the compute-dtype weights the step already holds, instead of Levanter's standalone
-  eval, which with ``zero1`` would gather the float32 weights.
+- fork overlay: with two or more microbatches, June's ``GrugEvalConfig`` runs as the step eval (``_check_step_eval``):
+  on its steps the loop dispatches, before the train step, a forward-only held-out loss on the compute-dtype weights
+  the step starts from (``_make_step_eval``), instead of Levanter's standalone eval, which with ``zero1`` would gather
+  the float32 weights. It is its own small program: as a second variant of the train step, of the same size as the
+  step's temporary block, it could not find that block again in the fragmented heap after the plain steps (E1).
 """
 
 from __future__ import annotations
@@ -265,10 +266,7 @@ def _make_train_step(
         watch_targets = ()
 
     @functools.partial(jax.jit, donate_argnums=(0,), static_argnames=("compute_watch",))
-    def train_step(state: GrugTrainState, batch, eval_batch=None, *, compute_watch: bool = False):
-        """One optimizer step on ``batch``. With ``eval_batch``, a second compiled variant, also the held-out
-        cross-entropy sum and loss weight of ``eval_batch`` under the weights the step started from, as the metrics
-        ``EVAL_CROSS_ENTROPY_SUM_KEY`` and ``EVAL_LOSS_WEIGHT_SUM_KEY``; the update is the same."""
+    def train_step(state: GrugTrainState, batch, *, compute_watch: bool = False):
         # Apply pending QB betas to router biases inside JIT (avoids eager
         # host-side kernel launches that can cause SPMD sync issues).
         qb_params = _apply_qb_betas(state.params, state.pending_qb_betas)
@@ -288,8 +286,6 @@ def _make_train_step(
 
         gathered_blocks = None
         if microbatches == 1:
-            if eval_batch is not None:
-                raise ValueError("the eval inside the train step needs microbatches >= 2")
 
             def loss_fn(params):
                 terms = loss_terms(params, batch)
@@ -298,16 +294,14 @@ def _make_train_step(
 
             (loss, summarized_metrics), compute_grads = jax.value_and_grad(loss_fn, has_aux=True)(qb_compute_params)
         else:
-            loss, summarized_metrics, compute_grads, gathered_blocks, eval_sums = _microbatched_loss_and_grads(
+            loss, summarized_metrics, compute_grads, gathered_blocks = _microbatched_loss_and_grads(
                 loss_terms,
                 qb_compute_params,
                 batch,
                 microbatches,
                 grad_shardings=qb_params,
                 gather_sources=qb_params if zero1 else None,
-                eval_batch=eval_batch,
             )
-            summarized_metrics = {**summarized_metrics, **eval_sums}
         grads = mp.cast_to_param(compute_grads)
         # The loss's finiteness is checked on the host from this flag, fetched with the other metrics.
         metrics = {"train/loss": loss, _LOSS_FINITE_KEY: jnp.isfinite(loss), **summarized_metrics}
@@ -484,25 +478,15 @@ def _finalize_accumulated_grad(grad_sum: jax.Array, param: jax.Array, target: ja
     return reshard(grad_sum.astype(param.dtype), jax.typeof(target).sharding)
 
 
-def _before_last_microbatch(
-    params: Transformer, last_microbatch, grad_sum: Transformer, eval_batch, rows_per_chunk: int
-) -> tuple[object, Transformer, dict[str, jax.Array]]:
+def _before_last_microbatch(params: Transformer, last_microbatch, grad_sum: Transformer):
     """The point after the microbatch loop and before the last microbatch, where ``params``, the compute-dtype weights
     the step reads (with ZeRO-1, the gathered expert weights included), are resident and no microbatch's activations
-    are live. Returns ``last_microbatch``, ``grad_sum`` and the eval sums of ``eval_batch`` (``_eval_sums``; empty
-    without it), which is evaluated here: it gathers no weight and holds none beyond the step's own.
+    are live: forward-only work on those weights goes here.
 
-    The barriers start the last microbatch only after the loop (and the eval): otherwise XLA may run its forward first
-    and keep its activations live through the loop. Without ``eval_batch`` the step is traced as with no eval."""
-    if eval_batch is None:
-        last_microbatch, grad_sum = jax.lax.optimization_barrier((last_microbatch, grad_sum))
-        return last_microbatch, grad_sum, {}
-    # After the loop: no microbatch's residuals are live next to the eval's activations.
-    eval_batch, grad_sum = jax.lax.optimization_barrier((eval_batch, grad_sum))
-    eval_sums = _eval_sums(params, eval_batch, rows_per_chunk)
-    # The last microbatch starts once the eval is done, so the eval's activations are freed first.
-    last_microbatch, grad_sum, eval_sums = jax.lax.optimization_barrier((last_microbatch, grad_sum, eval_sums))
-    return last_microbatch, grad_sum, eval_sums
+    The barrier starts the last microbatch only after the loop: otherwise XLA may run its forward first and keep its
+    activations live through the loop."""
+    del params
+    return jax.lax.optimization_barrier((last_microbatch, grad_sum))
 
 
 def _eval_sums(params: Transformer, eval_batch, rows_per_chunk: int) -> dict[str, jax.Array]:
@@ -529,6 +513,25 @@ def _eval_sums(params: Transformer, eval_batch, rows_per_chunk: int) -> dict[str
     return {EVAL_CROSS_ENTROPY_SUM_KEY: cross_entropy_sum, EVAL_LOSS_WEIGHT_SUM_KEY: weight_sum}
 
 
+def _make_step_eval(mp: jmp.Policy, shardings: Transformer, rows_per_chunk: int):
+    """The step eval: ``evaluate(params, pending_qb_betas, eval_batch)``, the ``_eval_sums`` of ``eval_batch`` under
+    the weights a train step on a state with these ``params`` and ``pending_qb_betas`` starts from, as it reads them:
+    the QB betas applied and cast to the compute dtype, in the compute copy's ``shardings`` (``compute_shardings``;
+    with ZeRO-1 this all-gathers the expert weights in the compute dtype, as the step's first microbatch does).
+
+    It is compiled apart from the train step and reads the state without donating it, so the train step is the same
+    program with or without the eval. Its temporary block holds that compute-dtype copy and one chunk's forward, much
+    less than the train step's: two train-step variants of nearly the same temporary size each need their own
+    contiguous block, which the heap the plain steps leave behind may no longer have for the other (E1's OOM)."""
+
+    @jax.jit
+    def evaluate(params: Transformer, pending_qb_betas: jax.Array, eval_batch) -> dict[str, jax.Array]:
+        compute = jax.tree.map(reshard, mp.cast_to_compute(_apply_qb_betas(params, pending_qb_betas)), shardings)
+        return _eval_sums(compute, eval_batch, rows_per_chunk)
+
+    return evaluate
+
+
 def _microbatched_loss_and_grads(
     loss_terms: Callable[..., LossTerms],
     params: Transformer,
@@ -537,11 +540,9 @@ def _microbatched_loss_and_grads(
     *,
     grad_shardings: Transformer,
     gather_sources: Transformer | None,
-    eval_batch=None,
-) -> tuple[jax.Array, dict, Transformer, object, dict[str, jax.Array]]:
-    """Loss, summarized metrics and gradients of the whole ``batch``, one microbatch at a time, the buffers the
-    first microbatch gathered into (None without ``gather_sources``) and the eval sums of ``eval_batch``
-    (``_before_last_microbatch``; empty without it).
+) -> tuple[jax.Array, dict, Transformer, object]:
+    """Loss, summarized metrics and gradients of the whole ``batch``, one microbatch at a time, and the buffers the
+    first microbatch gathered into (None without ``gather_sources``).
 
     ``loss_terms(params, microbatch, routing)`` returns the microbatch's ``LossTerms`` with a summed cross-entropy.
     Each microbatch differentiates its share of the whole batch's loss: its cross-entropy sum over the batch's total
@@ -703,9 +704,7 @@ def _microbatched_loss_and_grads(
     # The last microbatch, after the loop: its expert weights stay unmarked, and each layer's gradient plus the
     # earlier microbatches' sum is reduced inside the backward of the layer scan, as soon as that layer is done.
     last_microbatch, last_share = jax.tree.map(lambda x: x[looped], (split_batch, token_shares))
-    last_microbatch, grad_sum, eval_sums = _before_last_microbatch(
-        params, last_microbatch, grad_sum, eval_batch, batch_size // microbatches
-    )
+    last_microbatch, grad_sum = _before_last_microbatch(params, last_microbatch, grad_sum)
     per_layer = per_layer_reduced(params)
     last_params = jax.tree.map(lambda p, m, pl: p if pl else m, params, marked, per_layer)
     # The per-layer weights' sums, already in the offsets' layout.
@@ -772,7 +771,7 @@ def _microbatched_loss_and_grads(
     loss = loss + last_loss
     cross_entropy_loss = cross_entropy_loss + last_cross_entropy
     aux_loss = aux_loss + last_aux
-    return loss, summarize_loss_metrics(router_metrics, cross_entropy_loss, aux_loss), grads, gathered_blocks, eval_sums
+    return loss, summarize_loss_metrics(router_metrics, cross_entropy_loss, aux_loss), grads, gathered_blocks
 
 
 def _check_per_device_parallelism(
@@ -822,33 +821,31 @@ def _fetch_step_metrics(metrics: dict, diagnose_numerics: bool) -> dict:
 
 
 def eval_runs_at(step: int, steps_per_eval: int, num_train_steps: int) -> bool:
-    """Whether the eval inside the train step runs at ``step``: every ``steps_per_eval`` steps from step 0 (which
-    evaluates the initial weights) and on the last step. An eval step evaluates the weights after ``step`` updates."""
+    """Whether the step eval runs at ``step``: every ``steps_per_eval`` steps from step 0 (which evaluates the
+    initial weights) and on the last step. An eval step evaluates the weights after ``step`` updates."""
     return step % steps_per_eval == 0 or step == num_train_steps - 1
 
 
 def _check_step_eval(config: GrugRunConfig) -> int:
-    """The number of held-out sequences ``config.eval`` evaluates inside the train step; raises if the run cannot.
+    """The number of held-out sequences ``config.eval`` evaluates at each eval step; raises if the run cannot.
 
     ``eval_batch_size`` sequences, whole train microbatches, are evaluated at every eval step, one microbatch's rows at
     a time; ``steps_per_eval`` is the cadence (``eval_runs_at``)."""
     eval_cfg, trainer = config.eval, config.trainer
     assert eval_cfg is not None
     if trainer.microbatches < 2:
-        raise ValueError(f"the eval inside the train step needs microbatches >= 2, got {trainer.microbatches}")
+        raise ValueError(f"the step eval needs microbatches >= 2, got {trainer.microbatches}")
     if eval_cfg.steps_per_eval is None or eval_cfg.steps_per_eval < 1:
-        raise ValueError(f"the eval inside the train step needs steps_per_eval >= 1, got {eval_cfg.steps_per_eval}")
+        raise ValueError(f"the step eval needs steps_per_eval >= 1, got {eval_cfg.steps_per_eval}")
     if eval_cfg.max_eval_batches not in (None, 1):
-        raise ValueError(
-            f"the eval inside the train step evaluates one batch; max_eval_batches={eval_cfg.max_eval_batches}"
-        )
+        raise ValueError(f"the step eval evaluates one batch; max_eval_batches={eval_cfg.max_eval_batches}")
     if not eval_cfg.eval_current:
-        raise ValueError("the eval inside the train step evaluates the current weights; eval_current must be True")
+        raise ValueError("the step eval evaluates the current weights; eval_current must be True")
     if eval_cfg.eval_ema and trainer.ema_beta is not None:
-        raise ValueError("the eval inside the train step cannot evaluate the EMA weights; set eval_ema=False")
+        raise ValueError("the step eval cannot evaluate the EMA weights; set eval_ema=False")
     batch_size = trainer.trainer.train_batch_size
     if not isinstance(batch_size, int):
-        raise ValueError("the eval inside the train step needs a fixed train_batch_size")
+        raise ValueError("the step eval needs a fixed train_batch_size")
     rows = batch_size // trainer.microbatches
     if eval_cfg.eval_batch_size < 1 or eval_cfg.eval_batch_size % rows != 0:
         raise ValueError(
@@ -862,7 +859,7 @@ def _held_out_examples(config: GrugRunConfig) -> AsyncDataset[GrugLmExample]:
     sequences = _check_step_eval(config)
     sets = config.data.validation_sets(Axis("position", config.model.max_seq_len))
     if len(sets) != 1:
-        raise ValueError(f"the eval inside the train step needs exactly one validation set, got {sorted(sets)}")
+        raise ValueError(f"the step eval needs exactly one validation set, got {sorted(sets)}")
     (named,) = sets.values()
     # The windows as GrugLmExamples, which the NamedLmDataset wrapper converts to Levanter's LmExample.
     assert isinstance(named, NamedLmDataset)
@@ -871,7 +868,7 @@ def _held_out_examples(config: GrugRunConfig) -> AsyncDataset[GrugLmExample]:
     assert config.eval is not None
     if available < sequences or (config.eval.max_eval_batches is None and available != sequences):
         raise ValueError(
-            f"the validation set has {available} sequences; the eval inside the train step evaluates one batch of "
+            f"the validation set has {available} sequences; the step eval evaluates one batch of "
             f"eval_batch_size={sequences} (with max_eval_batches=None it must hold exactly that many)"
         )
     return held_out.slice_dataset(end_index=sequences)
@@ -913,20 +910,23 @@ def _logged_eval_metrics(host: dict, prefix: str, eval_bytes: float | None) -> d
 
 @dataclass(frozen=True)
 class _LoadedStepEval:
-    """The eval inside the train step, ready for the loop: its whole held-out set on the devices, sharded as a train
-    batch."""
+    """The step eval, ready for the loop: its whole held-out set on the devices, sharded as a train batch."""
 
     batch: GrugLmExample
+    evaluate: Callable[..., dict[str, jax.Array]]
+    """``_make_step_eval``'s function: ``evaluate(params, pending_qb_betas, batch)``."""
     runs_at: Callable[[int], bool]
-    """Whether the loop dispatches the eval variant at this step."""
+    """Whether the loop evaluates at this step."""
     prefix: str
     byte_count: float | None
     """The held-out set's target bytes under its loss weight, for ``eval/bpb``; None logs none."""
 
 
-def _loaded_step_eval(config: GrugRunConfig, mesh: Mesh, byte_count: float | None) -> _LoadedStepEval:
+def _loaded_step_eval(
+    config: GrugRunConfig, mesh: Mesh, byte_count: float | None, mp: jmp.Policy, shardings: Transformer
+) -> _LoadedStepEval:
     """The held-out set as one global batch sharded like a train batch (each process loads its own rows), with
-    ``byte_count`` from ``step_eval_byte_count``."""
+    ``byte_count`` from ``step_eval_byte_count``, evaluated in the compute copy's ``shardings``."""
     eval_cfg = config.eval
     assert eval_cfg is not None and eval_cfg.steps_per_eval is not None
     held_out = _held_out_examples(config)
@@ -944,7 +944,9 @@ def _loaded_step_eval(config: GrugRunConfig, mesh: Mesh, byte_count: float | Non
     runs_at = functools.partial(
         eval_runs_at, steps_per_eval=eval_cfg.steps_per_eval, num_train_steps=config.trainer.trainer.num_train_steps
     )
-    return _LoadedStepEval(batch, runs_at, eval_cfg.prefix, byte_count)
+    rows_per_chunk = config.trainer.trainer.train_batch_size // config.trainer.microbatches
+    evaluate = _make_step_eval(mp, shardings, rows_per_chunk)
+    return _LoadedStepEval(batch, evaluate, runs_at, eval_cfg.prefix, byte_count)
 
 
 @dataclass(frozen=True)
@@ -1006,18 +1008,19 @@ def _train_loop(
     checkpointer each step is checked before its state can be saved. ``throughput/duration`` is the time from the later
     of the step's dispatch and the previous step's completion to its completion. ``watch_interval`` is the gradient
     watch's interval in steps, 0 for none. ``step_timeout`` bounds each wait for a step (``exit_if_hung``) except for
-    the first step of each variant and watch steps, which can compile.
+    the first step, the first eval step and watch steps, which can compile.
 
-    With ``step_eval`` the steps it ``runs_at`` dispatch the train step's eval variant on its held-out batch and log
-    ``eval/loss``. The first of them compiles that variant: it gets no timeout, and the loop finishes the step before
-    it first, so that the compile shows in the eval step's own duration and wall period."""
+    With ``step_eval`` the steps it ``runs_at`` first dispatch the step eval on the state they start from and its
+    held-out batch, then the train step, and log ``eval/loss`` with the step. The first of them compiles the eval: it
+    gets no timeout, and the loop finishes the step before it first, so that the compile shows in the eval step's own
+    duration and wall period."""
     next_step = int(state.step)
     pending: _DispatchedStep | None = None
     last_done = -math.inf
     last_loss = 0.0
     last_duration = 0.0
-    # The step variants (False: plain, True: eval) dispatched so far: the first dispatch of each compiles it.
-    compiled_variants: set[bool] = set()
+    first_step = next_step
+    eval_compiled = False
 
     def fetch(record: _DispatchedStep) -> dict:
         if record.host_metrics is None:
@@ -1066,26 +1069,29 @@ def _train_loop(
             step = next_step
             compute_watch = watch_interval > 0 and step % watch_interval == 0
             is_eval = step_eval is not None and step_eval.runs_at(step)
-            compiles = is_eval not in compiled_variants
-            compiles_eval = is_eval and compiles
+            compiles_eval = is_eval and not eval_compiled
             if compiles_eval and pending is not None:
-                # Charge the eval variant's compile to its own step rather than to the pending one.
+                # Charge the eval's compile to its own step rather than to the pending one.
                 with exit_if_hung(None if pending.may_compile else step_timeout):
                     fetch(pending)
                 finish(pending, None)
                 pending = None
             dispatch_time = time.perf_counter()
-            # The first plain and the first eval step compile, so they get no timeout; neither do watch steps, which
-            # can compile a variant.
-            may_compile = compiles or compute_watch
+            # The first step compiles the train step and the first eval step the eval, so they get no timeout; neither
+            # do watch steps, which can compile a variant of the train step.
+            may_compile = step == first_step or compiles_eval or compute_watch
             waits_for_compile = may_compile or (pending is not None and pending.may_compile)
-            # The eval variant takes the held-out batch as a third argument; the plain step is called as without it.
-            eval_args = (step_eval.batch,) if is_eval and step_eval is not None else ()
             with exit_if_hung(None if waits_for_compile else step_timeout):
-                state, metrics, watch_stats = train_step(state, batch, *eval_args, compute_watch=compute_watch)
+                eval_sums = {}
+                if is_eval:
+                    assert step_eval is not None
+                    # Dispatched before the train step, which donates the state it reads.
+                    eval_sums = step_eval.evaluate(state.params, state.pending_qb_betas, step_eval.batch)
+                state, metrics, watch_stats = train_step(state, batch, compute_watch=compute_watch)
+                metrics = {**metrics, **eval_sums}
                 if pending is not None:
                     fetch(pending)
-            compiled_variants.add(is_eval)
+            eval_compiled = eval_compiled or is_eval
             next_step = step + 1
             record = _DispatchedStep(step, metrics, watch_stats, dispatch_time, iterator.this_load_time, may_compile)
             if pending is not None:
@@ -1159,9 +1165,9 @@ def _run_grug_local(config: GrugRunConfig, *, step_hooks: Sequence[Callable[[cal
         microbatches=config.trainer.microbatches,
         batch_shards=batch_shards(mesh),
     )
-    # With two or more microbatches the eval runs inside the train step; its byte count is taken outside the mesh.
-    in_step_eval = config.eval is not None and config.trainer.microbatches >= 2
-    eval_bytes = step_eval_byte_count(config) if in_step_eval else None
+    # With two or more microbatches the eval runs as the step eval; its byte count is taken outside the mesh.
+    uses_step_eval = config.eval is not None and config.trainer.microbatches >= 2
+    eval_bytes = step_eval_byte_count(config) if uses_step_eval else None
     with set_mesh(mesh):
         batch_schedule = trainer.batch_schedule
 
@@ -1225,9 +1231,9 @@ def _run_grug_local(config: GrugRunConfig, *, step_hooks: Sequence[Callable[[cal
         levanter.tracker.log_summary(flops_summary)
 
         eval_cfg = config.eval
-        step_eval = _loaded_step_eval(config, mesh, eval_bytes) if in_step_eval else None
+        step_eval = _loaded_step_eval(config, mesh, eval_bytes, trainer.mp, shardings) if uses_step_eval else None
         evaluator = None
-        if eval_cfg is not None and not in_step_eval:
+        if eval_cfg is not None and not uses_step_eval:
             evaluator = build_tagged_evaluator(
                 data_config=config.data,
                 max_seq_len=config.model.max_seq_len,

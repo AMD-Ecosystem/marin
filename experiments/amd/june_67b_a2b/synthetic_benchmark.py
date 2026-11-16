@@ -10,7 +10,7 @@ front and ends with the median step time from step 2 on, tokens/s, model TFLOP/s
 (the time between consecutive steps' hooks, host work included), then each device's peak memory.
 
 Fork overlay: with ``--eval-every N`` every N-th step from step 0 (and the last) also runs a forward-only held-out loss
-inside the train step on ``--eval-microbatches`` microbatches of separate random sequences (seed 1), so its loss is
+(the step eval) on ``--eval-microbatches`` microbatches of separate random sequences (seed 1), so its loss is
 about ln(vocab_size). The headline then covers the train-only steps, and a further line gives the eval steps' cost.
 
 Example, two 8-GPU MI355X nodes, expert parallelism within each node and data parallelism across them::
