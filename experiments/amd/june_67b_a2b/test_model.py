@@ -53,8 +53,15 @@ def _loss_and_grads(params_like, tokens, loss_weight, mask):
             tokens, loss_weight, mask=mask, return_router_metrics=True, logsumexp_weight=1e-3
         )
 
-    (value, metrics), grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(params)
-    return value, metrics, grads
+    compiled = jax.jit(jax.value_and_grad(loss, has_aux=True)).lower(params).compile()
+    (value, metrics), grads = compiled(params)
+    # The result types of each all-reduce, one string per collective (a tuple when XLA combined several).
+    all_reduces = [
+        line.split(" = ", 1)[1].split(" all-reduce(")[0]
+        for line in compiled.as_text().splitlines()
+        if " all-reduce(" in line
+    ]
+    return value, metrics, grads, all_reduces
 
 
 def test_amd_model_trains_like_june_from_the_same_parameters():
@@ -77,8 +84,8 @@ def test_amd_model_trains_like_june_from_the_same_parameters():
         for (_, a), (_, b) in zip(amd_leaves, june_leaves, strict=True):
             np.testing.assert_array_equal(a, b)
 
-        june_loss, june_metrics, june_grads = _loss_and_grads(june_model, tokens, loss_weight, mask)
-        amd_loss, amd_metrics, amd_grads = _loss_and_grads(amd_model, tokens, loss_weight, mask)
+        june_loss, june_metrics, june_grads, _ = _loss_and_grads(june_model, tokens, loss_weight, mask)
+        amd_loss, amd_metrics, amd_grads, amd_all_reduces = _loss_and_grads(amd_model, tokens, loss_weight, mask)
 
     # The kernels compute the norms' float32 statistics in another order than XLA, so values agree to float32
     # rounding; routing and capacity drops come out the same.
@@ -92,6 +99,8 @@ def test_amd_model_trains_like_june_from_the_same_parameters():
     np.testing.assert_allclose(amd_metrics["qb_beta_per_layer"], june_metrics["qb_beta_per_layer"], rtol=1e-5, atol=1e-6)
     for key in (amd.MOE_DROPPED_ASSIGNMENTS_METRIC, amd.MOE_SKIPPED_PADDING_ASSIGNMENTS_METRIC):
         np.testing.assert_array_equal(amd_metrics[key], june_metrics[key])
+    # The drop counts are reduced in float32 with the other routing statistics: no integer all-reduce.
+    assert not any("s32" in types for types in amd_all_reduces), amd_all_reduces
     for (path, g), (_, want) in zip(
         jax.tree_util.tree_flatten_with_path(amd_grads)[0],
         jax.tree_util.tree_flatten_with_path(june_grads)[0],

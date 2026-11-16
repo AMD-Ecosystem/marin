@@ -93,6 +93,8 @@ REMAT_SAVE_NAMES = (
 _QK_NORM_EPS = 1e-6
 # QBRoutedMoE's normalization: the selected sigmoid combine weights of a token sum to this.
 _ROUTING_RENORM_SUM = 2.5
+# float32 holds every integer up to 2**24 exactly.
+_FLOAT32_EXACT_INTEGERS = 2**24
 
 
 def check_supported(cfg: GrugModelConfig) -> None:
@@ -397,8 +399,11 @@ class MoEMLP(eqx.Module):
                 local_capacity_drops=True,
             )
         assert isinstance(counts, MoeDispatchCounts)
-        stats["routing_sender_drops_local"] = counts.sender_dropped
-        stats["routing_receiver_drops_local"] = counts.receiver_dropped
+        # In float32 the drop counts join the other statistics' float32 all-reduce after the layer scan instead of
+        # taking an int32 one of their own. A layer drops at most its b * s * k assignments, so they stay exact.
+        drops_dtype = jnp.float32 if b * s * k <= _FLOAT32_EXACT_INTEGERS else jnp.int32
+        stats["routing_sender_drops_local"] = counts.sender_dropped.astype(drops_dtype)
+        stats["routing_receiver_drops_local"] = counts.receiver_dropped.astype(drops_dtype)
         stats["skipped_assignments"] = counts.padding_skipped.astype(jnp.float32)
         routed = reshard(rearrange(routed_flat, "(b s) d -> b s d", b=b, s=s), _batch_spec())
         return routed, stats
