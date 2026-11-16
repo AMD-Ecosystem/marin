@@ -192,3 +192,56 @@ def test_reducing_routing_counts_without_valid_tokens_raises():
     }
     with pytest.raises(ValueError, match="needs valid_tokens_local"):
         reduce_moe_routing_stats(stacked, num_experts=_EXPERTS, num_experts_per_token=_TOPK)
+
+
+def _all_reduce_types(hlo_text: str) -> list[str]:
+    # The result types of each all-reduce, one string per collective (a tuple when XLA combined several).
+    return [
+        line.split(" = ", 1)[1].split(" all-reduce(")[0] for line in hlo_text.splitlines() if " all-reduce(" in line
+    ]
+
+
+@pytest.mark.multidevice
+def test_float32_drop_partials_reduce_exactly_with_the_float32_statistics():
+    with use_test_devices(4) as devices:
+        mesh = jax.make_mesh((2, 2), _AXES, axis_types=(AxisType.Explicit,) * 2, devices=devices)
+        rng = np.random.default_rng(0)
+        # Up to 2**22 per shard: the four shards' sums reach close to 2**24, where float32 integers stop being exact.
+        drops = {
+            name: rng.integers(2**22 - 64, 2**22, size=(_LAYERS, 4), dtype=np.int32)
+            for name in ("routing_sender_drops_local", "routing_receiver_drops_local")
+        }
+        stats = {
+            "router_z_sq_sum_local": rng.random((_LAYERS, 4), dtype=np.float32),
+            "valid_tokens_local": np.full((_LAYERS, 4), 16.0, np.float32),
+        }
+
+        def reduce(stacked):
+            out = reduce_moe_routing_stats(
+                {**stacked, "qb_beta": jnp.zeros((_LAYERS, _EXPERTS))},
+                num_experts=_EXPERTS,
+                num_experts_per_token=_TOPK,
+            )
+            return {
+                name: out[name] for name in ("routing_sender_drops", "routing_receiver_drops", "capacity_overflow")
+            }
+
+        results, all_reduces = {}, {}
+        with jax.set_mesh(mesh):
+            shards = NamedSharding(mesh, P(None, _AXES))
+            for dtype in (np.int32, np.float32):
+                stacked = jax.device_put({**stats, **{k: v.astype(dtype) for k, v in drops.items()}}, shards)
+                compiled = jax.jit(reduce).lower(stacked).compile()
+                results[dtype] = jax.tree.map(np.asarray, compiled(stacked))
+                all_reduces[dtype] = _all_reduce_types(compiled.as_text())
+
+    sender = drops["routing_sender_drops_local"].sum(axis=1, dtype=np.int64)
+    receiver = drops["routing_receiver_drops_local"].sum(axis=1, dtype=np.int64)
+    for dtype in (np.int32, np.float32):
+        assert results[dtype]["routing_sender_drops"].dtype == np.int32
+        np.testing.assert_array_equal(results[dtype]["routing_sender_drops"], sender)
+        np.testing.assert_array_equal(results[dtype]["routing_receiver_drops"], receiver)
+        np.testing.assert_array_equal(results[dtype]["capacity_overflow"], (sender + receiver).astype(np.float32))
+    # int32 partials take an all-reduce of their own; float32 ones none outside the float32 statistics'.
+    assert any("s32" in types for types in all_reduces[np.int32]), all_reduces[np.int32]
+    assert all_reduces[np.float32] and not any("s32" in types for types in all_reduces[np.float32]), all_reduces

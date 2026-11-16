@@ -200,6 +200,10 @@ def reduce_moe_routing_stats(
     counts from ``moe_mlp(..., local_capacity_drops=True)``) into the drop counts and ``capacity_overflow``; and
     ``qb_beta_local`` with ``qb_beta_weight_local`` (from :func:`qb_beta_topk_local`) into valid-token-weighted QB
     thresholds. Histogram QB callers instead provide an already-reduced ``qb_beta``.
+
+    The drop partials may be cast to float32 so that their sum joins the float32 statistics' all-reduce instead of
+    taking a collective of its own. That is exact while a layer's dropped assignments over all shards, at most its
+    tokens times ``num_experts_per_token``, stay at or below ``2**24``; the drop counts come back as int32 either way.
     """
     out = {}
     if "valid_tokens_local" in stacked:
@@ -218,9 +222,11 @@ def reduce_moe_routing_stats(
             assignment_fraction * num_experts_per_token * (prob_sum / valid_tokens[:, None]), axis=-1
         )
     if "routing_sender_drops_local" in stacked:
-        out["routing_sender_drops"] = jnp.sum(stacked["routing_sender_drops_local"], axis=1)
-        out["routing_receiver_drops"] = jnp.sum(stacked["routing_receiver_drops_local"], axis=1)
-        out["capacity_overflow"] = (out["routing_sender_drops"] + out["routing_receiver_drops"]).astype(jnp.float32)
+        sender = jnp.sum(stacked["routing_sender_drops_local"], axis=1)
+        receiver = jnp.sum(stacked["routing_receiver_drops_local"], axis=1)
+        out["routing_sender_drops"] = sender.astype(jnp.int32)
+        out["routing_receiver_drops"] = receiver.astype(jnp.int32)
+        out["capacity_overflow"] = (sender + receiver).astype(jnp.float32)
     if "qb_beta_local" in stacked:
         qb_weights = stacked["qb_beta_weight_local"].astype(jnp.float32)
         out["qb_beta"] = jnp.sum(stacked["qb_beta_local"] * qb_weights[:, :, None], axis=1) / jnp.maximum(
