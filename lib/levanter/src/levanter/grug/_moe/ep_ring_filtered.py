@@ -140,6 +140,7 @@ def _moe_mlp_ep_ring_filtered_local(
     capacity_factor: float,
     transport_capacity_factor: float,
     token_sharding_axes: tuple[str, ...],
+    reduce_drops: bool = True,
 ) -> tuple[Float[Array, "Tlocal H"], CapacityDrops]:
     """Filtered all-to-all dispatch, ring's grouped expert MLP, expert-side combine.
 
@@ -263,5 +264,7 @@ def _moe_mlp_ep_ring_filtered_local(
             tiled=True,
         ).reshape(send_rows, hidden_dim)
         out_local = _combine_rows(returned, safe_source, slot_valid, slot).astype(x_local.dtype)
-        drops = jax.lax.psum(jnp.stack([sender_dropped, receiver_dropped]), token_sharding_axes)
+        drops = jnp.stack([sender_dropped, receiver_dropped])
+        # Summed over the token shards here, or returned as this shard's [1] counts for the caller to sum.
+        drops = jax.lax.psum(drops, token_sharding_axes) if reduce_drops else drops[:, None]
     return out_local, CapacityDrops(sender_dropped=drops[0], receiver_dropped=drops[1])
