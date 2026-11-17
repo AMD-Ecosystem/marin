@@ -9,7 +9,8 @@ kernels (reference or ``xla_flash`` attention, XLA ``ragged_dot``), so the two c
 hardware that has no CUDA or TPU kernels. Every step sees fresh uniform-random tokens with no repeats, so the
 loss cannot fall below ln(vocab_size) and a lower value means something leaks the targets (``--repeat-batches``
 cycles through a small pool of batches instead, so the loss can fall, for convergence checks). No checkpoint is
-written.
+written. Like the Snowball harness, it logs the model FLOPs per example up front and ends with the median step
+time from step 2 on, tokens/s, model TFLOP/s and MFU, then each device's peak memory.
 
 Example, 8 GPUs, full 67B shape, expert parallelism over all 8, profile of steps 10-12::
 
@@ -33,7 +34,8 @@ import jax
 import jmp
 import numpy as np
 from fray.cluster import ResourceConfig
-from levanter.callbacks.profiler import ProfilerConfig, XprofUploadConfig
+from levanter.callbacks import StepInfo
+from levanter.callbacks.profiler import ProfileOptionsConfig, ProfilerConfig, XprofUploadConfig
 from levanter.callbacks.watch import WatchConfig
 from levanter.checkpoint import CheckpointerConfig
 from levanter.data.dataset import ListAsyncDataset
@@ -46,10 +48,14 @@ from levanter.optim.config import AdamConfig
 from levanter.tracker.json_logger import JsonLoggerConfig
 from levanter.trainer import TrainerConfig
 from levanter.utils.jax_utils import multihost_broadcast_sync
+from rigging.log_setup import configure_logging
 
+from experiments.grug.snowball_synthetic.train import FIRST_TIMED_STEP, log_throughput_summary
 from experiments.june_tpu_67b_a2b.moe.heuristic_muonh import MoeMuonHHeuristic
 from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig, RematMode
 from experiments.june_tpu_67b_a2b.moe.train import (
+    ATTENTION_FLOPS_PER_EXAMPLE_KEY,
+    CAUSAL_ATTENTION_FLOPS_PER_EXAMPLE_KEY,
     GrugRunConfig,
     GrugTrainerConfig,
     _compute_flops,
@@ -192,8 +198,21 @@ def report_memory() -> None:
         )
 
 
+def log_model_flops(flops_per_example: float, flops_summary: dict[str, float]) -> None:
+    if jax.process_index() != 0:
+        return
+    logger.info(
+        "model flops per example: total=%r attention_noncausal=%r attention_causal=%r",
+        flops_per_example,
+        flops_summary[ATTENTION_FLOPS_PER_EXAMPLE_KEY],
+        flops_summary[CAUSAL_ATTENTION_FLOPS_PER_EXAMPLE_KEY],
+    )
+
+
 def main() -> None:
     args = parse_args()
+    # The training loop sets up logging only once it starts; without this, the lines logged before it are dropped.
+    configure_logging(logging.INFO)
     if args.gpus_per_node is not None:
         # Before any JAX call that starts the backend, including jax.device_count() below. Without explicit device
         # ids, JAX gives each Slurm process the single GPU numbered by its local rank.
@@ -249,6 +268,8 @@ def main() -> None:
             start_step=args.profile_start,
             num_steps=args.profile_steps,
             upload=XprofUploadConfig(enabled=False),
+            # HLO protos add /host:metadata so trace tools can identify ragged_dot kernels.
+            profile_options=ProfileOptionsConfig(enable_hlo_proto=True),
         ),
         jax_compilation_cache_dir=args.compilation_cache_dir,
         log_jaxprs=False,
@@ -287,7 +308,7 @@ def main() -> None:
         ),
         eval=None,
     )
-    flops_per_example, _ = _compute_flops(model_config=model)
+    flops_per_example, flops_summary = _compute_flops(model_config=model)
     logger.info(
         "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d seq_len=%d window=%d mp=%s "
         "expert_axis=%d replica_axis=%d attention=%s moe=%s capacity=%s pooled_capacity=%s waves=%d remat=%s "
@@ -314,7 +335,17 @@ def main() -> None:
         args.watch_interval,
         flops_per_example,
     )
-    _run_grug_local(config)
+    log_model_flops(flops_per_example, flops_summary)
+    step_durations: list[float] = []
+
+    def record_step(info: StepInfo, force: bool = False) -> None:
+        # The loop re-runs every hook with force=True after the last step; that call would duplicate the sample.
+        if not force and info.step >= FIRST_TIMED_STEP:
+            step_durations.append(info.step_duration)
+
+    _run_grug_local(config, step_hooks=[record_step])
+    if step_durations:
+        log_throughput_summary(step_durations, batch_size, model.max_seq_len, flops_per_example, args.steps)
     report_memory()
 
 
