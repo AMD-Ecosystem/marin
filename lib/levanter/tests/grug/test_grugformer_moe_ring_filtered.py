@@ -14,7 +14,7 @@ from haliax.nn.ragged_dot import ragged_dot
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 from levanter.grug._moe import ep_ring, ep_ring_filtered
 from levanter.grug._moe.ep_ring_filtered import destination_hit_fraction
-from levanter.grug.grug_moe import moe_mlp
+from levanter.grug.grug_moe import MOE_REMAT_SAVE_NAMES, moe_mlp
 from levanter.testing.devices import use_test_devices
 
 
@@ -256,73 +256,92 @@ def _bits(x: jax.Array) -> np.ndarray:
     return x.view(np.uint16 if x.dtype.itemsize == 2 else np.uint32)
 
 
+def _ring_filtered_loss(*, hidden, dtype, experts, mesh, shards=4, tokens_per_shard=16, inter=8, topk=2):
+    """A ring_filtered value-and-grad problem with sender and receiver drops and uneven padding: the loss of
+    (x, combine weights, w_up_gate, w_down) with the drop counts as aux, and those four arguments."""
+    tokens = shards * tokens_per_shard
+    keys = jax.random.split(jax.random.key(0), 7)
+    batch = NamedSharding(mesh, P(("data", "expert"), None))
+    expert_sharding = NamedSharding(mesh, P("expert", None, None))
+    args = (
+        jax.device_put(jax.random.normal(keys[0], (tokens, hidden)).astype(dtype), batch),
+        jax.device_put(jax.nn.softmax(jax.random.normal(keys[1], (tokens, topk)), axis=-1), batch),
+        jax.device_put(
+            (jax.random.normal(keys[2], (experts, hidden, 2 * inter)) / math.sqrt(hidden)).astype(dtype),
+            expert_sharding,
+        ),
+        jax.device_put(
+            (jax.random.normal(keys[3], (experts, inter, hidden)) / math.sqrt(inter)).astype(dtype), expert_sharding
+        ),
+    )
+    selected = jnp.argsort(jax.random.uniform(keys[4], (tokens, experts)), axis=1)[:, :topk].astype(jnp.int32)
+    selected = jax.device_put(selected, batch)
+    cotangent = jax.device_put(jax.random.normal(keys[5], (tokens, hidden)).astype(dtype), batch)
+    # Shard s keeps between 30% and all of its tokens.
+    keep_fraction = np.repeat(0.3 + 0.7 * np.arange(shards) / (shards - 1), tokens_per_shard)
+    token_valid = np.asarray(jax.random.uniform(keys[6], (tokens,))) < keep_fraction
+    token_valid = jax.device_put(jnp.asarray(token_valid), NamedSharding(mesh, P(("data", "expert"))))
+
+    def loss(x, cw, w_up_gate, w_down):
+        out, counts = moe_mlp(
+            x,
+            selected,
+            cw,
+            w_up_gate,
+            w_down,
+            token_valid=token_valid,
+            activation=jax.nn.silu,
+            implementation="ring_filtered",
+            mesh=mesh,
+            capacity_factor=0.3,
+            pooled_transport_capacity_factor=0.5,
+            report_capacity_overflow=True,
+        )
+        return jnp.sum((out * cotangent).astype(jnp.float32)), (out, counts)
+
+    return loss, args
+
+
+def _expert_mesh(devices, shards=4):
+    return Mesh(
+        np.asarray(devices).reshape(1, shards, 1),
+        axis_names=("data", "expert", "model"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit, AxisType.Explicit),
+    )
+
+
+_GATHER_KERNELS = {"grug_gather_rows", "grug_gather_sum"}
+_ROUTING_KERNELS = {"grug_send_slots", "grug_expert_rows"}
+
+
 @pytest.mark.skipif(jax.default_backend() == "tpu", reason="Pallas-Triton kernels need a GPU or CPU")
 @pytest.mark.parametrize(
-    ("hidden", "dtype", "uses_pallas"),
-    [(16, jnp.float32, True), (16, jnp.bfloat16, True), (24, jnp.float32, False)],
-    ids=["tileable_f32", "tileable_bf16", "untileable_f32"],
+    ("hidden", "dtype", "experts", "kernels_on_instinct"),
+    [
+        (16, jnp.float32, 16, _GATHER_KERNELS | _ROUTING_KERNELS),
+        (16, jnp.bfloat16, 16, _GATHER_KERNELS | _ROUTING_KERNELS),
+        (24, jnp.float32, 16, _ROUTING_KERNELS),
+        (16, jnp.float32, 12, _GATHER_KERNELS),
+    ],
+    ids=["tileable_f32", "tileable_bf16", "untileable_f32", "three_local_experts_f32"],
 )
 @pytest.mark.multidevice
-def test_ring_filtered_on_amd_instinct_matches_xla_bitwise(hidden, dtype, uses_pallas, monkeypatch):
-    """On AMD Instinct, ring_filtered moves rows with the Pallas-Triton gathers when they can tile the hidden width
-    and with XLA otherwise. Either way it gives the outputs, gradients and drop counts of the XLA gathers used on
-    other devices, bit for bit, with sender and receiver drops and uneven padding."""
+def test_ring_filtered_on_amd_instinct_matches_xla_bitwise(hidden, dtype, experts, kernels_on_instinct, monkeypatch):
+    """On AMD Instinct, ring_filtered moves rows with the Pallas-Triton gathers when they can tile the hidden width,
+    and builds its routing maps with the Pallas-Triton sorts when the shard and local expert counts are powers of two;
+    XLA does the rest. Either way it gives the outputs, gradients and drop counts of the XLA path used on other
+    devices, bit for bit, with sender and receiver drops and uneven padding."""
     with use_test_devices(4) as devices:
-        shards, tokens_per_shard, inter, experts, topk = 4, 16, 8, 16, 2
-        tokens = shards * tokens_per_shard
-        mesh = Mesh(
-            np.asarray(devices).reshape(1, shards, 1),
-            axis_names=("data", "expert", "model"),
-            axis_types=(AxisType.Explicit, AxisType.Explicit, AxisType.Explicit),
-        )
-        keys = jax.random.split(jax.random.key(0), 7)
-        batch = NamedSharding(mesh, P(("data", "expert"), None))
-        expert_sharding = NamedSharding(mesh, P("expert", None, None))
-        args = (
-            jax.device_put(jax.random.normal(keys[0], (tokens, hidden)).astype(dtype), batch),
-            jax.device_put(jax.nn.softmax(jax.random.normal(keys[1], (tokens, topk)), axis=-1), batch),
-            jax.device_put(
-                (jax.random.normal(keys[2], (experts, hidden, 2 * inter)) / math.sqrt(hidden)).astype(dtype),
-                expert_sharding,
-            ),
-            jax.device_put(
-                (jax.random.normal(keys[3], (experts, inter, hidden)) / math.sqrt(inter)).astype(dtype),
-                expert_sharding,
-            ),
-        )
-        selected = jnp.argsort(jax.random.uniform(keys[4], (tokens, experts)), axis=1)[:, :topk].astype(jnp.int32)
-        selected = jax.device_put(selected, batch)
-        cotangent = jax.device_put(jax.random.normal(keys[5], (tokens, hidden)).astype(dtype), batch)
-        # Shard s keeps between 30% and all of its tokens.
-        keep_fraction = np.repeat(0.3 + 0.7 * np.arange(shards) / (shards - 1), tokens_per_shard)
-        token_valid = np.asarray(jax.random.uniform(keys[6], (tokens,))) < keep_fraction
-        token_valid = jax.device_put(jnp.asarray(token_valid), NamedSharding(mesh, P(("data", "expert"))))
+        mesh = _expert_mesh(devices)
+        loss, args = _ring_filtered_loss(hidden=hidden, dtype=dtype, experts=experts, mesh=mesh)
 
         def run(amd_instinct):
             monkeypatch.setattr(ep_ring_filtered, "is_amd_instinct", lambda: amd_instinct)
-
-            def loss(x, cw, w_up_gate, w_down):
-                out, counts = moe_mlp(
-                    x,
-                    selected,
-                    cw,
-                    w_up_gate,
-                    w_down,
-                    token_valid=token_valid,
-                    activation=jax.nn.silu,
-                    implementation="ring_filtered",
-                    mesh=mesh,
-                    capacity_factor=0.3,
-                    pooled_transport_capacity_factor=0.5,
-                    report_capacity_overflow=True,
-                )
-                return jnp.sum((out * cotangent).astype(jnp.float32)), (out, counts)
-
             with jax.set_mesh(mesh):
                 grad_fn = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2, 3), has_aux=True))
                 # Which kernels run: without this, the bitwise comparison passes trivially.
                 jaxpr = str(jax.make_jaxpr(grad_fn)(*args))
-                kernels = {name for name in ("grug_gather_rows", "grug_gather_sum") if name in jaxpr}
+                kernels = {name for name in _GATHER_KERNELS | _ROUTING_KERNELS if name in jaxpr}
                 (_, (out, counts)), grads = grad_fn(*args)
             return kernels, out, counts, grads
 
@@ -330,11 +349,42 @@ def test_ring_filtered_on_amd_instinct_matches_xla_bitwise(hidden, dtype, uses_p
         kernels, out, counts, grads = run(amd_instinct=True)
         assert xla_kernels == set()
         # The send gather runs grug_gather_rows; the combine and dispatch backward run grug_gather_sum.
-        assert kernels == ({"grug_gather_rows", "grug_gather_sum"} if uses_pallas else set())
+        assert kernels == kernels_on_instinct
         assert int(xla_counts.sender_dropped) > 0 and int(xla_counts.receiver_dropped) > 0
         assert int(counts.sender_dropped) == int(xla_counts.sender_dropped)
         assert int(counts.receiver_dropped) == int(xla_counts.receiver_dropped)
         np.testing.assert_array_equal(_bits(out), _bits(xla_out))
         for a, e in zip(grads, xla_grads, strict=True):
             assert np.any(np.asarray(e, np.float32) != 0)
+            np.testing.assert_array_equal(_bits(a), _bits(e))
+
+
+@pytest.mark.skipif(jax.default_backend() == "tpu", reason="Pallas-Triton kernels need a GPU or CPU")
+@pytest.mark.parametrize("amd_instinct", [False, True], ids=["xla_maps", "pallas_maps"])
+@pytest.mark.multidevice
+def test_ring_filtered_under_save_moe_saves_its_routing_maps_with_the_same_gradients(amd_instinct, monkeypatch):
+    """The save_moe remat policy (save_only_these_names(*MOE_REMAT_SAVE_NAMES)) keeps ring_filtered's integer routing
+    maps for the backward instead of rebuilding them, and the gradients match rebuilding them bit for bit."""
+    monkeypatch.setattr(ep_ring_filtered, "is_amd_instinct", lambda: amd_instinct)
+    with use_test_devices(4) as devices:
+        mesh = _expert_mesh(devices)
+        loss, args = _ring_filtered_loss(hidden=24, dtype=jnp.float32, experts=16, mesh=mesh)
+        without_routing = tuple(name for name in MOE_REMAT_SAVE_NAMES if name != "grug_moe_routing")
+
+        def run(saved_names):
+            remat_loss = jax.checkpoint(loss, policy=jax.checkpoint_policies.save_only_these_names(*saved_names))
+            with jax.set_mesh(mesh):
+                _, vjp_fn, (out, _) = jax.jit(lambda *a: jax.vjp(remat_loss, *a, has_aux=True))(*args)
+                # The vjp closes over exactly what the forward saved for the backward.
+                saved_integer = sum(jnp.issubdtype(x.dtype, jnp.integer) for x in jax.tree.leaves(vjp_fn))
+                grads = jax.jit(vjp_fn)(jnp.float32(1.0))
+            return saved_integer, out, grads
+
+        saved_integer, out, grads = run(MOE_REMAT_SAVE_NAMES)
+        rebuilt_saved_integer, rebuilt_out, rebuilt_grads = run(without_routing)
+        # Both save the routed expert ids, an input; only save_moe also saves the routing maps.
+        assert saved_integer > rebuilt_saved_integer
+        np.testing.assert_array_equal(_bits(out), _bits(rebuilt_out))
+        for a, e in zip(grads, rebuilt_grads, strict=True):
+            assert np.any(np.asarray(e) != 0)
             np.testing.assert_array_equal(_bits(a), _bits(e))
