@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import jax.scipy as jsp
 from haliax.jax_utils import is_amd_instinct, named_call
 from jax import shard_map
+from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 from jax.sharding import reshard
 from jaxtyping import Array, Bool, Float, Int
@@ -447,6 +448,12 @@ class QBRoutedMoE(eqx.Module):
         return routed, router_stats
 
 
+# Checkpoint name of the concatenated expert gate|up weights [E, D, 2I] that MoEExpertMlp feeds the up projection. A
+# remat policy that saves it keeps the backward's rerun of the block from concatenating them again (one stacked copy
+# of the expert gate|up weights per layer scan stays live instead).
+MOE_W13_REMAT_SAVE_NAME = "grug_moe_w13"
+
+
 class MoEExpertMlp(eqx.Module):
     """Expert MLP weights for routed MoE calls."""
 
@@ -514,7 +521,7 @@ class MoEExpertMlp(eqx.Module):
         grad_acc: ExpertGradAccumulator | None = None,
     ) -> Any:
         """``moe_mlp`` with these weights; with ``grad_acc`` it returns ``(result, grad_acc)``."""
-        w_gate_up = jnp.concatenate([self.w_gate, self.w_up], axis=-1)
+        w_gate_up = checkpoint_name(jnp.concatenate([self.w_gate, self.w_up], axis=-1), MOE_W13_REMAT_SAVE_NAME)
         return moe_mlp(
             x,
             selected_experts,
@@ -864,6 +871,7 @@ __all__ = [
     "MOE_RECEIVER_DROPPED_ASSIGNMENTS_METRIC",
     "MOE_SKIPPED_PADDING_ASSIGNMENTS_METRIC",
     "MOE_VALID_ASSIGNMENTS_METRIC",
+    "MOE_W13_REMAT_SAVE_NAME",
     "MoeDispatchCounts",
     "MoeActivation",
     "MoEExpertMlp",
