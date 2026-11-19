@@ -62,9 +62,15 @@ _interleave_halves.defvjp(_interleave_halves_fwd, _interleave_halves_bwd)
 def order_after(value, deps):
     """``value``, available only once ``deps`` are computed: a forward-only scheduling dependency.
 
-    Both go through one ``optimization_barrier``, so XLA can neither start ``value``'s users before ``deps`` exist nor
+    Both go through an ``optimization_barrier``, so XLA can neither start ``value``'s users before ``deps`` exist nor
     merge work across it. The backward passes ``value``'s cotangent through and gives ``deps`` none: unlike a plain
-    barrier, whose transpose would tie the cotangents together, it adds nothing to the backward. Fork overlay."""
+    barrier, whose transpose would tie the cotangents together, it adds nothing to the backward. Fork overlay.
+
+    There are two barriers on the same ``deps``. XLA's algebraic simplifier drops a barrier operand whose barrier output
+    is unused and that has no other user (``HandleOptimizationBarrier``). That is the case for ``deps`` passed into a
+    ``shard_map``: XLA's GPU pipeline simplifies the shard_map body before inlining it, and one barrier would lose the
+    dependency there. The second barrier gives ``deps`` a second user, so neither loses it."""
+    value = jax.lax.optimization_barrier((value, deps))[0]
     return jax.lax.optimization_barrier((value, deps))[0]
 
 
