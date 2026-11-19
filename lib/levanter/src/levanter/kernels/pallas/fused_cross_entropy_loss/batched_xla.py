@@ -198,6 +198,23 @@ def _validate_launch_feasibility(
         )
 
 
+def _online_max_sum_exp(a: tuple[jax.Array, jax.Array], b: tuple[jax.Array, jax.Array]):
+    """Combine two (running max, sum of exp(x - max)) pairs. A pair whose max is -inf holds no elements."""
+    (m_a, l_a), (m_b, l_b) = a, b
+    m = jnp.maximum(m_a, m_b)
+    shift = jnp.where(m == -jnp.inf, 0.0, m)
+    return m, l_a * jnp.exp(m_a - shift) + l_b * jnp.exp(m_b - shift)
+
+
+def _row_max_and_sum_exp(logits: Float[Array, "BB V"]) -> tuple[Float[Array, "BB"], Float[Array, "BB"]]:
+    """Per row: the max and sum(exp(logits - max)), in one pass over ``logits`` (a variadic online reduction).
+
+    Masked entries are -inf and add nothing; a row of only -inf gives (-inf, 0). Two separate reductions (the max,
+    then the sum of exponentials) would read the float32 logits tile twice."""
+    init = (jnp.array(-jnp.inf, logits.dtype), jnp.array(0.0, logits.dtype))
+    return jax.lax.reduce((logits, jnp.ones_like(logits)), init, _online_max_sum_exp, (1,))
+
+
 @partial(
     jax.jit,
     static_argnames=[
@@ -271,9 +288,7 @@ def _linear_softmax_cross_entropy_loss_batched_xla_fa_style_streaming(
                 best_logits = jnp.where(better, block_best_logits, best_logits)
                 best_ids = jnp.where(better, block_best_ids, best_ids)
 
-            tile_m = jnp.max(safe_logits, axis=-1)
-            exp_shifted = jnp.where(in_vocab[None, :], jnp.exp(safe_logits - tile_m[:, None]), 0.0)
-            tile_l = jnp.sum(exp_shifted, axis=-1)
+            tile_m, tile_l = _row_max_and_sum_exp(safe_logits)
 
             new_m = jnp.maximum(running_m, tile_m)
             running_l = running_l * jnp.exp(running_m - new_m) + tile_l * jnp.exp(tile_m - new_m)
