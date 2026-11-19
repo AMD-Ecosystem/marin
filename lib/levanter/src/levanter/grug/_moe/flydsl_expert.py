@@ -208,7 +208,7 @@ def _down_scatter(gemm: ExpertGemm, hidden, w2, group_sizes, dst_row, row_scale,
         _rd._check_flydsl_operands(hidden, w2, group_sizes)
         offsets = _rd.flydsl_offsets(group_sizes, hidden.shape[0])
         return _ops(gemm).grouped_gemm_bf16_nn_scatter(
-            hidden, w2, offsets, dst_row, row_scale=row_scale, dst_rows=num_rows
+            hidden, w2, offsets, dst_row, row_scale=row_scale, dst_rows=num_rows, store_c="unscattered"
         )
     y = _rd.ragged_dot(hidden, w2, group_sizes)
     return y, _scatter_reference(jnp.zeros((num_rows, y.shape[1]), y.dtype), y, dst_row, row_scale)
