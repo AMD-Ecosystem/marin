@@ -5,7 +5,8 @@
 
 The AMD counterpart of ``experiments/june_tpu_67b_a2b/moe/synthetic_benchmark.py``: the same presets, synthetic data
 and report, on ``experiments/amd/june_67b_a2b``'s model and training loop. Every step sees fresh uniform-random
-tokens, so the loss cannot fall below ln(vocab_size). No checkpoint is written. It logs the model FLOPs per example up
+tokens, so the loss cannot fall below ln(vocab_size) (``--repeat-batches`` cycles through a small pool of batches
+instead, so the loss can fall, for convergence checks). No checkpoint is written. It logs the model FLOPs per example up
 front and ends with the median step time from step 2 on, tokens/s, model TFLOP/s and MFU, the median wall step
 (the time between consecutive steps' hooks, host work included), then each device's peak memory.
 
@@ -63,6 +64,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_run_arguments(parser)
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument(
+        "--repeat-batches",
+        type=int,
+        default=0,
+        help="Draw the tokens from this many batches' worth of sequences, repeated over the run, so the loss can "
+        "fall (a convergence check); 0 = fresh tokens every step. Either way the run draws from at most 65535 "
+        "distinct sequences.",
+    )
     parser.add_argument("--log-dir", type=Path, default=Path("logs/amd-june-synthetic"))
     parser.add_argument("--run-id", help="Run id under --log-dir (default: size and timestamp).")
     return parser.parse_args(argv)
@@ -72,8 +81,16 @@ def build_run_config(args: argparse.Namespace) -> GrugRunConfig:
     """The benchmark's run: the command line's model and mesh on fresh random tokens, flat Adam, no checkpoints."""
     model, default_mp = build_model(args)
     batch_size = global_batch_size(args)
-    if args.steps * batch_size >= 2**16:
-        raise ValueError(f"{args.steps} batches of {batch_size} sequences exceed the mixture block limit of 65535")
+    # By default one fresh example per sequence, and a mixture block exactly as long as the dataset so nothing
+    # repeats (MixtureDataset caps the block at 2^16 sequences, so at most 65535 / batch steps). With
+    # --repeat-batches N the dataset holds only N batches' worth of sequences and the mixture's restart strategy
+    # cycles through them, so the model can memorize them and the loss falls below ln(vocab_size).
+    distinct = args.steps if args.repeat_batches == 0 else min(args.repeat_batches, args.steps)
+    if distinct * batch_size >= 2**16:
+        raise ValueError(
+            f"{distinct} batches of {batch_size} sequences exceed the mixture block limit of 65535 sequences; lower "
+            "--steps or --repeat-batches"
+        )
     run_id = shared_run_id(args, "amd-june")
     trainer = build_trainer(
         args,
@@ -84,8 +101,7 @@ def build_run_config(args: argparse.Namespace) -> GrugRunConfig:
         tracker=JsonLoggerConfig(),
         checkpointer=CheckpointerConfig(base_path=str(args.log_dir / run_id / "checkpoints")),
     )
-    # One fresh example per sequence, and a mixture block exactly as long as the dataset so nothing repeats.
-    examples = synthetic_examples(args.steps * batch_size, model.max_seq_len, model.vocab_size, TRAIN_SEED)
+    examples = synthetic_examples(distinct * batch_size, model.max_seq_len, model.vocab_size, TRAIN_SEED)
     datasets = {"train": ListAsyncDataset(examples)}
     held_out = step_eval_sequences(args, batch_size)
     if held_out:
