@@ -38,6 +38,7 @@ from levanter.grug._moe.common import (
     _CHECKPOINT_ROUTING,
     _scaled_capacity,
     CapacityDrops,
+    order_after,
 )
 from levanter.grug._moe import flydsl_expert
 from levanter.grug._moe.ep_common import _assignment_sources, _combine_gather_sum_impl
@@ -264,6 +265,7 @@ def _moe_mlp_ep_ring_filtered_local(
     token_sharding_axes: tuple[str, ...],
     reduce_drops: bool = True,
     grad_acc: ExpertGradAccumulator | None = None,
+    dispatch_tie: Any = None,
 ) -> (
     tuple[Float[Array, "Tlocal H"], CapacityDrops]
     | tuple[Float[Array, "Tlocal H"], CapacityDrops, ExpertGradAccumulator]
@@ -283,6 +285,10 @@ def _moe_mlp_ep_ring_filtered_local(
 
     With ``grad_acc`` (this shard's block of an ``ExpertGradAccumulator``, layer set) the expert matmuls fold their
     weight gradients into it and it comes back as a third output; it needs the FlyDSL expert kernels.
+
+    With ``dispatch_tie`` (this shard's rows of other work, e.g. the shared expert's activations) the expert matmuls
+    wait for it as well as for the dispatch ``all_to_all`` (``order_after``), so XLA schedules that work while the
+    dispatch is in flight. Forward only; the values do not change. Fork overlay.
     """
     tokens, topk = selected_experts_local.shape
     hidden_dim = x_local.shape[1]
@@ -352,6 +358,9 @@ def _moe_mlp_ep_ring_filtered_local(
         received_x = jax.lax.all_to_all(
             send_x.reshape(ep_size, pair_capacity, hidden_dim), "expert", split_axis=0, concat_axis=0, tiled=True
         ).reshape(send_rows, hidden_dim)
+        if dispatch_tie is not None:
+            # Before the remat tag below: the backward loads the tied rows and never recomputes the tie.
+            received_x = order_after(received_x, dispatch_tie)
 
     with jax.named_scope("expert_dispatch"):
         group_valid_assignments = jnp.sum(received_metadata[:, pair_capacity, 0]).astype(jnp.int32)

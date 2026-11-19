@@ -512,6 +512,7 @@ class MoEExpertMlp(eqx.Module):
         report_capacity_overflow: bool = False,
         local_capacity_drops: bool = False,
         grad_acc: ExpertGradAccumulator | None = None,
+        dispatch_tie: Any = None,
     ) -> Any:
         """``moe_mlp`` with these weights; with ``grad_acc`` it returns ``(result, grad_acc)``."""
         w_gate_up = jnp.concatenate([self.w_gate, self.w_up], axis=-1)
@@ -532,6 +533,7 @@ class MoEExpertMlp(eqx.Module):
             expert_chunks=self.expert_chunks,
             num_expert_waves=self.num_expert_waves,
             grad_acc=grad_acc,
+            dispatch_tie=dispatch_tie,
         )
 
 
@@ -554,6 +556,7 @@ def moe_mlp(
     expert_chunks: int = 1,
     num_expert_waves: int = 1,
     grad_acc: ExpertGradAccumulator | None = None,
+    dispatch_tie: Any = None,
 ) -> Any:
     """Functional routed MoE MLP core used by Grug modules and benchmarks.
 
@@ -599,6 +602,10 @@ def moe_mlp(
     Fork overlay: `grad_acc` (an `ExpertGradAccumulator` with its layer set) folds the expert weight gradients into
     float32 sums inside the FlyDSL weight-gradient kernel (`ring_filtered` on an expert axis of two or more, with
     `RAGGED_DOT_IMPL=flydsl`); the call then returns `(result, grad_acc)`, `result` being what it returns without it.
+
+    Fork overlay: `dispatch_tie` (a pytree of [T, ...] arrays, token-sharded like `x`) makes the expert matmuls wait for
+    it as well as for the dispatch `all_to_all` (`ring_filtered` on an expert axis of two or more), so XLA schedules
+    the work that produces it while the dispatch is in flight. It changes no value and no gradient.
     """
     resolved_implementation = resolve_moe_implementation(implementation)
     if local_capacity_drops and not report_capacity_overflow:
@@ -615,6 +622,13 @@ def moe_mlp(
             raise NotImplementedError(
                 f"grad_acc needs ring_filtered on an expert axis of size two or more, got {resolved_implementation!r}"
             )
+    if dispatch_tie is not None and (
+        resolved_implementation != "ring_filtered"
+        or not (_mesh_has_axis(mesh, "expert") and _mesh_axis_size(mesh, "expert") > 1)
+    ):
+        raise NotImplementedError(
+            f"dispatch_tie needs ring_filtered on an expert axis of size two or more, got {resolved_implementation!r}"
+        )
 
     if isinstance(activation, ActivationFunctionEnum):
         activation_fn: Callable[[jax.Array], jax.Array] = activation.to_jax_fn()
@@ -722,10 +736,13 @@ def moe_mlp(
                 transport_capacity_factor=pooled_transport_capacity_factor,
                 reduce_drops=not local_capacity_drops,
             )
-            shard_local_fn = ring_filtered_fn
-            if grad_acc is not None:
-                # The accumulator rides last, after the weights, as a keyword of the local function.
-                shard_local_fn = lambda *a, **kw: ring_filtered_fn(*a[:-1], grad_acc=a[-1], **kw)  # noqa: E731
+            # The accumulator and the dispatch tie ride after the weights, as keywords of the local function.
+            extra_names = [n for n, v in (("grad_acc", grad_acc), ("dispatch_tie", dispatch_tie)) if v is not None]
+
+            def shard_local_fn(*a, **kw):
+                extras = dict(zip(extra_names, a[6:], strict=True))
+                return ring_filtered_fn(*a[:6], **extras, **kw)
+
         elif resolved_implementation == "ragged_all_to_all":
             shard_local_fn = _moe_mlp_ep_ragged_a2a_local
         elif resolved_implementation == "fixed_all_to_all":
@@ -764,6 +781,10 @@ def moe_mlp(
                 grad_acc.mode,
             )
             in_specs, out_specs, args = (*in_specs, acc_specs), (*out_specs, acc_specs), (*args, grad_acc)
+        if dispatch_tie is not None:
+            tie_specs = jax.tree.map(lambda a: P(token_spec[0], *(None,) * (a.ndim - 1)), dispatch_tie)
+            dispatch_tie = jax.tree.map(lambda a, spec: _reshard_for_shard_map(a, mesh, spec), dispatch_tie, tie_specs)
+            in_specs, args = (*in_specs, tie_specs), (*args, dispatch_tie)
         shard_fn = shard_map(
             partial(
                 shard_local_fn,
