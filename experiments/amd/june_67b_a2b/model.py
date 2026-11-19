@@ -50,6 +50,7 @@ from levanter.grug.grug_moe import (
     MOE_DROPPED_ASSIGNMENTS_METRIC,
     MOE_REMAT_SAVE_NAMES,
     MOE_SKIPPED_PADDING_ASSIGNMENTS_METRIC,
+    MOE_W13_REMAT_SAVE_NAME,
     MoEExpertMlp,
     moe_router_z_loss_local,
     qb_beta_topk_local,
@@ -110,6 +111,8 @@ GATED_NORM_REMAT_SAVE_NAME = "gated_norm_hidden"
 HEAD_GATE_REMAT_SAVE_NAME = "attn_head_gate"
 REMAT_SAVE_NAMES = (
     *MOE_REMAT_SAVE_NAMES,
+    # The expert gate|up concatenation: the backward's rerun of the block reads it (+1 stacked copy per layer scan).
+    MOE_W13_REMAT_SAVE_NAME,
     ATTENTION_REMAT_SAVE_NAME,
     GATED_NORM_REMAT_SAVE_NAME,
     HEAD_GATE_REMAT_SAVE_NAME,
