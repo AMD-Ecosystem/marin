@@ -264,11 +264,14 @@ def _expert_mesh(devices, shards=4):
     )
 
 
-def _ring_filtered_loss(*, hidden, dtype, experts, mesh, shards=4, tokens_per_shard=16, inter=8, topk=2):
+def _ring_filtered_loss(
+    *, hidden, dtype, experts, mesh, shards=4, tokens_per_shard=16, inter=8, topk=2, side_work=None
+):
     """A ring_filtered value-and-grad problem with sender and receiver drops and uneven padding: the loss of
     (x, combine weights, w_up_gate, w_down) with the drop counts as aux, and those four arguments.
 
-    The inputs come from NumPy so that building them compiles nothing.
+    The inputs come from NumPy so that building them compiles nothing. With ``side_work`` ("plain" or "tied") the
+    loss also adds a term of other work on x, passed to moe_mlp as its ``dispatch_tie`` when "tied".
     """
     tokens = shards * tokens_per_shard
     rng = np.random.default_rng(0)
@@ -293,7 +296,10 @@ def _ring_filtered_loss(*, hidden, dtype, experts, mesh, shards=4, tokens_per_sh
     keep_fraction = np.repeat(0.3 + 0.7 * np.arange(shards) / (shards - 1), tokens_per_shard)
     token_valid = jax.device_put(rng.random(tokens) < keep_fraction, NamedSharding(mesh, P(("data", "expert"))))
 
+    w_side = jnp.asarray(np.random.default_rng(1).standard_normal((hidden, inter), dtype=np.float32).astype(dtype))
+
     def loss(x, cw, w_up_gate, w_down):
+        side = None if side_work is None else jnp.tanh(x @ w_side)
         out, counts = moe_mlp(
             x,
             selected,
@@ -307,8 +313,12 @@ def _ring_filtered_loss(*, hidden, dtype, experts, mesh, shards=4, tokens_per_sh
             capacity_factor=0.3,
             pooled_transport_capacity_factor=0.5,
             report_capacity_overflow=True,
+            dispatch_tie=side if side_work == "tied" else None,
         )
-        return jnp.sum((out * cotangent).astype(jnp.float32)), (out, counts)
+        value = jnp.sum((out * cotangent).astype(jnp.float32))
+        if side is not None:
+            value += jnp.sum(jnp.square(side).astype(jnp.float32))
+        return value, (out, counts)
 
     return loss, args
 
@@ -392,3 +402,42 @@ def test_ring_filtered_under_save_moe_saves_its_routing_maps_with_the_same_gradi
         for a, e in zip(grads, rebuilt_grads, strict=True):
             assert np.any(np.asarray(e) != 0)
             np.testing.assert_array_equal(_bits(a), _bits(e))
+
+
+@pytest.mark.multidevice
+def test_ring_filtered_dispatch_tie_changes_no_value_or_gradient():
+    """A ``dispatch_tie`` only orders work: the outputs and every gradient, through the tied work's too, are those of
+    the call without it, bit for bit, under the save_moe remat policy."""
+    with use_test_devices(4) as devices:
+        mesh = _expert_mesh(devices)
+
+        def run(side_work):
+            loss, args = _ring_filtered_loss(hidden=16, dtype=jnp.float32, experts=16, mesh=mesh, side_work=side_work)
+            remat = jax.checkpoint(loss, policy=jax.checkpoint_policies.save_only_these_names(*MOE_REMAT_SAVE_NAMES))
+            with jax.set_mesh(mesh):
+                (_, (out, _)), grads = jax.jit(jax.value_and_grad(remat, argnums=(0, 1, 2, 3), has_aux=True))(*args)
+            return out, grads
+
+        out, grads = run("tied")
+        want_out, want_grads = run("plain")
+        np.testing.assert_array_equal(_bits(out), _bits(want_out))
+        for a, e in zip(grads, want_grads, strict=True):
+            np.testing.assert_array_equal(_bits(a), _bits(e))
+
+
+@pytest.mark.multidevice
+def test_dispatch_tie_needs_ring_filtered():
+    with use_test_devices(4) as devices:
+        mesh = _expert_mesh(devices)
+        x = jnp.zeros((8, 4))
+        with pytest.raises(NotImplementedError, match="dispatch_tie"):
+            moe_mlp(
+                x,
+                jnp.zeros((8, 2), jnp.int32),
+                jnp.zeros((8, 2)),
+                jnp.zeros((4, 4, 6)),
+                jnp.zeros((4, 3, 4)),
+                implementation="ring",
+                mesh=mesh,
+                dispatch_tie=x,
+            )

@@ -58,6 +58,27 @@ def _interleave_halves_bwd(_, ct):
 _interleave_halves.defvjp(_interleave_halves_fwd, _interleave_halves_bwd)
 
 
+@jax.custom_vjp
+def order_after(value, deps):
+    """``value``, available only once ``deps`` are computed: a forward-only scheduling dependency.
+
+    Both go through one ``optimization_barrier``, so XLA can neither start ``value``'s users before ``deps`` exist nor
+    merge work across it. The backward passes ``value``'s cotangent through and gives ``deps`` none: unlike a plain
+    barrier, whose transpose would tie the cotangents together, it adds nothing to the backward. Fork overlay."""
+    return jax.lax.optimization_barrier((value, deps))[0]
+
+
+def _order_after_fwd(value, deps):
+    return order_after(value, deps), None
+
+
+def _order_after_bwd(_, ct):
+    return ct, None
+
+
+order_after.defvjp(_order_after_fwd, _order_after_bwd)
+
+
 def _interleave_gate_up(moe_w13: jax.Array, moe_dim: int) -> jax.Array:
     """grug w13 [E,H,2I] gate=[:I], up=[I:] -> interleaved [g0,u0,g1,u1,...] (QuACK layout)."""
     # The split's width check matters here: the packed path would broadcast mismatched halves
