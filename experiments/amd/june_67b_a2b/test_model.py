@@ -126,3 +126,43 @@ def test_amd_model_rejects_june_configs_it_does_not_implement(change):
     # The copy shares June's GrugModelConfig, so a field it silently ignored would break that contract: it must raise.
     with pytest.raises(ValueError):
         amd.Transformer.init(dataclasses.replace(CONFIG, **change), key=jax.random.key(0))
+
+
+def _reduced_types(all_reduces: list[str]) -> list[str]:
+    """Every array type the all-reduces reduce, sorted, however XLA combined them."""
+    return sorted(t.strip() for types in all_reduces for t in types.strip("()").split(", "))
+
+
+@pytest.mark.timeout(240)
+@pytest.mark.parametrize("mode", [amd.SharedUnderDispatch.GATE, amd.SharedUnderDispatch.GATE_UP])
+def test_shared_expert_under_the_dispatch_trains_like_the_default(mode, monkeypatch):
+    # The modes only move the shared expert's GEMMs: same parameter tree, loss, routing and gradients as mode off.
+    with use_test_devices(4), jax.set_mesh(compact_grug_mesh(expert_axis_size=2)):
+        tokens = jax.random.randint(jax.random.key(1), (BATCH, CONFIG.max_seq_len), 0, CONFIG.vocab_size)
+        loss_weight = jnp.ones(tokens.shape).at[:, -1].set(0)
+        mask = AttentionMask(is_causal=True)
+        model = jax.jit(amd.Transformer.init, static_argnums=0)(CONFIG, key=jax.random.key(0))
+        monkeypatch.delenv(amd.SHARED_UNDER_DISPATCH_ENV, raising=False)
+        want_loss, want_metrics, want_grads, want_all_reduces = _loss_and_grads(model, tokens, loss_weight, mask)
+        monkeypatch.setenv(amd.SHARED_UNDER_DISPATCH_ENV, mode)
+        loss, metrics, grads, all_reduces = _loss_and_grads(model, tokens, loss_weight, mask)
+
+    np.testing.assert_allclose(loss, want_loss, rtol=1e-5)
+    np.testing.assert_allclose(metrics["qb_beta_per_layer"], want_metrics["qb_beta_per_layer"], rtol=1e-5, atol=1e-6)
+    for key in (amd.MOE_DROPPED_ASSIGNMENTS_METRIC, amd.MOE_SKIPPED_PADDING_ASSIGNMENTS_METRIC):
+        np.testing.assert_array_equal(metrics[key], want_metrics[key])
+    # No new cross-device reduction: the shared weights' gradients still wait for the one after the layer scan. (XLA
+    # may combine the same reductions in another order.)
+    assert _reduced_types(all_reduces) == _reduced_types(want_all_reduces)
+    grad_leaves = jax.tree_util.tree_flatten_with_path(grads)[0]
+    want_leaves = jax.tree_util.tree_flatten_with_path(want_grads)[0]
+    assert [jax.tree_util.keystr(p) for p, _ in grad_leaves] == [jax.tree_util.keystr(p) for p, _ in want_leaves]
+    for (path, g), (_, want) in zip(grad_leaves, want_leaves, strict=True):
+        g, want = np.asarray(g, np.float64), np.asarray(want, np.float64)
+        assert np.linalg.norm(g - want) <= 1e-5 * max(np.linalg.norm(want), 1e-30), jax.tree_util.keystr(path)
+
+
+def test_shared_under_dispatch_rejects_unknown_modes(monkeypatch):
+    monkeypatch.setenv(amd.SHARED_UNDER_DISPATCH_ENV, "gate+up")
+    with pytest.raises(ValueError):
+        amd.shared_under_dispatch()

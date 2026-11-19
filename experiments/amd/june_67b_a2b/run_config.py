@@ -31,7 +31,7 @@ from levanter.tracker import TrackerConfig
 from levanter.trainer import TrainerConfig
 from levanter.utils.jax_utils import multihost_broadcast_sync
 
-from experiments.amd.june_67b_a2b.model import MOE_IMPLEMENTATION
+from experiments.amd.june_67b_a2b.model import MOE_IMPLEMENTATION, shared_under_dispatch
 from experiments.amd.june_67b_a2b.train import GrugTrainerConfig, eval_runs_at
 from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig
 from experiments.june_tpu_67b_a2b.moe.synthetic_benchmark import snowball_model
@@ -269,7 +269,7 @@ def log_run_config(
         "size=%s layers=%d hidden=%d experts=%d topk=%d heads=%d kv=%d batch=%d microbatches=%d zero1=%s "
         "seq_len=%d window=%d mp=%s "
         "expert_axis=%d replica_axis=%d attention=%s moe=%s expert_kernels=%s expert_grad_sums=%s "
-        "capacity=%s pooled_capacity=%s "
+        "capacity=%s pooled_capacity=%s shared_under_dispatch=%s "
         "watch_interval=%d eval_every=%d eval_microbatches=%d flops_per_example=%.4e",
         args.size,
         model.num_layers,
@@ -298,6 +298,8 @@ def log_run_config(
         ),
         model.capacity_factor,
         model.pooled_transport_capacity_factor,
+        # Fork overlay: MARIN_SHARED_UNDER_DISPATCH.
+        shared_under_dispatch(),
         args.watch_interval,
         args.eval_every,
         args.eval_microbatches,

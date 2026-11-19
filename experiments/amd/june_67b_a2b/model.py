@@ -20,12 +20,16 @@ Same architecture, parameters and checkpoint layout as ``experiments/june_tpu_67
 - the small replicated block weights' gradients are reduced once after the layer scan, and the scan routes the
   trainer's microbatch reductions and ZeRO-1 gathers (``parallel.LayerRouting``);
 - fork overlay: the scan can hand the expert weights' gradient sums to the MoE's FlyDSL weight-gradient kernels
-  (``LayerRouting.expert_acc``).
+  (``LayerRouting.expert_acc``);
+- fork overlay: ``MARIN_SHARED_UNDER_DISPATCH`` can move the shared expert's gate/up GEMMs under the MoE's dispatch
+  ``all_to_all`` (``SharedUnderDispatch``).
 
 ``Transformer.init`` raises for config values this copy does not implement.
 """
 
+import enum
 import functools
+import os
 from typing import NamedTuple
 
 import equinox as eqx
@@ -38,7 +42,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 from jax.sharding import get_abstract_mesh, reshard
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
-from levanter.grug._moe.common import MoeDispatchCounts
+from levanter.grug._moe.common import MoeDispatchCounts, order_after
 from levanter.grug._moe.grad_accum import ExpertGradAccumulator
 from levanter.grug._moe.routing_top_k import routing_top_k
 from levanter.grug.attention import AttentionMask, align_kv_heads, attention, token_validity_from_attention_mask
@@ -89,6 +93,7 @@ from experiments.june_tpu_67b_a2b.moe.model import (
     GatedNorm,
     GrugModelConfig,
     RMSNorm,
+    _batch_reshard,
     _batch_spec,
     _init_weight,
     _long_layer_schedule,
@@ -115,6 +120,28 @@ _QK_NORM_EPS = 1e-6
 _ROUTING_RENORM_SUM = 2.5
 # float32 holds every integer up to 2**24 exactly.
 _FLOAT32_EXACT_INTEGERS = 2**24
+SHARED_UNDER_DISPATCH_ENV = "MARIN_SHARED_UNDER_DISPATCH"
+
+
+class SharedUnderDispatch(enum.StrEnum):
+    """Where the shared expert's GEMMs run relative to the MoE's dispatch ``all_to_all`` (fork overlay).
+
+    ``off``: ``Block`` calls ``DenseMLP``, and XLA's dot merger joins its gate GEMM with the router GEMM (they read the
+    same input), so the gate runs before the routing top-k, on the routing's critical path. ``gate`` and ``gate_up``:
+    ``MoEMLP`` computes the shared expert itself, after the top-k (``order_after`` on the shared weights, which also
+    keeps the router a GEMM of its own), and the expert matmuls wait for its gate (``gate``) or its gate, up and SwiGLU
+    (``gate_up``) besides the dispatch, so XLA runs them while the dispatch is in flight. The down GEMM stays in the
+    combine's window. Same parameters and math; the separate router and gate GEMMs can round differently in bfloat16.
+    """
+
+    OFF = "off"
+    GATE = "gate"
+    GATE_UP = "gate_up"
+
+
+def shared_under_dispatch() -> SharedUnderDispatch:
+    """The mode from ``MARIN_SHARED_UNDER_DISPATCH`` (unset or empty: ``off``), read at trace time."""
+    return SharedUnderDispatch(os.environ.get(SHARED_UNDER_DISPATCH_ENV) or SharedUnderDispatch.OFF)
 
 
 def check_supported(cfg: GrugModelConfig) -> None:
@@ -374,10 +401,18 @@ class MoEMLP(eqx.Module):
 
     @named_call
     def __call__(
-        self, x: Float[Array, "B S D"], token_valid: Bool[Array, "B S"], grad_acc: ExpertGradAccumulator | None = None
+        self,
+        x: Float[Array, "B S D"],
+        token_valid: Bool[Array, "B S"],
+        grad_acc: ExpertGradAccumulator | None = None,
+        shared: DenseMLP | None = None,
+        shared_mode: SharedUnderDispatch = SharedUnderDispatch.OFF,
     ):
         """The routed output and this layer's per-shard routing statistics (see ``reduce_moe_routing_stats``), and with
-        ``grad_acc`` (the expert gradient sums, ``moe_mlp``) the accumulator as a third output."""
+        ``grad_acc`` (the expert gradient sums, ``moe_mlp``) the accumulator as a third output. With ``shared`` (modes
+        ``gate`` and ``gate_up`` of ``SharedUnderDispatch``) the output includes the shared expert's."""
+        if (shared is None) != (shared_mode == SharedUnderDispatch.OFF):
+            raise ValueError(f"shared goes with shared_mode gate or gate_up, got {shared_mode!r}")
         cfg = self.cfg
         k = cfg.num_experts_per_token
         mesh = get_abstract_mesh()
@@ -398,6 +433,16 @@ class MoEMLP(eqx.Module):
             combine_weights = jax.lax.optimization_barrier(combine_weights)
             combine_weights *= _ROUTING_RENORM_SUM / (jnp.sum(combine_weights, axis=-1, keepdims=True) + 1e-9)
             combine_weights = combine_weights.astype(x.dtype)
+
+        dispatch_tie = None
+        if shared is not None:
+            with jax.named_scope("shared_expert"):
+                # After the top-k: neither shared GEMM can merge with the router GEMM or run ahead of the routing.
+                w_gate, w_up = order_after((shared.w_gate, shared.w_up), selected_experts)
+                gate = jnp.einsum("td,dm->tm", x_flat, w_gate)
+                up = jnp.einsum("td,dm->tm", x_flat, w_up)
+                shared_hidden = ActivationFunctionEnum.silu.to_jax_fn()(gate) * up
+                dispatch_tie = gate if shared_mode == SharedUnderDispatch.GATE else shared_hidden
 
         stats: dict[str, jax.Array] = {}
         if cfg.router_z_loss_coef != 0:
@@ -426,6 +471,7 @@ class MoEMLP(eqx.Module):
                 report_capacity_overflow=True,
                 local_capacity_drops=True,
                 grad_acc=grad_acc,
+                dispatch_tie=dispatch_tie,
             )
             if grad_acc is not None:
                 result, grad_acc = result
@@ -438,6 +484,11 @@ class MoEMLP(eqx.Module):
         stats["routing_receiver_drops_local"] = counts.receiver_dropped.astype(drops_dtype)
         stats["skipped_assignments"] = counts.padding_skipped.astype(jnp.float32)
         routed = reshard(rearrange(routed_flat, "(b s) d -> b s d", b=b, s=s), _batch_spec())
+        if shared is not None:
+            # DenseMLP's down projection and reshard; the tie above holds back the expert matmuls, not this GEMM.
+            with jax.named_scope("shared_expert"):
+                shared_flat = jnp.einsum("tm,md->td", shared_hidden, shared.w_down, out_sharding=_batch_spec())
+                routed = routed + _batch_reshard(rearrange(shared_flat, "(b s) d -> b s d", b=b, s=s))
         if grad_acc is not None:
             return routed, stats, grad_acc
         return routed, stats
@@ -493,9 +544,13 @@ class Block(eqx.Module):
         )
         x, mlp_in = fused_norm_and_gate(x, attn_out, self.rms_mlp, self.mlp_gated_norm, return_h=True)
         token_valid = token_validity_from_attention_mask(short_mask, batch_size=x.shape[0], sequence_length=x.shape[1])
-        mlp_out, router_stats, *acc_out = self.mlp(mlp_in, token_valid, grad_acc)
-        if self.shared is not None:
-            mlp_out = mlp_out + self.shared(mlp_in, activation=ActivationFunctionEnum.silu)
+        shared_mode = shared_under_dispatch() if self.shared is not None else SharedUnderDispatch.OFF
+        if shared_mode == SharedUnderDispatch.OFF:
+            mlp_out, router_stats, *acc_out = self.mlp(mlp_in, token_valid, grad_acc)
+            if self.shared is not None:
+                mlp_out = mlp_out + self.shared(mlp_in, activation=ActivationFunctionEnum.silu)
+        else:
+            mlp_out, router_stats, *acc_out = self.mlp(mlp_in, token_valid, grad_acc, self.shared, shared_mode)
         return x + mlp_out, router_stats, *acc_out
 
 
