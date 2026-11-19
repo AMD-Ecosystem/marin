@@ -41,7 +41,7 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 from levanter.grug._moe.common import MoeDispatchCounts
 from levanter.grug._moe.grad_accum import ExpertGradAccumulator
 from levanter.grug._moe.routing_top_k import routing_top_k
-from levanter.grug.attention import AttentionMask, align_kv_heads, attention, token_validity_from_attention_mask
+from levanter.grug.attention import AttentionMask, attention, token_validity_from_attention_mask
 from levanter.grug.grug_moe import (
     MOE_DROPPED_ASSIGNMENTS_METRIC,
     MOE_REMAT_SAVE_NAMES,
@@ -205,14 +205,21 @@ class CausalSelfAttention(eqx.Module):
         k = _qk_head_norm(k, positions, cfg=cfg, rope=rope, scales=())
         attn_out = attention(q, k, v, mask, implementation=cfg.attention_implementation)
         attn_out = reshard(attn_out, head_spec)
-        aligned_v = reshard(align_kv_heads(v, num_q_heads=attn_out.shape[2]), head_spec)
-        # Exclusive Self Attention: subtract the component of y_i parallel to v_i, per head.
-        dot = jnp.sum(attn_out * aligned_v, axis=-1, keepdims=True)
-        v_norm_sq = jnp.sum(aligned_v * aligned_v, axis=-1, keepdims=True)
-        attn_out = attn_out - (dot / (v_norm_sq + 1e-6)) * aligned_v
+        # Exclusive Self Attention: subtract the component of y_i parallel to v_i, per head. Computed on the grouped
+        # view [B, S, kv heads, q heads per kv head, D] against v broadcast over the group, so the v of each query
+        # head (align_kv_heads) is never materialized and |v|^2 is taken once per kv head; same values per head.
+        num_kv_heads = v.shape[2]
+        group = attn_out.shape[2] // num_kv_heads
+        grouped_spec = P(_BATCH_AXES, None, "model", None, None)
+        attn_out = attn_out.reshape((batch, seq_len, num_kv_heads, group, head_dim), out_sharding=grouped_spec)
+        v_grouped = v[:, :, :, None, :]
+        dot = jnp.sum(attn_out * v_grouped, axis=-1, keepdims=True)
+        v_norm_sq = jnp.sum(v * v, axis=-1, keepdims=True)[:, :, :, None, :]
+        attn_out = attn_out - (dot / (v_norm_sq + 1e-6)) * v_grouped
         # Headwise gating: 2 * sigmoid(x @ attn_gate), one scalar per head.
         gate_logits = checkpoint_name(jnp.einsum("bsd,dn->bsn", x, self.attn_gate), HEAD_GATE_REMAT_SAVE_NAME)
-        attn_out = 2 * jax.nn.sigmoid(gate_logits)[..., None] * attn_out
+        gate = 2 * jax.nn.sigmoid(gate_logits).reshape((batch, seq_len, num_kv_heads, group, 1))
+        attn_out = gate * attn_out
         attn_out = attn_out.reshape((batch, seq_len, -1), out_sharding=P(_BATCH_AXES, None, "model"))
         return jnp.einsum("bsh,hd->bsd", attn_out, self.w_o, out_sharding=_batch_spec())
 
