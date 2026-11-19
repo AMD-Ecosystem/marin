@@ -1095,6 +1095,40 @@ def test_batched_xla_full_vocab_b_tiled_forward_matches_reference():
     np.testing.assert_allclose(actual_lse, expected_lse, rtol=1e-5, atol=1e-5)
 
 
+def test_batched_xla_streaming_forward_matches_reference():
+    """The FA-style streaming forward (one online max/sum-exp reduction per vocab tile) against the dense reference,
+    with a vocab tail past the last real column and an ignored row."""
+    if jax.default_backend() == "tpu":
+        pytest.skip("batched_xla streaming forward is covered by CPU/GPU precision paths")
+
+    key_x, key_w, key_y = jax.random.split(jax.random.PRNGKey(43), 3)
+    x = jax.random.normal(key_x, (8, 16), dtype=jnp.float32)
+    w = 3.0 * jax.random.normal(key_w, (16, 40), dtype=jnp.float32)
+    y = jax.random.randint(key_y, (8,), 0, 40, dtype=jnp.int32).at[5].set(-1)
+    v_block = 16
+    w_pad = jnp.pad(w, ((0, 0), (0, 48 - 40)))
+
+    expected_loss, expected_lse = linear_softmax_cross_entropy_loss_reference(x, y, w, dtype=jnp.float32)
+    loss, lse = batched_xla._linear_softmax_cross_entropy_loss_batched_xla_fa_style_streaming(
+        x,
+        y,
+        w_pad,
+        b_block_size=4,
+        v_dim=40,
+        h_block_size=16,
+        num_b_blocks=2,
+        num_v_blocks=3,
+        num_h_blocks=1,
+        v_block_size=v_block,
+        logit_soft_cap=None,
+        precision=jax.lax.Precision.HIGHEST,
+    )
+    valid = np.asarray(y) >= 0
+    np.testing.assert_allclose(np.asarray(loss).reshape(-1)[valid], np.asarray(expected_loss)[valid], rtol=1e-5)
+    np.testing.assert_allclose(np.asarray(lse).reshape(-1)[valid], np.asarray(expected_lse)[valid], rtol=1e-5)
+    np.testing.assert_array_equal(np.asarray(loss).reshape(-1)[~valid], 0.0)
+
+
 def test_batched_xla_backward_b_tiled_from_lse_matches_reference_gradients():
     """Gradient algebra of the b-tiled backward, against autodiff through the dense reference.
 
