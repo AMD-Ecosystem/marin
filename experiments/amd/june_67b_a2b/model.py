@@ -22,7 +22,9 @@ Same architecture, parameters and checkpoint layout as ``experiments/june_tpu_67
 - fork overlay: the scan can hand the expert weights' gradient sums to the MoE's FlyDSL weight-gradient kernels
   (``LayerRouting.expert_acc``);
 - fork overlay: ``MARIN_SHARED_UNDER_DISPATCH`` can move the shared expert's gate/up GEMMs under the MoE's dispatch
-  ``all_to_all`` (``SharedUnderDispatch``).
+  ``all_to_all`` (``SharedUnderDispatch``);
+- fork overlay: ``MARIN_FP8_DISPATCH`` can send the MoE dispatch's token rows as fp8 with a bf16 backward
+  (``Fp8DispatchMode``; lossy prototype).
 
 ``Transformer.init`` raises for config values this copy does not implement.
 """
@@ -121,6 +123,7 @@ _ROUTING_RENORM_SUM = 2.5
 # float32 holds every integer up to 2**24 exactly.
 _FLOAT32_EXACT_INTEGERS = 2**24
 SHARED_UNDER_DISPATCH_ENV = "MARIN_SHARED_UNDER_DISPATCH"
+FP8_DISPATCH_ENV = "MARIN_FP8_DISPATCH"
 
 
 class SharedUnderDispatch(enum.StrEnum):
@@ -142,6 +145,25 @@ class SharedUnderDispatch(enum.StrEnum):
 def shared_under_dispatch() -> SharedUnderDispatch:
     """The mode from ``MARIN_SHARED_UNDER_DISPATCH`` (unset or empty: ``off``), read at trace time."""
     return SharedUnderDispatch(os.environ.get(SHARED_UNDER_DISPATCH_ENV) or SharedUnderDispatch.OFF)
+
+
+class Fp8DispatchMode(enum.StrEnum):
+    """How the MoE's dispatch ``all_to_all`` sends the token rows (fork overlay, lossy prototype).
+
+    ``off``: bfloat16. ``unfused``: float8_e4m3fn bits with a float32 scale per row, dequantized on arrival before the
+    expert up projection. ``fused``: the same transport, the up projection dequantizing as it loads its rows (jax-flydsl
+    fp8 A loader; needs ``RAGGED_DOT_IMPL=flydsl``), and the remat policy saving the fp8 rows. ``unfused`` and ``fused``
+    give the same values; the backward stays bfloat16 (straight-through). See ``levanter.grug._moe.fp8_dispatch``.
+    """
+
+    OFF = "off"
+    UNFUSED = "unfused"
+    FUSED = "fused"
+
+
+def fp8_dispatch() -> Fp8DispatchMode:
+    """The mode from ``MARIN_FP8_DISPATCH`` (unset or empty: ``off``), read at trace time."""
+    return Fp8DispatchMode(os.environ.get(FP8_DISPATCH_ENV) or Fp8DispatchMode.OFF)
 
 
 def check_supported(cfg: GrugModelConfig) -> None:
@@ -472,6 +494,7 @@ class MoEMLP(eqx.Module):
                 local_capacity_drops=True,
                 grad_acc=grad_acc,
                 dispatch_tie=dispatch_tie,
+                fp8_dispatch=fp8_dispatch().value,
             )
             if grad_acc is not None:
                 result, grad_acc = result

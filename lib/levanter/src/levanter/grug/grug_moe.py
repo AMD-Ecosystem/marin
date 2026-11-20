@@ -59,6 +59,7 @@ from levanter.grug._moe.ep_ring import (
     _scatter_add_dispatch_combine,
 )
 from levanter.grug._moe.ep_ring_filtered import _moe_mlp_ep_ring_filtered_local
+from levanter.grug._moe.fp8_dispatch import Fp8Dispatch, check_fp8_dispatch
 from levanter.grug._moe.grad_accum import ExpertGradAccumulator
 from levanter.grug._moe.local import _moe_mlp_local
 from levanter.grug._moe.routing_top_k import routing_top_k
@@ -513,6 +514,7 @@ class MoEExpertMlp(eqx.Module):
         local_capacity_drops: bool = False,
         grad_acc: ExpertGradAccumulator | None = None,
         dispatch_tie: Any = None,
+        fp8_dispatch: Fp8Dispatch = "off",
     ) -> Any:
         """``moe_mlp`` with these weights; with ``grad_acc`` it returns ``(result, grad_acc)``."""
         w_gate_up = jnp.concatenate([self.w_gate, self.w_up], axis=-1)
@@ -534,6 +536,7 @@ class MoEExpertMlp(eqx.Module):
             num_expert_waves=self.num_expert_waves,
             grad_acc=grad_acc,
             dispatch_tie=dispatch_tie,
+            fp8_dispatch=fp8_dispatch,
         )
 
 
@@ -557,6 +560,7 @@ def moe_mlp(
     num_expert_waves: int = 1,
     grad_acc: ExpertGradAccumulator | None = None,
     dispatch_tie: Any = None,
+    fp8_dispatch: Fp8Dispatch = "off",
 ) -> Any:
     """Functional routed MoE MLP core used by Grug modules and benchmarks.
 
@@ -606,6 +610,10 @@ def moe_mlp(
     Fork overlay: `dispatch_tie` (a pytree of [T, ...] arrays, token-sharded like `x`) makes the expert matmuls wait for
     it as well as for the dispatch `all_to_all` (`ring_filtered` on an expert axis of two or more), so XLA schedules
     the work that produces it while the dispatch is in flight. It changes no value and no gradient.
+
+    Fork overlay: `fp8_dispatch` ("unfused" or "fused"; `ring_filtered` on an expert axis of two or more) sends the
+    dispatch's token rows as float8_e4m3fn with a float32 scale per row and keeps the backward bfloat16
+    (straight-through). Lossy; see `levanter.grug._moe.fp8_dispatch`.
     """
     resolved_implementation = resolve_moe_implementation(implementation)
     if local_capacity_drops and not report_capacity_overflow:
@@ -628,6 +636,13 @@ def moe_mlp(
     ):
         raise NotImplementedError(
             f"dispatch_tie needs ring_filtered on an expert axis of size two or more, got {resolved_implementation!r}"
+        )
+    if check_fp8_dispatch(fp8_dispatch) != "off" and (
+        resolved_implementation != "ring_filtered"
+        or not (_mesh_has_axis(mesh, "expert") and _mesh_axis_size(mesh, "expert") > 1)
+    ):
+        raise NotImplementedError(
+            f"fp8_dispatch needs ring_filtered on an expert axis of size two or more, got {resolved_implementation!r}"
         )
 
     if isinstance(activation, ActivationFunctionEnum):
@@ -735,6 +750,7 @@ def moe_mlp(
                 _moe_mlp_ep_ring_filtered_local,
                 transport_capacity_factor=pooled_transport_capacity_factor,
                 reduce_drops=not local_capacity_drops,
+                fp8_dispatch=fp8_dispatch,
             )
             # The accumulator and the dispatch tie ride after the weights, as keywords of the local function.
             extra_names = [n for n, v in (("grad_acc", grad_acc), ("dispatch_tie", dispatch_tie)) if v is not None]
