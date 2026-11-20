@@ -10,10 +10,12 @@ Modes (``Fp8Dispatch``):
 - ``unfused``: the sender quantizes its token rows (:func:`quantize_rows`), gathers and sends their bits; the expert
   side dequantizes the received rows (:func:`dequantize_rows`) and runs the bfloat16 expert path on them.
 - ``fused``: the same transport, but the expert up projection reads the fp8 rows and their scales itself (the
-  jax-flydsl fp8 A loader, ``flydsl_expert.dispatch_up_fp8``); the remat policy saves the fp8 rows, not bfloat16 ones.
+  jax-flydsl fp8 kernel, ``flydsl_expert.dispatch_up_fp8``); the remat policy saves the fp8 rows, not bfloat16 ones.
 
-Both modes compute the same bfloat16 rows, ``round(f32(q) * s)``: the fused kernel dequantizes in registers with the
-same operations, so the two modes give the same values and gradients.
+``unfused`` multiplies the bfloat16 rows ``round(f32(q) * s)``. The fused kernel converts ``q`` exactly and multiplies
+its f32 accumulator row by ``s`` before the bfloat16 store, so its forward skips the bfloat16 rounding of ``q * s``: it
+is within about one bfloat16 ulp of ``unfused``, not bitwise equal (bitwise for power-of-two scales). On CPU the fused
+mode's reference path is the unfused math. The backward of both modes is the same bfloat16 straight-through one.
 
 Quantization, per row: ``s = amax * f32(1 / 448)`` in float32 (1 for an all-zero row) and ``q = e4m3fn(clip(x / s, -448,
 448))``, rounded to nearest even. The explicit clip makes the result independent of the conversion's saturation mode.
