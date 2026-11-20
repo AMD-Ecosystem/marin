@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from levanter.grug._moe import flydsl_expert
 from levanter.grug.attention import AttentionMask
 from levanter.grug.sharding import compact_grug_mesh
 from levanter.testing.devices import use_test_devices
@@ -166,3 +167,52 @@ def test_shared_under_dispatch_rejects_unknown_modes(monkeypatch):
     monkeypatch.setenv(amd.SHARED_UNDER_DISPATCH_ENV, "gate+up")
     with pytest.raises(ValueError):
         amd.shared_under_dispatch()
+
+
+def _bits(x) -> np.ndarray:
+    x = np.asarray(x)
+    return x.view({2: np.uint16, 4: np.uint32}[x.dtype.itemsize])
+
+
+@pytest.mark.timeout(400)
+@pytest.mark.parametrize("shared_mode", [amd.SharedUnderDispatch.OFF, amd.SharedUnderDispatch.GATE_UP])
+def test_fp8_dispatch_fused_trains_like_unfused_and_close_to_off(shared_mode, monkeypatch):
+    # The fused fp8 up projection (here its XLA reference form) gives unfused's loss and gradients bit for bit; both
+    # stay close to the bfloat16 dispatch, with the same routing and the same cross-device reductions.
+    monkeypatch.setattr(flydsl_expert, "expert_gemm", lambda: "reference")
+    monkeypatch.setenv(amd.SHARED_UNDER_DISPATCH_ENV, shared_mode)
+    with use_test_devices(4), jax.set_mesh(compact_grug_mesh(expert_axis_size=2)):
+        tokens = jax.random.randint(jax.random.key(1), (BATCH, CONFIG.max_seq_len), 0, CONFIG.vocab_size)
+        loss_weight = jnp.ones(tokens.shape).at[:, -1].set(0)
+        mask = AttentionMask(is_causal=True)
+        model = jax.jit(amd.Transformer.init, static_argnums=0)(CONFIG, key=jax.random.key(0))
+        results = {}
+        for mode in amd.Fp8DispatchMode:
+            monkeypatch.setenv(amd.FP8_DISPATCH_ENV, mode)
+            results[mode] = _loss_and_grads(model, tokens, loss_weight, mask)
+
+    fused, unfused, off = (
+        results[m] for m in (amd.Fp8DispatchMode.FUSED, amd.Fp8DispatchMode.UNFUSED, amd.Fp8DispatchMode.OFF)
+    )
+    np.testing.assert_array_equal(_bits(fused[0]), _bits(unfused[0]))
+    for (path, got), (_, want) in zip(
+        jax.tree_util.tree_flatten_with_path(fused[2])[0],
+        jax.tree_util.tree_flatten_with_path(unfused[2])[0],
+        strict=True,
+    ):
+        np.testing.assert_array_equal(_bits(got), _bits(want), err_msg=jax.tree_util.keystr(path))
+    np.testing.assert_allclose(unfused[0], off[0], rtol=1e-2)
+    assert _reduced_types(unfused[3]) == _reduced_types(off[3])
+    for key in (amd.MOE_DROPPED_ASSIGNMENTS_METRIC, amd.MOE_SKIPPED_PADDING_ASSIGNMENTS_METRIC):
+        np.testing.assert_array_equal(unfused[1][key], off[1][key])
+    for (path, g), (_, want) in zip(
+        jax.tree_util.tree_flatten_with_path(unfused[2])[0], jax.tree_util.tree_flatten_with_path(off[2])[0], strict=True
+    ):
+        g, want = np.asarray(g, np.float64), np.asarray(want, np.float64)
+        assert np.linalg.norm(g - want) <= 0.1 * max(np.linalg.norm(want), 1e-30), jax.tree_util.keystr(path)
+
+
+def test_fp8_dispatch_rejects_unknown_modes(monkeypatch):
+    monkeypatch.setenv(amd.FP8_DISPATCH_ENV, "on")
+    with pytest.raises(ValueError):
+        amd.fp8_dispatch()

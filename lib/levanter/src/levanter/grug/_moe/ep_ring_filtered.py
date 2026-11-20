@@ -22,6 +22,7 @@ of ``flydsl_expert`` instead (gathered A rows, scatter epilogues, and expert wei
 with an ``ExpertGradAccumulator``), with the same values and gradients.
 """
 
+import functools
 import math
 from collections.abc import Callable
 from typing import Any, NamedTuple, cast
@@ -42,6 +43,7 @@ from levanter.grug._moe.common import (
 )
 from levanter.grug._moe import flydsl_expert
 from levanter.grug._moe.ep_common import _assignment_sources, _combine_gather_sum_impl
+from levanter.grug._moe.fp8_dispatch import Fp8Dispatch, check_fp8_dispatch, quantize_rows, straight_through_rows
 from levanter.grug._moe.ep_ring import (
     XLA_ROW_GATHERS,
     RowGathers,
@@ -149,6 +151,51 @@ def _down_project_combine_bwd(residual, cotangent):
 
 
 _down_project_combine.defvjp(_down_project_combine_fwd, _down_project_combine_bwd)
+
+
+@jax.custom_vjp
+def _metadata_all_to_all(
+    metadata: Float[Array, "D C1 K2"], extra: Float[Array, "D C1 X"]
+) -> tuple[Float[Array, "D C1 K2"], Float[Array, "D C1 X"]]:
+    """The dispatch metadata's ``all_to_all`` with ``extra`` columns riding along (the fp8 dispatch's row scales).
+
+    The backward moves only the metadata's cotangent, so the backward ``all_to_all`` keeps the bfloat16 dispatch's
+    shape; ``extra`` gets no gradient."""
+    columns = metadata.shape[2]
+    received = jax.lax.all_to_all(
+        jnp.concatenate([metadata, extra], axis=2), "expert", split_axis=0, concat_axis=0, tiled=True
+    )
+    return received[..., :columns], received[..., columns:]
+
+
+def _metadata_all_to_all_fwd(metadata, extra):
+    return _metadata_all_to_all(metadata, extra), None
+
+
+def _metadata_all_to_all_bwd(_, cotangent):
+    d_metadata, _ = cotangent
+    return jax.lax.all_to_all(d_metadata, "expert", split_axis=0, concat_axis=0, tiled=True), None
+
+
+_metadata_all_to_all.defvjp(_metadata_all_to_all_fwd, _metadata_all_to_all_bwd)
+
+
+def _send_back(
+    d_received: Float[Array, "P H"],
+    slot: Int[Array, "T K"],
+    *,
+    ep_size: int,
+    pair_capacity: int,
+    gathers: RowGathers,
+) -> Float[Array, "T H"]:
+    """The sender rows' cotangent for the received rows' ``d_received``: the transpose of the bfloat16 dispatch
+    (``_dispatch_rows`` then the ``all_to_all``), as autodiff builds it. The fp8 dispatch's straight-through backward.
+    """
+    hidden = d_received.shape[1]
+    d_send = jax.lax.all_to_all(
+        d_received.reshape(ep_size, pair_capacity, hidden), "expert", split_axis=0, concat_axis=0, tiled=True
+    ).reshape(ep_size * pair_capacity, hidden)
+    return gathers.gather_sum(d_send, slot)
 
 
 def _gather_sum_slots_clamped(rows: Float[Array, "P H"], slots: Int[Array, "T K"]) -> Float[Array, "T H"]:
@@ -268,6 +315,7 @@ def _moe_mlp_ep_ring_filtered_local(
     reduce_drops: bool = True,
     grad_acc: ExpertGradAccumulator | None = None,
     dispatch_tie: Any = None,
+    fp8_dispatch: Fp8Dispatch = "off",
 ) -> (
     tuple[Float[Array, "Tlocal H"], CapacityDrops]
     | tuple[Float[Array, "Tlocal H"], CapacityDrops, ExpertGradAccumulator]
@@ -291,7 +339,12 @@ def _moe_mlp_ep_ring_filtered_local(
     With ``dispatch_tie`` (this shard's rows of other work, e.g. the shared expert's activations) the expert matmuls
     wait for it as well as for the dispatch ``all_to_all`` (``order_after``), so XLA schedules that work while the
     dispatch is in flight. Forward only; the values do not change. Fork overlay.
+
+    ``fp8_dispatch`` ("unfused" or "fused") sends the token rows as float8_e4m3fn with a float32 scale per row, which
+    rides in an extra metadata column; the backward stays bfloat16 (``fp8_dispatch`` module). "fused" needs the FlyDSL
+    expert kernels. Lossy; fork overlay prototype.
     """
+    fp8_dispatch = check_fp8_dispatch(fp8_dispatch)
     tokens, topk = selected_experts_local.shape
     hidden_dim = x_local.shape[1]
     local_experts = moe_w13_local.shape[0]
@@ -305,6 +358,8 @@ def _moe_mlp_ep_ring_filtered_local(
     gemm = flydsl_expert.expert_gemm()
     if grad_acc is not None and gemm is None:
         raise ValueError("grad_acc needs the FlyDSL expert kernels (RAGGED_DOT_IMPL=flydsl)")
+    if fp8_dispatch == "fused" and gemm is None:
+        raise ValueError("fp8_dispatch='fused' needs the FlyDSL expert kernels (RAGGED_DOT_IMPL=flydsl)")
 
     hit_fraction = destination_hit_fraction(num_experts=num_experts, local_experts=local_experts, topk=topk)
     pair_capacity = min(tokens, max(1, math.ceil(transport_capacity_factor * hit_fraction * tokens)))
@@ -353,16 +408,44 @@ def _moe_mlp_ep_ring_filtered_local(
         trailer = jnp.zeros((ep_size, 1, 2 * topk), jnp.float32).at[:, 0, 0].set(valid_assignments.astype(jnp.float32))
         metadata = jnp.concatenate([metadata, trailer], axis=1)
 
-        received_metadata = jax.lax.all_to_all(metadata, "expert", split_axis=0, concat_axis=0, tiled=True)
+        if fp8_dispatch == "off":
+            received_metadata = jax.lax.all_to_all(metadata, "expert", split_axis=0, concat_axis=0, tiled=True)
+        else:
+            # fp8: quantize the source rows, then send their bits; each send row's scale rides in one more metadata
+            # column (zero for an empty slot and the trailer).
+            x_bits, x_scale = quantize_rows(jax.lax.stop_gradient(x_local))
+            send_scale = jnp.where(slot_valid, x_scale[safe_source], 0.0).reshape(ep_size, pair_capacity, 1)
+            send_scale = jnp.concatenate([send_scale, jnp.zeros((ep_size, 1, 1), jnp.float32)], axis=1)
+            received_metadata, received_scale = _metadata_all_to_all(metadata, send_scale)
+            received_scale = jax.lax.stop_gradient(received_scale[:, :pair_capacity, 0].reshape(send_rows))
         received_metadata = tree_checkpoint_name(received_metadata, _CHECKPOINT_DISPATCH_INPUT)
 
-        send_x = _dispatch_rows(x_local, safe_source, slot_valid, slot, sender_gathers)
-        received_x = jax.lax.all_to_all(
-            send_x.reshape(ep_size, pair_capacity, hidden_dim), "expert", split_axis=0, concat_axis=0, tiled=True
-        ).reshape(send_rows, hidden_dim)
+        if fp8_dispatch == "off":
+            send_x = _dispatch_rows(x_local, safe_source, slot_valid, slot, sender_gathers)
+            received_x = jax.lax.all_to_all(
+                send_x.reshape(ep_size, pair_capacity, hidden_dim), "expert", split_axis=0, concat_axis=0, tiled=True
+            ).reshape(send_rows, hidden_dim)
+        else:
+            send_bits = _take_valid_rows(x_bits, safe_source, slot_valid)
+            received_bits = jax.lax.all_to_all(
+                send_bits.reshape(ep_size, pair_capacity, hidden_dim),
+                "expert",
+                split_axis=0,
+                concat_axis=0,
+                tiled=True,
+            ).reshape(send_rows, hidden_dim)
+            # The straight-through backward: the bfloat16 dispatch's transpose.
+            send_back = functools.partial(
+                _send_back, ep_size=ep_size, pair_capacity=pair_capacity, gathers=sender_gathers
+            )
+            if fp8_dispatch == "unfused":
+                received_x = straight_through_rows(x_local, received_bits, received_scale, send_back, (slot,))
         if dispatch_tie is not None:
             # Before the remat tag below: the backward loads the tied rows and never recomputes the tie.
-            received_x = order_after(received_x, dispatch_tie)
+            if fp8_dispatch == "fused":
+                received_bits, received_scale = order_after((received_bits, received_scale), dispatch_tie)
+            else:
+                received_x = order_after(received_x, dispatch_tie)
 
     with jax.named_scope("expert_dispatch"):
         group_valid_assignments = jnp.sum(received_metadata[:, pair_capacity, 0]).astype(jnp.int32)
@@ -396,13 +479,39 @@ def _moe_mlp_ep_ring_filtered_local(
                 flydsl_expert.scatter_plan(position, picked, dispatch_valid), _CHECKPOINT_ROUTING
             )
             # The up projection reads the received rows through dispatch_row (the sentinel send_rows reads zeros), so
-            # they, not an expert-ordered copy, are the saved dispatch input.
-            received_x = tree_checkpoint_name(received_x, _CHECKPOINT_DISPATCH_INPUT)
+            # they, not an expert-ordered copy, are the saved dispatch input: with fp8_dispatch="fused" their fp8 bits
+            # and scales.
+            if fp8_dispatch == "fused":
+                received_bits, received_scale = tree_checkpoint_name(
+                    (received_bits, received_scale), _CHECKPOINT_DISPATCH_INPUT
+                )
+            else:
+                received_x = tree_checkpoint_name(received_x, _CHECKPOINT_DISPATCH_INPUT)
 
     with jax.named_scope("moe_up_down"):
         moe_dim = moe_w2_local.shape[1]
         if gemm is None:
             w13_out = ragged_dot(x_dispatch, moe_w13_local, group_sizes)
+        elif fp8_dispatch == "fused":
+            w13_out, grad_acc = _acc_result(
+                flydsl_expert.dispatch_up_fp8(
+                    x_local,
+                    received_bits,
+                    received_scale,
+                    dispatch_row,
+                    moe_w13_local,
+                    group_sizes,
+                    position,
+                    dst_row,
+                    write,
+                    gemm,
+                    send_back,
+                    (slot,),
+                    **_acc_args(grad_acc, "w13"),
+                ),
+                grad_acc,
+                "w13",
+            )
         else:
             w13_out, grad_acc = _acc_result(
                 flydsl_expert.dispatch_up(

@@ -38,6 +38,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from levanter.grug._moe.ep_common import _combine_gather_sum_impl
 from levanter.grug._moe.ep_ring import _gather_sum_slots, _take_valid_rows
+from levanter.grug._moe.fp8_dispatch import FP8_DTYPE, SendBack, dequantize_rows
 from levanter.grug._moe.grad_accum import GradAccumulation, accumulate_reference
 from levanter.grug._moe.pallas_gather_sum import gather_sum_rows_into
 
@@ -46,6 +47,13 @@ from levanter.grug._moe.pallas_gather_sum import gather_sum_rows_into
 _rd = importlib.import_module("haliax.nn.ragged_dot")
 
 ExpertGemm: TypeAlias = Literal["flydsl", "reference"]
+
+# jax-flydsl's gathered nn GEMM with an fp8 A operand (the fp8 A loader of the fp8 dispatch, fork overlay):
+# ``grouped_gemm_fp8a_nn(a, a_scale, b, group_offsets, *, row_index)`` with ``a`` [R, K] float8_e4m3fn, ``a_scale`` [R]
+# float32, ``b`` [G, K, N] bf16 and ``row_index`` [total_M] ints. Row ``r`` multiplies the bf16 row
+# ``round(f32(a[row_index[r]]) * a_scale[row_index[r]])`` (zeros for an index outside [0, R)), bit for bit
+# ``grouped_gemm_bf16_nn(dequantized a, b, group_offsets, row_index=row_index)``.
+FP8_UP_KERNEL = "grouped_gemm_fp8a_nn"
 
 
 def expert_gemm() -> ExpertGemm | None:
@@ -335,3 +343,124 @@ def _dispatch_up_bwd(gemm, mode, residuals, cotangent):
 
 
 _dispatch_up.defvjp(_dispatch_up_fwd, _dispatch_up_bwd)
+
+
+# fp8 dispatch, fused: the up projection reads the received rows as float8_e4m3fn bits and float32 row scales.
+def dispatch_up_fp8(
+    x_source: Float[Array, "T H"],
+    received_bits: Any,
+    received_scale: Float[Array, " R"],
+    row_index: Int[Array, " C"],
+    w13: Float[Array, "E H I2"],
+    group_sizes: Int[Array, " E"],
+    position: Int[Array, "R K"],
+    dst_row: Int[Array, " C"],
+    write: Bool[Array, " R"],
+    gemm: ExpertGemm,
+    send_back: SendBack,
+    send_back_args: tuple[jax.Array, ...],
+    *,
+    acc: Any = None,
+    layer: jax.Array | None = None,
+    mode: GradAccumulation | None = None,
+) -> Any:
+    """:func:`dispatch_up` on the received rows ``dequantize_rows(received_bits, received_scale, x_source.dtype)``,
+    which the forward never builds: the jax-flydsl fp8 A loader (``FP8_UP_KERNEL``) dequantizes them as it loads them.
+
+    The backward is :func:`dispatch_up`'s at the dequantized rows (rebuilt from the saved bits and scales), and the
+    received rows' cotangent goes on to ``x_source``, the sender's rows, through ``send_back(d_received,
+    *send_back_args)`` (straight-through: the transpose of the bfloat16 transport). ``x_source`` itself is not read.
+    The bits and the scales get no gradient. ``acc``/``layer``/``mode`` as in :func:`dispatch_up`."""
+    if mode is None:
+        acc = layer = None
+    return _dispatch_up_fp8(
+        x_source,
+        received_bits,
+        received_scale,
+        row_index,
+        w13,
+        group_sizes,
+        position,
+        dst_row,
+        write,
+        send_back_args,
+        acc,
+        layer,
+        gemm,
+        mode,
+        send_back,
+    )
+
+
+def _up_gathered_fp8(gemm: ExpertGemm, bits, scale, row_index, w13, group_sizes, dtype):
+    if gemm == "reference":
+        return _up_gathered(gemm, dequantize_rows(bits, scale, dtype), row_index, w13, group_sizes)
+    if dtype != jnp.bfloat16:
+        raise ValueError(f"the fp8 up projection needs bfloat16 tokens, got {dtype}")
+    _rd._check_flydsl_operands(jax.ShapeDtypeStruct(bits.shape, jnp.bfloat16), w13, group_sizes)
+    kernel = getattr(_ops(gemm), FP8_UP_KERNEL, None)
+    if kernel is None:
+        raise NotImplementedError(
+            f"fp8_dispatch='fused' needs jax-flydsl's {FP8_UP_KERNEL} (the fp8 A loader), which this jax-flydsl lacks"
+        )
+    offsets = _rd.flydsl_offsets(group_sizes, row_index.shape[0])
+    out = kernel(jax.lax.bitcast_convert_type(bits, FP8_DTYPE), scale, w13, offsets, row_index=row_index)
+    return _rd._zero_rows_past_groups_in_place(out, group_sizes)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(12, 13, 14))
+def _dispatch_up_fp8(
+    x_source, bits, scale, row_index, w13, group_sizes, position, dst_row, write, sb_args, acc, layer, gemm, mode, sb
+):
+    return _dispatch_up_fp8_fwd(
+        x_source,
+        bits,
+        scale,
+        row_index,
+        w13,
+        group_sizes,
+        position,
+        dst_row,
+        write,
+        sb_args,
+        acc,
+        layer,
+        gemm,
+        mode,
+        sb,
+    )[0]
+
+
+def _dispatch_up_fp8_fwd(
+    x_source, bits, scale, row_index, w13, group_sizes, position, dst_row, write, sb_args, acc, layer, gemm, mode, sb
+):
+    out = _up_gathered_fp8(gemm, bits, scale, row_index, w13, group_sizes, x_source.dtype)
+    # The zero-size array carries the dtype of the dequantized rows and of x_source's cotangent.
+    residuals = (
+        bits,
+        scale,
+        row_index,
+        w13,
+        group_sizes,
+        position,
+        dst_row,
+        write,
+        layer,
+        acc if mode == "final" else None,
+        sb_args,
+        jnp.zeros((0,), x_source.dtype),
+    )
+    return (out if mode in (None, "final") else (out, acc)), residuals
+
+
+def _dispatch_up_fp8_bwd(gemm, mode, send_back, residuals, cotangent):
+    bits, scale, row_index, w13, group_sizes, position, dst_row, write, layer, acc, sb_args, dtype_carrier = residuals
+    received = dequantize_rows(bits, scale, dtype_carrier.dtype)
+    d_received, _, d_w13, _, _, _, _, d_acc, _ = _dispatch_up_bwd(
+        gemm, mode, (received, row_index, w13, group_sizes, position, dst_row, write, layer, acc), cotangent
+    )
+    d_source = send_back(d_received, *sb_args)
+    return d_source, None, None, None, d_w13, None, None, None, None, None, d_acc, None
+
+
+_dispatch_up_fp8.defvjp(_dispatch_up_fp8_fwd, _dispatch_up_fp8_bwd)
