@@ -49,11 +49,11 @@ _rd = importlib.import_module("haliax.nn.ragged_dot")
 ExpertGemm: TypeAlias = Literal["flydsl", "reference"]
 
 # jax-flydsl's gathered nn GEMM with an fp8 A operand (the fp8 A loader of the fp8 dispatch, fork overlay):
-# ``grouped_gemm_fp8a_nn(a, a_scale, b, group_offsets, *, row_index)`` with ``a`` [R, K] float8_e4m3fn, ``a_scale`` [R]
-# float32, ``b`` [G, K, N] bf16 and ``row_index`` [total_M] ints. Row ``r`` multiplies the bf16 row
-# ``round(f32(a[row_index[r]]) * a_scale[row_index[r]])`` (zeros for an index outside [0, R)), bit for bit
+# ``grouped_gemm_fp8_rows_nn(a_q, a_scale, b, group_offsets, *, row_index)`` with ``a_q`` [R, K] float8_e4m3fn (or its
+# uint8 bits), ``a_scale`` [R] float32, ``b`` [G, K, N] bf16 and ``row_index`` [total_M] ints. Row ``r`` multiplies the
+# bf16 row ``round(f32(a_q[row_index[r]]) * a_scale[row_index[r]])`` (zeros for an index outside [0, R)), bit for bit
 # ``grouped_gemm_bf16_nn(dequantized a, b, group_offsets, row_index=row_index)``.
-FP8_UP_KERNEL = "grouped_gemm_fp8a_nn"
+FP8_UP_KERNEL = "grouped_gemm_fp8_rows_nn"
 
 
 def expert_gemm() -> ExpertGemm | None:
