@@ -151,9 +151,10 @@ class Fp8DispatchMode(enum.StrEnum):
     """How the MoE's dispatch ``all_to_all`` sends the token rows (fork overlay, lossy prototype).
 
     ``off``: bfloat16. ``unfused``: float8_e4m3fn bits with a float32 scale per row, dequantized on arrival before the
-    expert up projection. ``fused``: the same transport, the up projection dequantizing as it loads its rows (jax-flydsl
-    fp8 A loader; needs ``RAGGED_DOT_IMPL=flydsl``), and the remat policy saving the fp8 rows. ``unfused`` and ``fused``
-    give the same values; the backward stays bfloat16 (straight-through). See ``levanter.grug._moe.fp8_dispatch``.
+    expert up projection. ``fused``: the same transport, the up projection reading the fp8 rows itself (jax-flydsl fp8
+    kernel, row scale applied in its epilogue; needs ``RAGGED_DOT_IMPL=flydsl``), and the remat policy saving the fp8
+    rows. ``fused``'s forward is within about one bf16 ulp of ``unfused``'s (not bitwise); the backward is the same
+    bfloat16 straight-through in both. See ``levanter.grug._moe.fp8_dispatch``.
     """
 
     OFF = "off"

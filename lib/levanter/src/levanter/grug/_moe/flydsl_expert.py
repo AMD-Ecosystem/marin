@@ -50,9 +50,11 @@ ExpertGemm: TypeAlias = Literal["flydsl", "reference"]
 
 # jax-flydsl's gathered nn GEMM with an fp8 A operand (the fp8 A loader of the fp8 dispatch, fork overlay):
 # ``grouped_gemm_fp8_rows_nn(a_q, a_scale, b, group_offsets, *, row_index)`` with ``a_q`` [R, K] float8_e4m3fn (or its
-# uint8 bits), ``a_scale`` [R] float32, ``b`` [G, K, N] bf16 and ``row_index`` [total_M] ints. Row ``r`` multiplies the
-# bf16 row ``round(f32(a_q[row_index[r]]) * a_scale[row_index[r]])`` (zeros for an index outside [0, R)), bit for bit
-# ``grouped_gemm_bf16_nn(dequantized a, b, group_offsets, row_index=row_index)``.
+# uint8 bits), ``a_scale`` [R] float32, ``b`` [G, K, N] bf16 and ``row_index`` [total_M] ints. Output row ``r`` is
+# ``bf16(a_scale[i] * sum_k f32(a_q[i, k]) * b[g, k, :])`` with ``i = row_index[r]`` (zeros for an index outside
+# [0, R)): the kernel converts the fp8 rows exactly and applies the row scale to the f32 accumulator in its epilogue.
+# That is ``grouped_gemm_bf16_nn(dequantized a, b, group_offsets, row_index=row_index)`` without the bf16 rounding of
+# ``q * scale``: within about one bf16 ulp of the unfused path, not bit for bit (bitwise only for power-of-two scales).
 FP8_UP_KERNEL = "grouped_gemm_fp8_rows_nn"
 
 
@@ -365,7 +367,9 @@ def dispatch_up_fp8(
     mode: GradAccumulation | None = None,
 ) -> Any:
     """:func:`dispatch_up` on the received rows ``dequantize_rows(received_bits, received_scale, x_source.dtype)``,
-    which the forward never builds: the jax-flydsl fp8 A loader (``FP8_UP_KERNEL``) dequantizes them as it loads them.
+    which the forward never builds: the jax-flydsl fp8 kernel (``FP8_UP_KERNEL``) converts the fp8 rows exactly as it
+    loads them and applies the row scales to its f32 accumulator, so the forward is within about one bf16 ulp of the
+    unfused path (it skips the bf16 rounding of ``q * s``), not bitwise equal to it.
 
     The backward is :func:`dispatch_up`'s at the dequantized rows (rebuilt from the saved bits and scales), and the
     received rows' cotangent goes on to ``x_source``, the sender's rows, through ``send_back(d_received,
